@@ -32,3 +32,9 @@
   - Renamed `main.py` to `run.py`.
   - Renamed `docs/weahtersyskill.txt` to `docs/LEGACY_SYSTEM_SHUTDOWN.md`.
   - Updated `chime.service` path.
+- **v1.2.0 Update (Announcements)**:
+  - Updated `docs/REQUIREMENTS.md`.
+  - Renamed/Moved assets: `001_...wav` -> `assets/announce.wav`, `auld_lang_syne.mp3` -> `assets/hotaru.mp3`.
+  - Updated `src/config.py` with new file paths.
+  - Updated `src/player.py` to implement sequential playback (Announce -> Wait -> Chime with Fade-in).
+  - Updated `run.py` to ensure weekday-only execution (Mon-Fri).
