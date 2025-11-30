@@ -1,0 +1,13 @@
+[Unit]
+Description=Campus Evening Chime System
+After=network.target audio.target sound.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/campus-chime
+ExecStart=/usr/bin/python3 /home/pi/campus-chime/campus_chime.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+
