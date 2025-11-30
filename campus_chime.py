@@ -4,6 +4,7 @@ import time
 import logging
 import platform
 import subprocess
+import argparse
 from datetime import datetime
 
 # 依存ライブラリのインポート試行
@@ -132,10 +133,23 @@ def main():
     """
     責務: メインループとスケジューリング
     """
+    # 引数解析
+    parser = argparse.ArgumentParser(description="Campus Evening Chime System")
+    parser.add_argument("--test", action="store_true", help="Test mode: Play sequence immediately and exit")
+    args = parser.parse_args()
+
     logger.info("Starting Campus Chime System (Technical Specifications v1)")
     
     # 初期化
     designer = SoundDesigner()
+    
+    # テストモード: 即時実行して終了
+    if args.test:
+        logger.info("Running in TEST MODE (Immediate playback)")
+        designer.play_sequence()
+        logger.info("Test completed. Exiting.")
+        return
+
     last_played_date = None
     
     try:
