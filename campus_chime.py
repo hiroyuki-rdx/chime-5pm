@@ -14,8 +14,8 @@ except ImportError:
     pygame = None
 
 # 2.1 定数定義
-TARGET_HOUR = 17
-TARGET_MINUTE = 0
+TARGET_HOUR = 16
+TARGET_MINUTE = 57
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # パスは設計書のディレクトリ構成に合わせて assets/ を参照
 ANNOUNCE_FILE = os.path.join(BASE_DIR, "assets", "announce.wav")
