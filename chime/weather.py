@@ -282,7 +282,7 @@ class WeatherService:
         self.provider = str(self.settings.get("provider", "jma")).lower()
         self.timeout = float(self.settings.get("timeout_seconds", 8.0))
         self.cache_seconds = float(self.settings.get("cache_minutes", 60)) * 60.0
-        self._cache: Optional[Tuple[float, str]] = None
+        self._cache: Optional[Tuple[float, date, str]] = None
 
     @property
     def enabled(self) -> bool:
@@ -318,16 +318,19 @@ class WeatherService:
         if not self.enabled:
             raise WeatherError("天気予報機能が無効化されています。")
 
+        resolved_today = today or date.today()
         now = time.monotonic()
-        if use_cache and self._cache and now - self._cache[0] < self.cache_seconds:
+        if (use_cache and self._cache
+                and self._cache[1] == resolved_today
+                and now - self._cache[0] < self.cache_seconds):
             logger.debug("天気予報をキャッシュから取得しました。")
-            return self._cache[1]
+            return self._cache[2]
 
         payload = fetch_json(self.url(), self.timeout)
-        parts = self.parse(payload, today or date.today())
+        parts = self.parse(payload, resolved_today)
         text = build_text(parts, self.settings)
         if not text:
             raise WeatherError("天気予報の読み上げ文を組み立てられませんでした。")
 
-        self._cache = (now, text)
+        self._cache = (now, resolved_today, text)
         return text

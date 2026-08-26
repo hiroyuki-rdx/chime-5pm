@@ -44,6 +44,22 @@ class LoadQuotesTest(unittest.TestCase):
             path = write_quotes(tmp, {"general": ["共通"], "by_hour": {12: ["お昼"]}})
             self.assertEqual(load_quotes(path)["by_hour"]["12"], ["お昼"])
 
+    def test_non_list_by_hour_entry_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_quotes(tmp, {
+                "general": ["共通"],
+                "by_hour": {"10": {"a": 1, "b": 2}, "11": "文字列も配列ではない"},
+            })
+            data = load_quotes(path)
+            self.assertNotIn("10", data["by_hour"])
+            self.assertNotIn("11", data["by_hour"])
+
+    def test_non_list_general_falls_back(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_quotes(tmp, {"general": {"a": 1}, "by_hour": {}})
+            data = load_quotes(path)
+            self.assertEqual(data["general"], FALLBACK_QUOTES)
+
 
 class PickTest(unittest.TestCase):
     def setUp(self):

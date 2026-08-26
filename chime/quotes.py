@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import random
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -52,13 +52,22 @@ def load_quotes(path: str) -> Dict[str, Any]:
         logger.error("ひとことファイルの形式が不正です: %s", path)
         return {"general": list(FALLBACK_QUOTES), "by_hour": {}}
 
-    general = [str(item) for item in data.get("general", []) or []]
+    general_raw = data.get("general", [])
+    if isinstance(general_raw, list):
+        general = [str(item) for item in general_raw]
+    else:
+        if general_raw:
+            logger.warning("ひとことファイルの general が配列ではありません: %s", path)
+        general = []
+
     by_hour_raw = data.get("by_hour", {}) or {}
     by_hour: Dict[str, List[str]] = {}
     if isinstance(by_hour_raw, Mapping):
         for key, values in by_hour_raw.items():
-            if isinstance(values, Iterable) and not isinstance(values, (str, bytes)):
+            if isinstance(values, list):
                 by_hour[str(key)] = [str(item) for item in values]
+            elif values:
+                logger.warning("ひとことファイルの by_hour[%s] が配列ではありません: %s", key, path)
 
     if not general and not by_hour:
         logger.warning("ひとことが 1 件も定義されていません: %s", path)

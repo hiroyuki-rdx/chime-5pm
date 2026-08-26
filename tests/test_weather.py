@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import date
+from unittest import mock
 
 from tests.support import load_fixture  # noqa: F401
 
@@ -69,6 +71,15 @@ class ParseJmaTest(unittest.TestCase):
         for payload in ({}, [], [{"timeSeries": []}], "nonsense"):
             with self.assertRaises(WeatherError):
                 parse_jma(payload, WEATHER["jma"], TODAY)
+
+    def test_does_not_depend_on_timeseries_order(self):
+        # 気象庁 API は timeSeries の並び順（weathers/pops/temps）を保証しない。
+        # 順序を入れ替えても同じ結果になること。
+        payload = json.loads(json.dumps(self.payload))  # deep copy
+        payload[0]["timeSeries"] = list(reversed(payload[0]["timeSeries"]))
+        parts = parse_jma(payload, WEATHER["jma"], TODAY)
+        expected = parse_jma(self.payload, WEATHER["jma"], TODAY)
+        self.assertEqual(parts, expected)
 
 
 class ParseOpenMeteoTest(unittest.TestCase):
@@ -137,8 +148,26 @@ class ServiceTest(unittest.TestCase):
 
     def test_cached_result_is_reused(self):
         service = WeatherService(WEATHER)
-        service._cache = (float("inf"), "キャッシュされた予報")
+        service._cache = (float("inf"), date.today(), "キャッシュされた予報")
         self.assertEqual(service.describe(), "キャッシュされた予報")
+
+    def test_cache_is_not_reused_across_a_date_change(self):
+        # キャッシュ期限内でも、日付が変わっていれば前日分の文言を使い回さない。
+        service = WeatherService(dict(WEATHER, provider="jma"))
+        service._cache = (float("inf"), date(2026, 8, 25), "昨日の天気")
+        payload = load_fixture("jma_130000.json")
+        with mock.patch("chime.weather.fetch_json", return_value=payload) as mocked:
+            text = service.describe(today=TODAY)
+        mocked.assert_called_once()
+        self.assertNotEqual(text, "昨日の天気")
+
+    def test_cache_within_the_same_day_avoids_refetch(self):
+        service = WeatherService(dict(WEATHER, provider="jma"))
+        service._cache = (float("inf"), TODAY, "本日分のキャッシュ")
+        with mock.patch("chime.weather.fetch_json") as mocked:
+            text = service.describe(today=TODAY)
+        mocked.assert_not_called()
+        self.assertEqual(text, "本日分のキャッシュ")
 
     def test_parse_dispatches_by_provider(self):
         service = WeatherService(dict(WEATHER, provider="open_meteo"))

@@ -26,6 +26,14 @@ class DeepMergeTest(unittest.TestCase):
         merged = deep_merge({"weekdays": [0, 1, 2]}, {"weekdays": [5]})
         self.assertEqual(merged["weekdays"], [5])
 
+    def test_untouched_branches_are_independent_copies(self):
+        # override で触れていない枝を書き換えても base に波及しないこと。
+        # DEFAULT_CONFIG のような共有の既定値辞書を base に使う場合に重要。
+        base = {"a": 1, "logging": {"level": "INFO"}}
+        merged = deep_merge(base, {"a": 2})
+        merged["logging"]["level"] = "DEBUG"
+        self.assertEqual(base["logging"]["level"], "INFO")
+
 
 class ConfigAccessTest(unittest.TestCase):
     def setUp(self):
@@ -51,6 +59,21 @@ class ConfigAccessTest(unittest.TestCase):
     def test_absolute_paths_are_kept(self):
         config = Config({"x": "/srv/sound.wav"}, base_dir="/opt/chime")
         self.assertEqual(config.path("x"), "/srv/sound.wav")
+
+    def test_explicit_empty_string_is_not_replaced_by_default(self):
+        # 明示的な空文字列（「未設定」の意）は、default 引数があっても尊重される。
+        config = Config({"x": ""}, base_dir="/opt/chime")
+        self.assertEqual(config.path("x", default="fallback.wav"), "")
+
+    def test_missing_key_uses_default(self):
+        config = Config({}, base_dir="/opt/chime")
+        self.assertEqual(config.path("missing", default="fallback.wav"),
+                         "/opt/chime/fallback.wav")
+
+    def test_tilde_is_expanded_to_home_directory(self):
+        config = Config({"x": "~/sounds/hotaru.mp3"}, base_dir="/opt/chime")
+        expected = os.path.join(os.path.expanduser("~"), "sounds", "hotaru.mp3")
+        self.assertEqual(config.path("x"), expected)
 
 
 class LoadConfigTest(unittest.TestCase):

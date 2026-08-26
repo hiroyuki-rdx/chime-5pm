@@ -179,8 +179,13 @@ class ConfigError(RuntimeError):
 
 
 def deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> Dict[str, Any]:
-    """辞書を再帰的にマージした新しい辞書を返す（``override`` が優先）。"""
-    merged: Dict[str, Any] = dict(base)
+    """辞書を再帰的にマージした新しい辞書を返す（``override`` が優先）。
+
+    戻り値は ``base``／``override`` のどの階層とも参照を共有しない。
+    ``override`` で触れられなかった枝を呼び出し側が書き換えても、
+    元の ``base``（ひいては :data:`DEFAULT_CONFIG`）に影響しない。
+    """
+    merged: Dict[str, Any] = copy.deepcopy(dict(base))
     for key, value in override.items():
         current = merged.get(key)
         if isinstance(current, Mapping) and isinstance(value, Mapping):
@@ -219,8 +224,15 @@ class Config:
         return dict(value) if isinstance(value, Mapping) else {}
 
     def path(self, path: str, default: str = "") -> str:
-        """設定値を絶対パスとして解決する（相対パスは ``base_dir`` 起点）。"""
-        value = self.get(path, default) or default
+        """設定値を絶対パスとして解決する（相対パスは ``base_dir`` 起点）。
+
+        キー自体が存在しない場合のみ ``default`` を使う。空文字列が明示的に
+        設定されている場合は「未設定」の意味でそのまま尊重する
+        （``or default`` にすると意図的な空文字列まで ``default`` に化けてしまう）。
+        """
+        value = self.get(path, default)
+        if value is None:
+            value = default
         return self.resolve(str(value))
 
     def resolve(self, value: str) -> str:
