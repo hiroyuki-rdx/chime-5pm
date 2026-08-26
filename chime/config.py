@@ -126,15 +126,24 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "cache_minutes": 60,
         "jma": {
             # 地域コード。https://www.jma.go.jp/bosai/common/const/area.json 参照
-            "area_code": "130000",
+            # 既定は滋賀県。一次細分区域は「南部」（大津・草津・近江八幡など）と
+            # 「北部」（彦根・長浜・米原・高島など）の 2 つがあり、既定は南部。
+            # 北部に切り替える場合は area_name を "北部"、temp_area_name を
+            # "彦根" にする（docs/SETUP.md 7 章を参照）。
+            "area_code": "250000",
             # timeSeries 内で優先的に使う地域名（前方一致）。空なら先頭を使う。
-            "area_name": "東京地方",
-            "label": "東京",
+            # 天気・降水確率の細分区域名（"南部" / "北部"）。
+            "area_name": "南部",
+            # 気温の timeSeries だけは観測地点名（"大津" / "彦根" など）で
+            # area_name とは体系が異なるため、別に指定する。
+            # 空文字列なら従来どおり area_name で選ぶ（後方互換）。
+            "temp_area_name": "大津",
+            "label": "滋賀",
         },
         "open_meteo": {
-            "latitude": 35.6895,
-            "longitude": 139.6917,
-            "label": "東京",
+            "latitude": 35.0045,
+            "longitude": 135.8686,
+            "label": "滋賀",
         },
         "template": "{when}の{label}の天気は、{weather}。{details}",
         "details_separator": "、",

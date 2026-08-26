@@ -12,7 +12,7 @@
 09:59:57  ポ、ポ、ポ、    ← 短音 3 回（440Hz）
 10:00:00              ポーン ← 長音（880Hz）が正時ちょうど
 10:00:01  「午前10時をお知らせしました。」
-10:00:04  「今日の東京の天気は、くもり時々晴れ。最高気温は31度、降水確率は30パーセントです。」
+10:00:04  「今日の滋賀の天気は、晴れ時々くもり。最高気温は27度、降水確率は20パーセントです。」
    :
 16:57:00  「（閉館アナウンス）」→「蛍の光」♪
 ```
@@ -179,7 +179,7 @@ sudo systemctl restart campus_chime.service
 | 閉館放送の時刻を変える | `schedule.closing.hour` / `minute` |
 | 土曜も鳴らす | `schedule.*.weekdays` に `5` を追加（月=0〜日=6） |
 | 読み上げ文言を変える | `time_signal.announce_template` |
-| 天気の地域を変える | `weather.jma.area_code` / `area_name` / `label` |
+| 天気の地域を変える | `weather.jma.area_code` / `area_name` / `temp_area_name` / `label`（既定は滋賀・南部） |
 | 天気の頻度を変える | `extra_segment.weather_probability`（0.0〜1.0） |
 | おまけを止める | `extra_segment.enabled` を `false` |
 

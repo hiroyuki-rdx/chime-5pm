@@ -115,6 +115,10 @@ def parse_jma(payload: Any, settings: Mapping[str, Any], today: date) -> Dict[st
 
     time_series = [s for s in root.get("timeSeries", []) or [] if isinstance(s, Mapping)]
     area_name = str(settings.get("area_name", ""))
+    # 気温の timeSeries は観測地点名（"大津" など）で、天気・降水確率の細分区域名
+    # （"南部" など）とは体系が異なる。temp_area_name が空なら従来どおり
+    # area_name を使う（後方互換）。
+    temp_area_name = str(settings.get("temp_area_name", "")) or area_name
 
     weather_series = _series_by_key(time_series, "weathers")
     if weather_series is None:
@@ -148,21 +152,25 @@ def parse_jma(payload: Any, settings: Mapping[str, Any], today: date) -> Dict[st
         "pop": None,
     }
 
-    temps = _collect_jma_temps(time_series, area_name)
+    temps = _collect_jma_temps(time_series, temp_area_name)
     result["temp_min"], result["temp_max"] = temps.get(target_date, (None, None))
     result["pop"] = _collect_jma_pop(time_series, area_name, target_date)
     return result
 
 
 def _collect_jma_temps(time_series: List[Mapping[str, Any]],
-                       area_name: str) -> Dict[date, Tuple[Optional[int], Optional[int]]]:
-    """気温の時系列を日付ごとの (最低, 最高) に畳み込む。"""
+                       temp_area_name: str) -> Dict[date, Tuple[Optional[int], Optional[int]]]:
+    """気温の時系列を日付ごとの (最低, 最高) に畳み込む。
+
+    ``temp_area_name`` は気温の観測地点名（例: "大津"）。天気・降水確率の
+    細分区域名（area_name）とは体系が異なるため、呼び出し側で解決した値を渡す。
+    """
     series = _series_by_key(time_series, "temps")
     collected: Dict[date, Tuple[Optional[int], Optional[int]]] = {}
     if series is None:
         return collected
 
-    area = _pick_area(list(series.get("areas", []) or []), area_name)
+    area = _pick_area(list(series.get("areas", []) or []), temp_area_name)
     if area is None:
         return collected
 

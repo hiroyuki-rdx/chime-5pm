@@ -99,14 +99,15 @@
     "timeout_seconds": 8.0,
     "cache_minutes": 60,
     "jma": {
-      "area_code": "130000",
-      "area_name": "東京地方",
-      "label": "東京"
+      "area_code": "250000",
+      "area_name": "南部",
+      "temp_area_name": "大津",
+      "label": "滋賀"
     },
     "open_meteo": {
-      "latitude": 35.6895,
-      "longitude": 139.6917,
-      "label": "東京"
+      "latitude": 35.0045,
+      "longitude": 135.8686,
+      "label": "滋賀"
     },
     "template": "{when}の{label}の天気は、{weather}。{details}",
     "details_separator": "、",
