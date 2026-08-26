@@ -9,12 +9,14 @@ import os
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import date, datetime, timedelta
 from unittest import mock
 
 from tests.support import REPO_ROOT  # noqa: F401
 
 from chime import env
 from chime.cli import build_parser, run
+from chime.sequence import PlaybackPlan
 
 
 def call(argv):
@@ -123,6 +125,83 @@ class RunTest(unittest.TestCase):
             code, output = call(["--config", path, "--schedule", "1"])
         self.assertEqual(code, 0)
         self.assertIn("08:00:00", output)
+
+    # -- 不具合1: --weather が OS のローカル日付を使っていた --------------
+    def test_weather_command_uses_configured_timezone_date(self):
+        """``--weather`` は OS のローカル日付ではなく ``app.now().date()`` を渡すこと。
+
+        修正前は ``app.weather.describe()`` を引数なしで呼んでいたため、
+        ``describe()`` 側で ``today=None`` を受け取り OS のローカル日付
+        （``date.today()``）にフォールバックしていた。
+        """
+        fake_today = date.today() + timedelta(days=1)
+        captured = {}
+
+        def fake_describe(self, today=None, use_cache=True):
+            captured["today"] = today
+            return "テスト日和です。"
+
+        with mock.patch("chime.app.ChimeApp.now",
+                        return_value=datetime.combine(fake_today, datetime.min.time())), \
+                mock.patch("chime.weather.WeatherService.describe", fake_describe):
+            code, output = call(["--weather", "--dry-run"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(captured["today"], fake_today)
+
+    # -- 不具合2: --say "" が常駐ループに落ちていた ------------------------
+    def test_say_empty_string_is_argument_error(self):
+        """空文字列は「指定なし」ではなく引数エラーとして扱い、常駐に落ちないこと。"""
+        code, output = call(["--say", "", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 2)
+        self.assertIn("読み上げる文言が空です", output)
+        self.assertNotIn("次回以降の予定", output)
+
+    def test_say_whitespace_only_is_argument_error(self):
+        code, output = call(["--say", "   ", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 2)
+        self.assertIn("読み上げる文言が空です", output)
+
+    # -- 不具合3: 音声合成が全滅しても --say / --test-hourly が 0 を返していた --
+    def test_say_returns_1_when_tts_completely_fails(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"tts": {"engines": []}}, handle)
+            code, output = call(["--config", path, "--say", "テスト",
+                                 "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 1)
+        self.assertIn("合成できませんでした", output)
+
+    def test_test_hourly_still_returns_0_when_only_speech_fails(self):
+        """時報音は合成不要で必ず鳴るため、読み上げだけの失敗は 0 のままでよい。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"tts": {"engines": []},
+                          "extra_segment": {"enabled": False}}, handle)
+            code, output = call(["--config", path, "--test-hourly", "10",
+                                 "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("合成できませんでした", output)
+
+    def test_test_hourly_returns_1_when_no_segments_at_all(self):
+        """時報音を含め、再生できるセグメントが 1 つも無ければ 1 を返す。"""
+        def fake_build_hourly(self, hour, event=None):
+            return PlaybackPlan(event=event, segments=[],
+                                warnings=["時報音すら用意できませんでした"])
+
+        with mock.patch("chime.sequence.SequenceBuilder.build_hourly", fake_build_hourly):
+            code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 1)
+
+    def test_test_hourly_weather_failure_with_quote_fallback_is_not_an_error(self):
+        """天気取得に失敗しても「ひとこと」への切り替えが成功していればエラーではない。"""
+        with mock.patch("chime.weather.fetch_json",
+                        side_effect=__import__("chime.weather", fromlist=["x"]).WeatherError("圏外")):
+            code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("天気予報を取得できませんでした", output)
 
 
 class EnvironmentTest(unittest.TestCase):

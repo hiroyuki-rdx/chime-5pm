@@ -125,13 +125,20 @@ def run(argv: Optional[List[str]] = None) -> int:
     if args.weather:
         return show_weather(app)
 
-    if args.say:
+    if args.say is not None:
+        if not args.say.strip():
+            print("読み上げる文言が空です。", file=sys.stderr)
+            return 2
         app.log_environment()
-        app.play(app.builder.build_text(args.say))
+        plan = app.builder.build_text(args.say)
+        app.play(plan)
+        if not plan.segments:
+            return 1
         return 0
 
     if args.test_hourly is not None or args.test or args.test_all:
         app.log_environment()
+        total_segments = 0
         if args.test_hourly is not None or args.test_all:
             hour = app.now().hour if (args.test_hourly is None or args.test_hourly < 0) \
                 else args.test_hourly
@@ -139,11 +146,18 @@ def run(argv: Optional[List[str]] = None) -> int:
                 print("--test-hourly は 0〜23 で指定してください。", file=sys.stderr)
                 return 2
             logger.info("テストモード: %d 時の時報を再生します。", hour)
-            app.play(app.builder.build_hourly(hour))
+            plan = app.builder.build_hourly(hour)
+            app.play(plan)
+            total_segments += len(plan.segments)
         if args.test or args.test_all:
             logger.info("テストモード: 閉館放送を再生します。")
-            app.play(app.builder.build_closing())
+            plan = app.builder.build_closing()
+            app.play(plan)
+            total_segments += len(plan.segments)
         logger.info("テストを終了します。")
+        if total_segments == 0:
+            logger.error("再生できるセグメントがありませんでした。")
+            return 1
         return 0
 
     app.install_signal_handlers()
@@ -182,7 +196,7 @@ def show_weather(app: ChimeApp) -> int:
     print("提供元: {0}".format(app.weather.provider))
     try:
         print("URL: {0}".format(app.weather.url()))
-        text = app.weather.describe()
+        text = app.weather.describe(today=app.now().date())
     except WeatherError as exc:
         print("天気予報を取得できませんでした: {0}".format(exc), file=sys.stderr)
         return 1
