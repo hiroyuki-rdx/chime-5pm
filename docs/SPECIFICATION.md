@@ -236,7 +236,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 | クラス | 仕様 |
 |---|---|
-| `Player.play(segments)` | 存在しないファイルを除外（`optional=False` なら `PlaybackError`）し、`open()` → 各 `play_one()` → `close()` を実行。`close()` は `finally` で必ず呼ぶ |
+| `Player.play(segments)` | 存在しないファイルを除外（`optional=False` なら `PlaybackError`）し、`open()` → 各 `play_one()` → `close()` を実行。`close()` は `finally` で必ず呼ぶ。戻り値は実際に再生したセグメント数（`int`）で、再生対象が 1 つも無かった場合（除外の結果 0 件になった場合を含む）は例外を出さず `0` を返す |
 | `PygamePlayer` | `pygame.mixer.init(frequency, size, channels, buffer)` で初期化し、`music.load` → `play(fade_ms=...)` → `get_busy()` が `False` になるまで 0.05 秒間隔でポーリング。`close()` で **`pygame.mixer.quit()`** |
 | `CommandPlayer` | 拡張子に応じて `aplay` / `mpg123` を実行。フェードは非対応 |
 | `MockPlayer` | ログ出力と `time.sleep` のみ（WAV は実長、上限 `mock_max_seconds`） |

@@ -118,9 +118,10 @@ class ChimeApp:
 
         戻り値は実際に再生できたかどうか。``--dry-run`` は再生自体を行わない
         ため失敗ではなく常に ``True``。再生対象のセグメントが 1 つもない場合
-        や、再生中にエラーが発生した場合（``PlaybackError`` や予期しない例外）
-        は ``False`` を返す。いずれの場合も例外は外へ送出しない（放送失敗で
-        プロセスを落とさないという方針は変えない）。
+        や、再生中にエラーが発生した場合（``PlaybackError`` や予期しない例外）、
+        セグメントはあってもすべて欠落した optional でスキップされ実際には
+        何も再生できなかった場合は ``False`` を返す。いずれの場合も例外は
+        外へ送出しない（放送失敗でプロセスを落とさないという方針は変えない）。
         """
         logger.info(plan.describe())
         if self.dry_run:
@@ -129,12 +130,15 @@ class ChimeApp:
         if not plan.segments:
             return False
         try:
-            self.player.play(plan.segments)
+            played = self.player.play(plan.segments)
         except PlaybackError as exc:
             logger.error("再生に失敗しました: %s", exc)
             return False
         except Exception as exc:  # pragma: no cover - 再生失敗でプロセスは落とさない
             logger.exception("再生中に予期しないエラーが発生しました: %s", exc)
+            return False
+        if not played:
+            logger.warning("再生できたセグメントがありませんでした。")
             return False
         logger.info("再生シーケンスが完了しました。")
         return True

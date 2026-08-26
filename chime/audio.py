@@ -81,8 +81,13 @@ class Player:
         raise NotImplementedError
 
     # -- 共通処理 -------------------------------------------------------
-    def play(self, segments: Sequence[Segment]) -> None:
-        """セグメントを順番に、間に無音を挟みながら再生する。"""
+    def play(self, segments: Sequence[Segment]) -> int:
+        """セグメントを順番に、間に無音を挟みながら再生する。
+
+        戻り値は実際に再生したセグメント数。欠落した optional セグメントは
+        スキップされるためカウントしない。1 件も再生できなかった場合は
+        （元々セグメントが無かった場合も含め）例外を送出せず ``0`` を返す。
+        """
         playable: List[Segment] = []
         for segment in segments:
             if not segment.path:
@@ -97,7 +102,7 @@ class Player:
 
         if not playable:
             logger.warning("再生できるセグメントがありません。")
-            return
+            return 0
 
         try:
             self.open()
@@ -109,6 +114,7 @@ class Player:
                     time.sleep(gap_ms / 1000.0)
         finally:
             self.close()
+        return len(playable)
 
 
 class PygamePlayer(Player):

@@ -224,6 +224,17 @@ class PlayReturnValueTest(AppTestCase):
         self.assertTrue(self.app.play(plan))
         self.assertEqual(self.player.played, [])
 
+    def test_returns_false_when_all_optional_segments_are_missing(self):
+        """穴の再現テスト: セグメントが 1 件以上あっても、すべて optional で
+        音源ファイルが欠落していると Player.play() は例外を出さず 0 件再生
+        で終わる。この場合も ChimeApp.play() は False を返す必要がある
+        （一音も鳴っていないのに成功を返さない）。"""
+        plan = PlaybackPlan(event=None,
+                            segments=[Segment("/nonexistent.wav", label="任意",
+                                              optional=True)])
+        self.assertFalse(self.app.play(plan))
+        self.assertEqual(self.player.played, [])
+
     def test_run_event_does_not_use_return_value(self):
         """``run_event()`` は ``play()`` の戻り値を使わず、
         再生に失敗しても従来どおり再生済みとして記録する。"""

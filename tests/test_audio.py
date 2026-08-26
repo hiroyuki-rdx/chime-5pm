@@ -107,6 +107,24 @@ class PlaySequenceTest(unittest.TestCase):
         player.play([Segment(""), Segment(self.first)])
         self.assertEqual(player.played, [self.first])
 
+    def test_returns_count_of_played_segments(self):
+        player = RecordingPlayer(AUDIO)
+        result = player.play([Segment(self.first), Segment(self.second)])
+        self.assertEqual(result, 2)
+
+    def test_returns_zero_when_nothing_to_play(self):
+        player = RecordingPlayer(AUDIO)
+        self.assertEqual(player.play([]), 0)
+
+    def test_returns_zero_when_all_segments_are_missing_optional(self):
+        """全セグメントが optional かつ音源が欠落している場合、例外を出さず
+        再生数 0 を返す（合成音声のキャッシュが再生前に消えるケースなどを
+        想定した再現テスト）。"""
+        player = RecordingPlayer(AUDIO)
+        result = player.play([Segment("/nonexistent.wav", optional=True)])
+        self.assertEqual(result, 0)
+        self.assertEqual(player.played, [])
+
 
 class MockPlayerTest(unittest.TestCase):
     def test_plays_without_sound(self):
