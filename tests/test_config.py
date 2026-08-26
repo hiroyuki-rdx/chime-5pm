@@ -95,6 +95,21 @@ class DefaultConfigMisreadFixesTest(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["weather"]["max_weather_chars"], 40)
 
 
+class DefaultExtraIsQuoteOnlyTest(unittest.TestCase):
+    """運用方針の変更: 時報のあとは既定で「ひとこと」のみとし、天気予報は
+    流さない。3 箇所すべてが揃っていないと別経路で天気予報が有効になりうる
+    ため、まとめて回帰確認する。"""
+
+    def test_weather_is_disabled_by_default(self):
+        self.assertFalse(DEFAULT_CONFIG["weather"]["enabled"])
+
+    def test_weather_probability_is_zero_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_probability"], 0.0)
+
+    def test_always_weather_hours_is_empty_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["always_weather_hours"], [])
+
+
 class LoadConfigTest(unittest.TestCase):
     def test_local_config_overrides_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -346,13 +346,16 @@ class ServiceTest(unittest.TestCase):
             service.describe()
 
     def test_cached_result_is_reused(self):
-        service = WeatherService(WEATHER)
+        # 既定値は enabled=False になったため、機能自体を検証するこのテストでは
+        # 明示的に有効化する。
+        service = WeatherService(dict(WEATHER, enabled=True))
         service._cache = (float("inf"), date.today(), "キャッシュされた予報")
         self.assertEqual(service.describe(), "キャッシュされた予報")
 
     def test_cache_is_not_reused_across_a_date_change(self):
         # キャッシュ期限内でも、日付が変わっていれば前日分の文言を使い回さない。
-        service = WeatherService(dict(WEATHER, provider="jma"))
+        # 既定値は enabled=False のため、明示的に有効化する。
+        service = WeatherService(dict(WEATHER, provider="jma", enabled=True))
         service._cache = (float("inf"), date(2026, 8, 25), "昨日の天気")
         payload = load_fixture("jma_130000.json")
         with mock.patch("chime.weather.fetch_json", return_value=payload) as mocked:
@@ -361,7 +364,8 @@ class ServiceTest(unittest.TestCase):
         self.assertNotEqual(text, "昨日の天気")
 
     def test_cache_within_the_same_day_avoids_refetch(self):
-        service = WeatherService(dict(WEATHER, provider="jma"))
+        # 既定値は enabled=False のため、明示的に有効化する。
+        service = WeatherService(dict(WEATHER, provider="jma", enabled=True))
         service._cache = (float("inf"), TODAY, "本日分のキャッシュ")
         with mock.patch("chime.weather.fetch_json") as mocked:
             text = service.describe(today=TODAY)

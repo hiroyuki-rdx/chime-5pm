@@ -88,10 +88,8 @@
   },
   "extra_segment": {
     "enabled": true,
-    "weather_probability": 0.4,
-    "always_weather_hours": [
-      10
-    ],
+    "weather_probability": 0.0,
+    "always_weather_hours": [],
     "always_quote_hours": [],
     "fallback_to_quote": true
   },
@@ -100,7 +98,7 @@
     "avoid_recent": 8
   },
   "weather": {
-    "enabled": true,
+    "enabled": false,
     "provider": "jma",
     "timeout_seconds": 8.0,
     "cache_minutes": 60,

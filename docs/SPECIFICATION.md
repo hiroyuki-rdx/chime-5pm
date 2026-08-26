@@ -126,8 +126,8 @@
 | 項目 | 既定値 | 意味 |
 |---|---|---|
 | `enabled` | `true` | おまけ放送の有効／無効 |
-| `weather_probability` | `0.4` | 天気予報が選ばれる確率 |
-| `always_weather_hours` | `[10]` | 必ず天気予報にする時 |
+| `weather_probability` | `0.0` | 天気予報が選ばれる確率。既定は `0.0` で、天気予報が無効なため常にひとことになる |
+| `always_weather_hours` | `[]` | 必ず天気予報にする時。既定は空（天気予報が無効なため未使用） |
 | `always_quote_hours` | `[]` | 必ずひとことにする時 |
 | `fallback_to_quote` | `true` | 天気取得失敗時にひとことへ切り替えるか |
 
@@ -142,7 +142,7 @@
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
-| `enabled` | `true` | 天気予報の有効／無効 |
+| `enabled` | `false` | 天気予報の有効／無効。既定は無効で、時報のあとは常に「ひとこと」になる（任意機能。有効化の手順は `docs/SETUP.md` 7 章） |
 | `provider` | `"jma"` | `jma`（気象庁）または `open_meteo` |
 | `timeout_seconds` | `8.0` | HTTP タイムアウト |
 | `cache_minutes` | `60` | 取得結果のキャッシュ時間 |

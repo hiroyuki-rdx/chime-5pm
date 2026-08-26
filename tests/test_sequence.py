@@ -53,6 +53,14 @@ class ChooseExtraTest(unittest.TestCase):
         for value in (0.0, 0.5, 0.999):
             self.assertEqual(choose_extra(11, settings, FixedRandom(value)), EXTRA_QUOTE)
 
+    def test_default_settings_always_choose_a_quote(self):
+        # 運用方針の変更: 時報のあとは常に「ひとこと」にし、天気予報は
+        # 流さない。DEFAULT_CONFIG をそのまま使う限り、どの時刻・どの乱数値
+        # でも天気予報が選ばれないことを回帰確認する。
+        for hour in range(24):
+            for value in (0.0, 0.4, 0.5, 0.999):
+                self.assertEqual(choose_extra(hour, EXTRA, FixedRandom(value)), EXTRA_QUOTE)
+
 
 class StubTTS:
     def __init__(self, tmp, fail=False):
@@ -133,19 +141,29 @@ class BuildHourlyTest(BuilderTestCase):
         self.assertIn("正午をお知らせしました。", plan.spoken)
 
     def test_quote_is_appended(self):
-        # weather_probability=0.4 に対し 0.99 → ひとことが選ばれる
+        # 既定の weather_probability は 0.0 のため、rng の値によらずひとことが選ばれる
         plan = self.make_builder().build_hourly(11)
         self.assertEqual(len(plan.segments), 3)
         self.assertIsNotNone(plan.quote)
         self.assertIn(plan.quote, plan.spoken)
 
+    def force_weather_selection(self):
+        """既定は weather_probability=0.0（常にひとこと）のため、天気予報の
+        経路そのものを検証するテストでは、ここで明示的に確率を 1.0 にして
+        選ばれるようにする。"""
+        self.config.data["extra_segment"]["weather_probability"] = 1.0
+
     def test_weather_is_appended(self):
+        self.force_weather_selection()
         plan = self.make_builder(rng=FixedRandom(0.0)).build_hourly(11)
         self.assertEqual(self.weather.calls, 1)
         self.assertIn("今日の東京の天気は、晴れ。", plan.spoken)
         self.assertIsNone(plan.quote)
 
-    def test_ten_oclock_always_uses_weather(self):
+    def test_always_weather_hours_setting_forces_weather(self):
+        # 既定では always_weather_hours は空だが、設定で指定すれば
+        # その時刻は weather_probability に関わらず必ず天気予報になること。
+        self.config.data["extra_segment"]["always_weather_hours"] = [10]
         plan = self.make_builder(rng=FixedRandom(0.99)).build_hourly(10)
         self.assertIn("今日の東京の天気は、晴れ。", plan.spoken)
 
@@ -153,6 +171,7 @@ class BuildHourlyTest(BuilderTestCase):
         # スケジューリングは設定タイムゾーン基準（ChimeApp.now().date()）で動くため、
         # 天気の「今日」判定も OS のローカル日付ではなく today_provider に従うこと。
         # OS のローカル日付とは絶対に一致しないよう、遠い未来日を注入して確認する。
+        self.force_weather_selection()
         injected_today = date(2099, 1, 1)
         self.assertNotEqual(injected_today, date.today())
         builder = self.make_builder(rng=FixedRandom(0.0),
@@ -163,11 +182,13 @@ class BuildHourlyTest(BuilderTestCase):
     def test_weather_defaults_to_os_local_today_without_a_provider(self):
         # today_provider を渡さない既存の呼び出し方でも壊れず、
         # 従来どおり OS のローカル日付が使われること。
+        self.force_weather_selection()
         builder = self.make_builder(rng=FixedRandom(0.0), today_provider=None)
         builder.build_hourly(11)
         self.assertEqual(self.weather.received_today, [date.today()])
 
     def test_weather_failure_falls_back_to_a_quote(self):
+        self.force_weather_selection()
         builder = self.make_builder(rng=FixedRandom(0.0),
                                     weather=StubWeather(fail=True))
         plan = builder.build_hourly(11)
@@ -178,6 +199,20 @@ class BuildHourlyTest(BuilderTestCase):
         self.config.data["extra_segment"]["enabled"] = False
         plan = self.make_builder().build_hourly(11)
         self.assertEqual(len(plan.segments), 2)
+
+    def test_default_config_always_appends_a_quote_never_weather(self):
+        """既定設定（config.json を作らない場合）では、時報のあとは必ず
+        「ひとこと」になり、天気予報は流れないこと（運用方針の変更）。この点を回帰確認する。
+
+        rng に最も天気予報が選ばれやすい 0.0 を渡してもなお、天気予報の
+        セグメントが 1 つも作られないことまで確認する。
+        """
+        for hour in (10, 11, 12, 14, 16):
+            with self.subTest(hour=hour):
+                plan = self.make_builder(rng=FixedRandom(0.0)).build_hourly(hour)
+                self.assertEqual(len(plan.segments), 3)
+                self.assertIsNotNone(plan.quote)
+        self.assertEqual(self.weather.calls, 0, "既定設定では天気予報を取得してはいけない")
 
     def test_pips_still_play_when_tts_is_broken(self):
         """音声合成が壊れていても、時報音そのものは必ず鳴る。"""

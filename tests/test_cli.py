@@ -114,18 +114,29 @@ class RunTest(unittest.TestCase):
         self.assertIn("0〜23", output)
 
     def test_weather_failure_returns_error_code(self):
-        with mock.patch("chime.weather.fetch_json",
-                        side_effect=__import__("chime.weather", fromlist=["x"]).WeatherError("圏外")):
-            code, output = call(["--weather", "--dry-run"])
+        # 天気予報は既定で無効なので、fetch_json の失敗を検証するこのテストでは
+        # 明示的に有効化する。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"weather": {"enabled": True}}, handle)
+            with mock.patch("chime.weather.fetch_json",
+                            side_effect=__import__("chime.weather", fromlist=["x"]).WeatherError("圏外")):
+                code, output = call(["--config", path, "--weather", "--dry-run"])
         self.assertEqual(code, 1)
         self.assertIn("天気予報を取得できませんでした", output)
 
     def test_weather_success_prints_text(self):
+        # 天気予報は既定で無効なので、明示的に有効化する。
         fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "jma_130000.json")
         with open(fixture, encoding="utf-8") as handle:
             payload = json.load(handle)
-        with mock.patch("chime.weather.fetch_json", return_value=payload):
-            code, output = call(["--weather", "--dry-run"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"weather": {"enabled": True}}, handle)
+            with mock.patch("chime.weather.fetch_json", return_value=payload):
+                code, output = call(["--config", path, "--weather", "--dry-run"])
         self.assertEqual(code, 0)
         self.assertIn("の天気は、", output)
 
@@ -214,12 +225,32 @@ class RunTest(unittest.TestCase):
         self.assertEqual(code, 1)
 
     def test_test_hourly_weather_failure_with_quote_fallback_is_not_an_error(self):
-        """天気取得に失敗しても「ひとこと」への切り替えが成功していればエラーではない。"""
-        with mock.patch("chime.weather.fetch_json",
-                        side_effect=__import__("chime.weather", fromlist=["x"]).WeatherError("圏外")):
-            code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
+        """天気取得に失敗しても「ひとこと」への切り替えが成功していればエラーではない。
+
+        天気予報は既定で無効・出現確率も 0 なので、この 10 時だけは
+        必ず天気予報になるよう明示的に設定して、失敗経路を再現する。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"weather": {"enabled": True},
+                          "extra_segment": {"always_weather_hours": [10]}}, handle)
+            with mock.patch("chime.weather.fetch_json",
+                            side_effect=__import__("chime.weather", fromlist=["x"]).WeatherError("圏外")):
+                code, output = call(["--config", path, "--test-hourly", "10",
+                                     "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("天気予報を取得できませんでした", output)
+
+    def test_test_hourly_default_config_uses_a_quote_not_weather(self):
+        """既定設定では、天気予報ではなく「ひとこと」が流れること
+        （10 時は以前の既定では必ず天気予報になっていた）。"""
+        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("ひとこと", output)
+        self.assertNotIn("天気予報", output)
 
     # -- 不具合4: 音源ファイルが全て欠落していても --test 系が 0 を返していた --
     # （仕様書 4.11 章「再生可能なセグメントを 1 つも用意できなかった場合は 1」に

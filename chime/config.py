@@ -109,9 +109,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 時報のあとに「ひとこと」または「天気予報」を流す
         "enabled": True,
         # 天気予報を選ぶ確率（0.0〜1.0）。残りは「ひとこと」。
-        "weather_probability": 0.4,
+        # 既定は 0.0（天気予報は流さず、常に「ひとこと」にする）。
+        "weather_probability": 0.0,
         # この時刻は必ず天気予報にする
-        "always_weather_hours": [10],
+        # 既定は空（天気予報機能自体は残すが、既定では有効化しない）。
+        "always_weather_hours": [],
         # この時刻は必ず「ひとこと」にする
         "always_quote_hours": [],
         # 天気取得に失敗したら「ひとこと」に切り替える
@@ -123,7 +125,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "avoid_recent": 8,
     },
     "weather": {
-        "enabled": True,
+        # 既定は無効（時報のあとは「ひとこと」のみ）。天気予報機能自体は
+        # 残しているため、必要になれば true にして再度有効化できる。
+        "enabled": False,
         # "jma"（気象庁・キー不要）または "open_meteo"（キー不要）
         "provider": "jma",
         "timeout_seconds": 8.0,
