@@ -6,7 +6,7 @@ import os
 import tempfile
 import unittest
 import wave
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 from chime.app import ChimeApp
 from chime.audio import Player
@@ -137,6 +137,20 @@ class TimezoneTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             app = ChimeApp(Config(DEFAULT_CONFIG, base_dir=tmp), backend="mock")
             self.assertEqual(app.now().utcoffset(), timedelta(hours=9))
+
+    def test_weather_today_follows_configured_timezone_not_os_local(self):
+        """天気の「今日」も、スケジューリングと同じ設定タイムゾーン基準にすること。
+
+        OS のローカル日付（``date.today()``）とは絶対に一致しないよう
+        ``app.now`` を差し替え、その日付が ``builder.today_provider()`` に
+        そのまま反映されることを確認する。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            app = ChimeApp(Config(DEFAULT_CONFIG, base_dir=tmp), backend="mock")
+            fake_today = date.today() + timedelta(days=1)
+            app.now = lambda: datetime.combine(fake_today, datetime.min.time())
+            self.assertEqual(app.builder.today_provider(), fake_today)
+            self.assertNotEqual(app.builder.today_provider(), date.today())
 
     def test_unknown_timezone_falls_back_to_local(self):
         with tempfile.TemporaryDirectory() as tmp:

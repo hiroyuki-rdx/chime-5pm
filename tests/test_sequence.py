@@ -6,6 +6,7 @@ import os
 import random
 import tempfile
 import unittest
+from datetime import date
 
 from tests.support import REPO_ROOT  # noqa: F401
 
@@ -74,9 +75,11 @@ class StubWeather:
         self.text = text
         self.fail = fail
         self.calls = 0
+        self.received_today = []
 
-    def describe(self):
+    def describe(self, today=None):
         self.calls += 1
+        self.received_today.append(today)
         if self.fail:
             raise WeatherError("接続できません")
         return self.text
@@ -101,10 +104,11 @@ class BuilderTestCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make_builder(self, rng=None, tts=None, weather=None):
+    def make_builder(self, rng=None, tts=None, weather=None, today_provider=None):
         return SequenceBuilder(self.config, tts or self.tts, weather or self.weather,
                                self.quotes, self.state, self.time_signal,
-                               rng or FixedRandom(0.99))
+                               rng or FixedRandom(0.99),
+                               today_provider=today_provider)
 
     def labels(self, plan):
         return [segment.label for segment in plan.segments]
@@ -144,6 +148,24 @@ class BuildHourlyTest(BuilderTestCase):
     def test_ten_oclock_always_uses_weather(self):
         plan = self.make_builder(rng=FixedRandom(0.99)).build_hourly(10)
         self.assertIn("今日の東京の天気は、晴れ。", plan.spoken)
+
+    def test_weather_uses_the_configured_today_provider(self):
+        # スケジューリングは設定タイムゾーン基準（ChimeApp.now().date()）で動くため、
+        # 天気の「今日」判定も OS のローカル日付ではなく today_provider に従うこと。
+        # OS のローカル日付とは絶対に一致しないよう、遠い未来日を注入して確認する。
+        injected_today = date(2099, 1, 1)
+        self.assertNotEqual(injected_today, date.today())
+        builder = self.make_builder(rng=FixedRandom(0.0),
+                                    today_provider=lambda: injected_today)
+        builder.build_hourly(11)
+        self.assertEqual(self.weather.received_today, [injected_today])
+
+    def test_weather_defaults_to_os_local_today_without_a_provider(self):
+        # today_provider を渡さない既存の呼び出し方でも壊れず、
+        # 従来どおり OS のローカル日付が使われること。
+        builder = self.make_builder(rng=FixedRandom(0.0), today_provider=None)
+        builder.build_hourly(11)
+        self.assertEqual(self.weather.received_today, [date.today()])
 
     def test_weather_failure_falls_back_to_a_quote(self):
         builder = self.make_builder(rng=FixedRandom(0.0),

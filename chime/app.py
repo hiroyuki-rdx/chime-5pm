@@ -53,6 +53,9 @@ class ChimeApp:
         self.builder = SequenceBuilder(
             config, self.tts, self.weather, self.quotes, self.state,
             self.time_signal_path, random.Random(),
+            # 天気予報の「今日」も、スケジューリングと同じ設定タイムゾーン基準にする
+            # （OS のローカル時刻が UTC のままでも日付がずれないように）。
+            today_provider=lambda: self.now().date(),
         )
         self.scheduler = Scheduler(
             config.section("schedule"),

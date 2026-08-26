@@ -12,7 +12,8 @@ from __future__ import annotations
 import logging
 import random
 from dataclasses import dataclass, field
-from typing import Any, List, Mapping, Optional
+from datetime import date
+from typing import Any, Callable, List, Mapping, Optional
 
 from .audio import Segment
 from .quotes import QuoteError, QuotePicker
@@ -65,7 +66,8 @@ class SequenceBuilder:
 
     def __init__(self, config, tts: TTSService, weather: WeatherService,
                  quotes: QuotePicker, state, time_signal_path: str,
-                 rng: Optional[random.Random] = None) -> None:
+                 rng: Optional[random.Random] = None,
+                 today_provider: Optional[Callable[[], date]] = None) -> None:
         self.config = config
         self.tts = tts
         self.weather = weather
@@ -73,6 +75,10 @@ class SequenceBuilder:
         self.state = state
         self.time_signal_path = time_signal_path
         self.rng = rng or random.Random()
+        # 天気予報の「今日」を決める手段。既定は OS のローカル日付だが、
+        # スケジューリングは設定タイムゾーン（``ChimeApp.now()``）基準で動くため、
+        # 呼び出し側（``ChimeApp``）はそちらの日付を渡すことで両者を一致させる。
+        self.today_provider: Callable[[], date] = today_provider or date.today
 
     # ------------------------------------------------------------------
     def build(self, event: Event) -> PlaybackPlan:
@@ -149,7 +155,7 @@ class SequenceBuilder:
     def _append_weather(self, plan: PlaybackPlan, hour: int) -> None:
         settings = self.config.section("extra_segment")
         try:
-            text = self.weather.describe()
+            text = self.weather.describe(today=self.today_provider())
         except WeatherError as exc:
             message = "天気予報を取得できませんでした: {0}".format(exc)
             logger.warning(message)
