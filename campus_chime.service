@@ -1,15 +1,28 @@
 [Unit]
-Description=Campus Evening Chime System
-After=network.target audio.target sound.target
+Description=Campus Chime System (hourly time signal and closing announcement)
+Documentation=https://github.com/hiroyuki-rdx/chime-5pm
+# 本機は RTC 非搭載のため、NTP 同期後に起動する（誤った時刻での判定を防ぐ）
+Wants=time-sync.target
+After=time-sync.target sound.target network.target
 
 [Service]
+Type=simple
 User=pi
+Group=pi
 WorkingDirectory=/home/pi/campus-chime
+# Lite 環境にはデスクトップ由来のサウンドサーバーが無いため ALSA を明示する
+Environment=SDL_AUDIODRIVER=alsa
+# journal へ即時に流す（バッファリングでログが遅れるのを防ぐ）
+Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/python3 /home/pi/campus-chime/campus_chime.py
-Restart=on-failure
+# 専用機のため、正常終了・異常終了を問わず必ず復帰させる
+Restart=always
+RestartSec=10
+# 音声デバイスへのアクセスに必要
+SupplementaryGroups=audio
+# 最低限の保護（cache/ への書き込みが必要なため ProtectHome は設定しない）
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
-
-
-

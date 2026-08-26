@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 実機（Raspberry Pi OS Bookworm）は 3.11。下限として 3.9 も検証する。
+        python-version: ["3.9", "3.11", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: 構文チェック
+        run: python -m compileall -q chime campus_chime.py scripts tests
+
+      - name: ユニットテスト
+        run: python -m unittest discover -s tests -t . -v
+
+      - name: CLI が起動すること
+        run: |
+          python campus_chime.py --version
+          python campus_chime.py --schedule 3
+          python campus_chime.py --test-hourly 12 --dry-run --backend mock
+
+  shell:
+    name: シェルスクリプト
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: 構文チェック
+        run: bash -n scripts/setup.sh
+      - name: shellcheck
+        run: shellcheck scripts/setup.sh
