@@ -88,6 +88,10 @@ def drop_after_markers(text: str, markers: Optional[Iterable[str]]) -> str:
     気象庁の予報文には「所により」のような地域限定の但し書きが続くことがあり、
     館内放送としては冗長かつ読み上げが長くなる原因になる。``markers`` が
     空（``None`` や ``[]``）なら何も切り捨てない。
+
+    切り捨てた結果が空文字列になる場合（例: 予報文が「所により」で始まる）は、
+    切り捨てを行わず元の文をそのまま返す。読み上げ文が「天気は、。」のように
+    壊れるくらいなら、多少長い文のほうが害が小さい。
     """
     if not markers:
         return text
@@ -99,7 +103,8 @@ def drop_after_markers(text: str, markers: Optional[Iterable[str]]) -> str:
         index = text.find(marker)
         if index != -1 and index < cut:
             cut = index
-    return text[:cut].rstrip("、")
+    result = text[:cut].rstrip("、")
+    return result if result else text
 
 
 def truncate_weather_text(text: str, max_chars: Any, separator: str = "、") -> str:
@@ -118,6 +123,9 @@ def truncate_weather_text(text: str, max_chars: Any, separator: str = "、") -> 
     cut = text.rfind(separator, 0, limit)
     if cut <= 0:
         return text
+    # cut > 0 が確定しているため、text[:cut] は必ず空文字列にならない
+    # （drop_after_markers と同じ「切り詰めた結果が空にならない」方針を、
+    # ここでは cut <= 0 のガードがそのまま満たしている）。
     return text[:cut]
 
 
@@ -194,6 +202,13 @@ def parse_jma(payload: Any, settings: Mapping[str, Any], today: date) -> Dict[st
 
     weather_text = normalize_weather_text(weathers[index])
     weather_text = drop_after_markers(weather_text, settings.get("drop_after", ["所により"]))
+    if not weather_text:
+        # 空文字列ガードはここ 1 箇所に集約する。予報文（正規化・切り捨て後）が
+        # 空 = 実質的に天気情報が無いということなので、build_text で
+        # 「今日の滋賀の天気は、。」のような壊れた文を組み立てさせるのではなく、
+        # ここで WeatherError を送出する。呼び出し側（chime.sequence）はこれを
+        # 受けて設計どおり「ひとこと」に切り替える。
+        raise WeatherError("気象庁 API の応答に天気予報の本文が含まれていません。")
 
     result: Dict[str, Any] = {
         "when": _relative_label(target_date, today),
@@ -311,7 +326,12 @@ def parse_open_meteo(payload: Any, settings: Mapping[str, Any], today: date) -> 
 
 
 def build_text(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> str:
-    """抜き出した要素から読み上げ文を組み立てる。"""
+    """抜き出した要素から読み上げ文を組み立てる。
+
+    ``parts["weather"]`` が空文字列にならないことはここでは保証しない。
+    空文字ガードは呼び出し側の parse_jma / parse_open_meteo に集約しており
+    （空なら WeatherError を送出する）、ここで二重に防御はしない。
+    """
     details: List[str] = []
     if parts.get("temp_max") is not None:
         details.append("最高気温は{0}度".format(parts["temp_max"]))

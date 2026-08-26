@@ -62,6 +62,21 @@ class DropAfterMarkersTest(unittest.TestCase):
         text = "晴れ、のち、雨、時々、くもり"
         self.assertEqual(drop_after_markers(text, ["くもり", "のち"]), "晴れ")
 
+    def test_marker_at_start_does_not_truncate_to_empty(self):
+        # 予報文が「所により」で始まる境界ケース。切り捨てた結果が空文字列に
+        # なる場合は、壊れた文（「天気は、。」）を読み上げるより、切り捨てずに
+        # 元の文をそのまま使うほうが害が小さい。
+        text = "所により、雨"
+        self.assertEqual(drop_after_markers(text, ["所により"]), text)
+
+    def test_marker_matching_entire_text_does_not_truncate_to_empty(self):
+        text = "所により"
+        self.assertEqual(drop_after_markers(text, ["所により"]), text)
+
+    def test_empty_input_stays_empty(self):
+        # 元々空文字列なら、切り捨てても空のまま（フォールバック対象にはならない）。
+        self.assertEqual(drop_after_markers("", ["所により"]), "")
+
 
 class TruncateWeatherTextTest(unittest.TestCase):
     def test_short_text_is_untouched(self):
@@ -217,6 +232,43 @@ class ParseJmaShigaTest(unittest.TestCase):
         settings = dict(WEATHER["jma"], drop_after=[])
         parts = parse_jma(payload, settings, TODAY)
         self.assertEqual(parts["weather"], "晴れ、所により、くもり")
+
+    def _with_south_weather(self, weather_text):
+        payload = json.loads(json.dumps(self.payload))  # deep copy
+        for series in payload[0]["timeSeries"]:
+            for area in series.get("areas", []):
+                if "weathers" in area and area["area"]["name"] == "南部":
+                    area["weathers"][0] = weather_text
+        return payload
+
+    def test_forecast_starting_with_marker_is_not_truncated_to_empty(self):
+        # 境界ケース: 予報文が但し書き「所により」で始まると、素直に切り捨てる
+        # と結果が空文字列になり、読み上げ文が「天気は、。」のように壊れる。
+        # 壊れた文より多少長い文のほうが害が小さいため、切り捨てずに使う。
+        payload = self._with_south_weather("所により　雨")
+        parts = parse_jma(payload, WEATHER["jma"], TODAY)
+        self.assertEqual(parts["weather"], "所により、雨")
+        text = build_text(parts, WEATHER)
+        self.assertNotIn("は、。", text)
+        self.assertEqual(
+            text,
+            "今日の滋賀の天気は、所により、雨。最高気温は27度、降水確率は20パーセントです。")
+
+    def test_forecast_that_is_only_the_marker_is_not_truncated_to_empty(self):
+        payload = self._with_south_weather("所により")
+        parts = parse_jma(payload, WEATHER["jma"], TODAY)
+        self.assertEqual(parts["weather"], "所により")
+        text = build_text(parts, WEATHER)
+        self.assertNotIn("は、。", text)
+
+    def test_empty_forecast_text_raises_weather_error(self):
+        # 予報文そのものが空（または空白のみ）なら天気情報が実質無いということ。
+        # build_text で壊れた文を組み立てるのではなく、ここで WeatherError を
+        # 送出し、呼び出し側（chime.sequence）で「ひとこと」に切り替えてもらう。
+        for empty_text in ("", "　", "  "):
+            payload = self._with_south_weather(empty_text)
+            with self.assertRaises(WeatherError):
+                parse_jma(payload, WEATHER["jma"], TODAY)
 
 
 class ParseOpenMeteoTest(unittest.TestCase):
