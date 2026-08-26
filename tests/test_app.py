@@ -169,5 +169,69 @@ class PlayerSelectionTest(AppTestCase):
             self.assertIs(app.player, app._player)
 
 
+class ExplodingPlayer(Player):
+    """再生中に想定外の例外を送出するテスト用バックエンド。"""
+
+    name = "exploding"
+
+    def play_one(self, segment):
+        raise RuntimeError("想定外の再生エラー")
+
+
+class PlayReturnValueTest(AppTestCase):
+    """``ChimeApp.play()`` の戻り値（再生の成否）を確認する。
+
+    ``--say``・``--test-hourly``・``--test``・``--test-all`` は、この戻り値を
+    見て終了コードを決める（``chime/cli.py``）。再生に失敗しても例外は外に
+    出さず、常駐は継続できることも合わせて確認する。
+    """
+
+    def test_returns_true_on_success(self):
+        plan = PlaybackPlan(event=None, segments=[Segment(self.wav, label="テスト音")])
+        self.assertTrue(self.app.play(plan))
+        self.assertEqual(self.player.played, [self.wav])
+
+    def test_returns_false_when_no_segments(self):
+        """再生対象のセグメントが 1 つも無ければ失敗として扱う。"""
+        plan = PlaybackPlan(event=None, segments=[])
+        self.assertTrue(self.app.play(plan) is False)
+        self.assertEqual(self.player.played, [])
+
+    def test_returns_false_on_playback_error(self):
+        """必須セグメントの音源ファイルが欠落している場合は失敗として扱う
+        （再現手順: 音源ファイルが存在しないパスを指定して ``--test`` する）。"""
+        plan = PlaybackPlan(event=None,
+                            segments=[Segment("/nonexistent.wav", label="欠落")])
+        self.assertFalse(self.app.play(plan))
+        self.assertEqual(self.player.played, [])
+
+    def test_returns_false_on_unexpected_exception(self):
+        self.app._player = ExplodingPlayer({})
+        plan = PlaybackPlan(event=None, segments=[Segment(self.wav, label="テスト音")])
+        self.assertFalse(self.app.play(plan))
+
+    def test_dry_run_returns_true_even_with_no_segments(self):
+        """``--dry-run`` は再生をスキップするだけで失敗ではないため、
+        セグメントが 0 件でも True を返す。"""
+        self.app.dry_run = True
+        plan = PlaybackPlan(event=None, segments=[])
+        self.assertTrue(self.app.play(plan))
+        self.assertEqual(self.player.played, [])
+
+    def test_dry_run_returns_true_without_playing(self):
+        self.app.dry_run = True
+        plan = PlaybackPlan(event=None, segments=[Segment(self.wav, label="テスト音")])
+        self.assertTrue(self.app.play(plan))
+        self.assertEqual(self.player.played, [])
+
+    def test_run_event_does_not_use_return_value(self):
+        """``run_event()`` は ``play()`` の戻り値を使わず、
+        再生に失敗しても従来どおり再生済みとして記録する。"""
+        self.app.builder = StubBuilder([Segment("/nonexistent.wav", label="欠落")])
+        event = self.past_event()
+        self.app.run_event(event)
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+
 if __name__ == "__main__":
     unittest.main()

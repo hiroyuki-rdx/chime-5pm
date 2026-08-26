@@ -113,20 +113,31 @@ class ChimeApp:
         logger.info("設定ソース: %s", " → ".join(self.config.sources))
 
     # -- 再生 -----------------------------------------------------------
-    def play(self, plan: PlaybackPlan) -> None:
-        """プランを再生する（``--dry-run`` の場合はログのみ）。"""
+    def play(self, plan: PlaybackPlan) -> bool:
+        """プランを再生する（``--dry-run`` の場合はログのみ）。
+
+        戻り値は実際に再生できたかどうか。``--dry-run`` は再生自体を行わない
+        ため失敗ではなく常に ``True``。再生対象のセグメントが 1 つもない場合
+        や、再生中にエラーが発生した場合（``PlaybackError`` や予期しない例外）
+        は ``False`` を返す。いずれの場合も例外は外へ送出しない（放送失敗で
+        プロセスを落とさないという方針は変えない）。
+        """
         logger.info(plan.describe())
         if self.dry_run:
             logger.info("dry-run のため再生しません。")
-            return
+            return True
+        if not plan.segments:
+            return False
         try:
             self.player.play(plan.segments)
         except PlaybackError as exc:
             logger.error("再生に失敗しました: %s", exc)
+            return False
         except Exception as exc:  # pragma: no cover - 再生失敗でプロセスは落とさない
             logger.exception("再生中に予期しないエラーが発生しました: %s", exc)
-        else:
-            logger.info("再生シーケンスが完了しました。")
+            return False
+        logger.info("再生シーケンスが完了しました。")
+        return True
 
     def run_event(self, event: Event) -> None:
         """イベント 1 件を準備・再生し、再生済みとして記録する。"""

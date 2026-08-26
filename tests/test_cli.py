@@ -15,6 +15,7 @@ from unittest import mock
 from tests.support import REPO_ROOT  # noqa: F401
 
 from chime import env
+from chime.audio import Segment
 from chime.cli import build_parser, run
 from chime.sequence import PlaybackPlan
 
@@ -164,12 +165,13 @@ class RunTest(unittest.TestCase):
 
     # -- 不具合3: 音声合成が全滅しても --say / --test-hourly が 0 を返していた --
     def test_say_returns_1_when_tts_completely_fails(self):
+        """``--dry-run`` は再生をスキップするだけで常に成功扱いのため、
+        実際に再生を試みる（＝``--dry-run`` を付けない）場合で確認する。"""
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump({"tts": {"engines": []}}, handle)
-            code, output = call(["--config", path, "--say", "テスト",
-                                 "--dry-run", "--backend", "mock"])
+            code, output = call(["--config", path, "--say", "テスト", "--backend", "mock"])
         self.assertEqual(code, 1)
         self.assertIn("合成できませんでした", output)
 
@@ -186,13 +188,17 @@ class RunTest(unittest.TestCase):
         self.assertIn("合成できませんでした", output)
 
     def test_test_hourly_returns_1_when_no_segments_at_all(self):
-        """時報音を含め、再生できるセグメントが 1 つも無ければ 1 を返す。"""
+        """時報音を含め、再生できるセグメントが 1 つも無ければ 1 を返す。
+
+        ``--dry-run`` は再生自体を行わないため常に成功扱いになるので、
+        ここでは付けずに確認する。
+        """
         def fake_build_hourly(self, hour, event=None):
             return PlaybackPlan(event=event, segments=[],
                                 warnings=["時報音すら用意できませんでした"])
 
         with mock.patch("chime.sequence.SequenceBuilder.build_hourly", fake_build_hourly):
-            code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
+            code, output = call(["--test-hourly", "10", "--backend", "mock"])
         self.assertEqual(code, 1)
 
     def test_test_hourly_weather_failure_with_quote_fallback_is_not_an_error(self):
@@ -202,6 +208,69 @@ class RunTest(unittest.TestCase):
             code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("天気予報を取得できませんでした", output)
+
+    # -- 不具合4: 音源ファイルが全て欠落していても --test 系が 0 を返していた --
+    # （仕様書 4.11 章「再生可能なセグメントを 1 つも用意できなかった場合は 1」に
+    #  実装が追いついていなかった不具合。len(plan.segments) を数えるだけで、
+    #  実際にファイルが再生できたかを見ていなかった）
+    def test_test_returns_1_when_closing_audio_files_are_both_missing(self):
+        """再現手順そのもの: 閉館放送の音源が両方とも存在しないパスなら、
+        一音も鳴らないので終了コードは 1 になること。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"closing": {"announce_file": "assets/does_not_exist.wav",
+                                       "music_file": "assets/also_missing.mp3"}}, handle)
+            code, output = call(["--config", path, "--test", "--backend", "mock"])
+        self.assertEqual(code, 1)
+        self.assertIn("音源ファイルが見つかりません", output)
+
+    def test_test_all_returns_0_when_only_closing_audio_is_missing(self):
+        """時報は鳴るが閉館放送の音源だけ欠けている場合、一部は鳴っているので 0 のまま。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"tts": {"engines": []},
+                          "extra_segment": {"enabled": False},
+                          "audio": {"mock_max_seconds": 0.05},
+                          "closing": {"announce_file": "assets/does_not_exist.wav",
+                                     "music_file": "assets/also_missing.mp3"}}, handle)
+            code, output = call(["--config", path, "--test-all", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("音源ファイルが見つかりません", output)
+
+    def test_say_returns_0_when_playback_succeeds(self):
+        """再生に成功すれば 0 を返す（``build_text`` が返すプランを差し替えて確認）。"""
+        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+
+        def fake_build_text(self, text):
+            return PlaybackPlan(event=None, segments=[Segment(wav, label="読み上げ")])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"audio": {"mock_max_seconds": 0.05}}, handle)
+            with mock.patch("chime.sequence.SequenceBuilder.build_text", fake_build_text):
+                code, output = call(["--config", path, "--say", "テストです", "--backend", "mock"])
+        self.assertEqual(code, 0)
+
+    def test_say_dry_run_returns_0_regardless_of_segments(self):
+        """``--dry-run`` は再生をスキップするだけで失敗ではないため、常に 0 を返す。"""
+        code, output = call(["--say", "テストです", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+
+    def test_test_hourly_returns_0_when_tts_disabled_and_audio_files_present(self):
+        """TTS が全滅していても時報音（同梱アセット）は鳴るので 0 のまま
+        （``--dry-run`` を付けずに実際の再生成否で確認する）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"tts": {"engines": []},
+                          "extra_segment": {"enabled": False},
+                          "audio": {"mock_max_seconds": 0.05}}, handle)
+            code, output = call(["--config", path, "--test-hourly", "10", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("合成できませんでした", output)
 
 
 class EnvironmentTest(unittest.TestCase):

@@ -131,14 +131,13 @@ def run(argv: Optional[List[str]] = None) -> int:
             return 2
         app.log_environment()
         plan = app.builder.build_text(args.say)
-        app.play(plan)
-        if not plan.segments:
+        if not app.play(plan):
             return 1
         return 0
 
     if args.test_hourly is not None or args.test or args.test_all:
         app.log_environment()
-        total_segments = 0
+        succeeded = False
         if args.test_hourly is not None or args.test_all:
             hour = app.now().hour if (args.test_hourly is None or args.test_hourly < 0) \
                 else args.test_hourly
@@ -147,15 +146,15 @@ def run(argv: Optional[List[str]] = None) -> int:
                 return 2
             logger.info("テストモード: %d 時の時報を再生します。", hour)
             plan = app.builder.build_hourly(hour)
-            app.play(plan)
-            total_segments += len(plan.segments)
+            if app.play(plan):
+                succeeded = True
         if args.test or args.test_all:
             logger.info("テストモード: 閉館放送を再生します。")
             plan = app.builder.build_closing()
-            app.play(plan)
-            total_segments += len(plan.segments)
+            if app.play(plan):
+                succeeded = True
         logger.info("テストを終了します。")
-        if total_segments == 0:
+        if not succeeded:
             logger.error("再生できるセグメントがありませんでした。")
             return 1
         return 0
