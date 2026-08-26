@@ -278,6 +278,8 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 { "schedule": { "hourly": { "start_hour": 9, "end_hour": 17 } } }
 ```
 
+（9 時は Open JTalk が誤読しやすい時刻の一つですが、既定の `hour_readings` で正しく読めるよう対策済みです）
+
 **お昼の時報だけ止める**
 
 ```json
@@ -304,6 +306,19 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 { "time_signal": {
     "announce_template": "ただいま{period}{hour}時です。",
     "noon_template": "ただいま正午です。" } }
+```
+
+`{hour}` は数字のみ（例: `4`）のプレースホルダです。Open JTalk は「4時」を「よんじ」、「7時」を「ななじ」、「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読します（正しくは よじ／しちじ／くじ／れいじ）。誤読対策込みの読みが欲しい場合は `{hour}` の代わりに `{hour_reading}` を使ってください（既定のテンプレートはこちらを使っています）。
+
+```json
+{ "time_signal": {
+    "announce_template": "ただいま{period}{hour_reading}です。" } }
+```
+
+対象の時刻を増やしたい場合は `hour_readings` に追加します（キーは 12 時間表記の「時」、文字列）。
+
+```json
+{ "time_signal": { "hour_readings": { "0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ", "1": "いちじ" } } }
 ```
 
 **天気予報の地域を変える**

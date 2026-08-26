@@ -125,14 +125,31 @@ def hour_parts(hour: int, settings: Mapping[str, Any]) -> Dict[str, Any]:
         period, hour12 = settings.get("period_pm", "午後"), 12
     else:
         period, hour12 = settings.get("period_pm", "午後"), hour - 12
-    return {"period": period, "hour": hour12, "hour24": hour}
+
+    # Open JTalk（MeCab）は「4時」を「よんじ」、「7時」を「ななじ」、
+    # 「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読する
+    # （正しくは よじ／しちじ／くじ／れいじ）。「午後よ時」のように数字部分
+    # だけをかな化すると今度は「時」が「とき」と読まれてしまうため、
+    # 誤読する時刻に限り「時」を含めて丸ごとかな書きに置き換える
+    # （hour_readings、既定はこの 4 つのみ）。
+    # 正しく読める時刻まで一律にかな化しないのは、TTS のアクセントが
+    # かえって不自然になるのを避けるため。
+    hour_readings: Mapping[str, str] = settings.get("hour_readings", {}) or {}
+    hour_reading = hour_readings.get(str(hour12), "{0}時".format(hour12))
+
+    return {"period": period, "hour": hour12, "hour24": hour, "hour_reading": hour_reading}
 
 
 def announce_text(hour: int, settings: Mapping[str, Any]) -> str:
-    """「午前10時をお知らせしました。」のような読み上げ文言を組み立てる。"""
+    """「午前10時をお知らせしました。」のような読み上げ文言を組み立てる。
+
+    テンプレートの ``{hour_reading}`` は誤読対策込みの時刻表現
+    （例: 16 時なら「よじ」）。後方互換のため、数値のみの ``{hour}`` も
+    引き続き使える（利用者が独自にテンプレートを書き換えている場合に備える）。
+    """
     parts = hour_parts(hour, settings)
     if parts["hour24"] == 12 and settings.get("use_noon_template", True):
         template = settings.get("noon_template", "正午をお知らせしました。")
     else:
-        template = settings.get("announce_template", "{period}{hour}時をお知らせしました。")
+        template = settings.get("announce_template", "{period}{hour_reading}をお知らせしました。")
     return template.format(**parts)

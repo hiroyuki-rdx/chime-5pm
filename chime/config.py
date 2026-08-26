@@ -93,13 +93,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # クリックノイズ防止のためのフェード（ミリ秒）
         "envelope_ms": 5,
         "output_file": "assets/generated/time_signal.wav",
-        # 「午前10時をお知らせしました。」
-        "announce_template": "{period}{hour}時をお知らせしました。",
+        # 「午前10時をお知らせしました。」（{hour_reading} は下記 hour_readings 参照）
+        "announce_template": "{period}{hour_reading}をお知らせしました。",
         # 12 時台のみ差し替える（NHK 準拠）
         "use_noon_template": True,
         "noon_template": "正午をお知らせしました。",
         "period_am": "午前",
         "period_pm": "午後",
+        # Open JTalk が誤読する時刻（12 時間表記の「時」）だけ、読みをかな書きで
+        # 上書きする。キーは文字列（JSON の都合上）。既定の 4 つ以外は正しく
+        # 読めるため、意図的に上書きしていない（詳細は chime/timesignal.py 参照）。
+        "hour_readings": {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"},
     },
     "extra_segment": {
         # 時報のあとに「ひとこと」または「天気予報」を流す
@@ -139,6 +143,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # 空文字列なら従来どおり area_name で選ぶ（後方互換）。
             "temp_area_name": "大津",
             "label": "滋賀",
+            # 「所により」以降は地域限定の但し書きで、館内放送には不要かつ
+            # 読み上げが長くなる原因になるため既定で切り捨てる。
+            # 空リスト（[]）にすると切り捨てを無効化できる。
+            "drop_after": ["所により"],
         },
         "open_meteo": {
             "latitude": 35.0045,
@@ -148,6 +156,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "template": "{when}の{label}の天気は、{weather}。{details}",
         "details_separator": "、",
         "suffix": "です。",
+        # 天気の説明部分（{weather}）の文字数上限。予期しない長文の予報が来た
+        # 場合の保険で、超えたら読点の位置で切り詰める（文の途中では切らない）。
+        "max_weather_chars": 40,
     },
     "tts": {
         # 上から順に試し、失敗したら次のエンジンへフォールバックする

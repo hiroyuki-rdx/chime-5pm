@@ -17,12 +17,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import date, datetime
-from typing import Any, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +69,56 @@ def fetch_json(url: str, timeout: float) -> Any:
 
 
 def normalize_weather_text(text: str) -> str:
-    """気象庁の予報文から全角・半角スペースを取り除く。"""
-    return "".join(str(text).split()).replace("　", "")
+    """気象庁の予報文中の空白を読点「、」に変換する。
+
+    気象庁の ``weathers`` は全角スペースが形態素の境界を表している
+    （例: ``"晴れ　時々　くもり"``）。これを単純に削除すると、Open JTalk の
+    形態素解析（MeCab）が正しく区切れなくなり、読み上げが崩壊する
+    （「所により」を含む長文で実測 23 秒・読み崩れを確認済み）。
+    スペースを削除するのではなく読点に置き換えることで、区切りを保ったまま
+    自然な文にする。連続する空白は 1 つの読点にまとめ、前後の余分な読点は削る。
+    """
+    collapsed = re.sub(r"[ 　]+", "、", str(text).strip())
+    return collapsed.strip("、")
+
+
+def drop_after_markers(text: str, markers: Optional[Iterable[str]]) -> str:
+    """``markers`` のいずれかが最初に現れる位置以降を切り捨てる。
+
+    気象庁の予報文には「所により」のような地域限定の但し書きが続くことがあり、
+    館内放送としては冗長かつ読み上げが長くなる原因になる。``markers`` が
+    空（``None`` や ``[]``）なら何も切り捨てない。
+    """
+    if not markers:
+        return text
+    cut = len(text)
+    for marker in markers:
+        marker = str(marker)
+        if not marker:
+            continue
+        index = text.find(marker)
+        if index != -1 and index < cut:
+            cut = index
+    return text[:cut].rstrip("、")
+
+
+def truncate_weather_text(text: str, max_chars: Any, separator: str = "、") -> str:
+    """``max_chars`` 文字を超える場合、``separator`` の位置で切り詰める。
+
+    予期しない長文の予報が来た場合の保険（NFR: 読み上げ時間の上限）。
+    文の途中で不自然にぶつ切りにならないよう、必ず区切り記号の位置で切る。
+    区切りが見つからない場合は切らない（中途半端な文を読み上げるより安全）。
+    """
+    try:
+        limit = int(max_chars)
+    except (TypeError, ValueError):
+        limit = 40
+    if limit <= 0 or len(text) <= limit:
+        return text
+    cut = text.rfind(separator, 0, limit)
+    if cut <= 0:
+        return text
+    return text[:cut]
 
 
 def _relative_label(target: date, today: date) -> str:
@@ -143,10 +192,13 @@ def parse_jma(payload: Any, settings: Mapping[str, Any], today: date) -> Dict[st
     if index < len(time_defines) and time_defines[index]:
         target_date = time_defines[index].date()
 
+    weather_text = normalize_weather_text(weathers[index])
+    weather_text = drop_after_markers(weather_text, settings.get("drop_after", ["所により"]))
+
     result: Dict[str, Any] = {
         "when": _relative_label(target_date, today),
         "label": str(settings.get("label") or area.get("area", {}).get("name", "")),
-        "weather": normalize_weather_text(weathers[index]),
+        "weather": weather_text,
         "temp_max": None,
         "temp_min": None,
         "pop": None,
@@ -272,11 +324,15 @@ def build_text(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> str:
     suffix = str(settings.get("suffix", "です。"))
     detail_text = separator.join(details) + suffix if details else ""
 
+    # 予期しない長文の予報が来た場合の保険。読点の位置で切り詰める。
+    weather_text = truncate_weather_text(
+        str(parts.get("weather", "")), settings.get("max_weather_chars", 40))
+
     template = str(settings.get("template", "{when}の{label}の天気は、{weather}。{details}"))
     text = template.format(
         when=parts.get("when", ""),
         label=parts.get("label", ""),
-        weather=parts.get("weather", ""),
+        weather=weather_text,
         details=detail_text,
     )
     return text.strip()
