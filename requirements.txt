@@ -1,1 +1,8 @@
+# 実機（Raspberry Pi OS Lite）では apt で入れるのが確実です。
+#   sudo apt install -y python3-pygame
+# pip で入れる場合のみ、このファイルを使ってください。
+#   pip3 install -r requirements.txt --break-system-packages
+#
+# pygame 以外の依存はありません（天気予報・音声合成・時報音生成はすべて
+# 標準ライブラリと apt パッケージ（open-jtalk）だけで動きます）。
 pygame>=2.5.0

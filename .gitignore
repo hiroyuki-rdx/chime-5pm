@@ -1,11 +1,20 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-.DS_Store
-.vscode/
-env/
+.venv/
 venv/
+env/
+
+# 現地設定（各機ごとに異なるため Git 管理外）
+config.json
+
+# 実行時に生成されるもの
+cache/
+assets/generated/
 *.log
 
-
-
+# エディタ・OS
+.vscode/
+.idea/
+.DS_Store

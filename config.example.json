@@ -1,0 +1,147 @@
+{
+  "timezone": "Asia/Tokyo",
+  "logging": {
+    "level": "INFO",
+    "format": "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+  },
+  "schedule": {
+    "hourly": {
+      "enabled": true,
+      "start_hour": 10,
+      "end_hour": 16,
+      "minute": 0,
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "skip_hours": []
+    },
+    "closing": {
+      "enabled": true,
+      "hour": 16,
+      "minute": 57,
+      "weekdays": [
+        0,
+        1,
+        2,
+        3,
+        4
+      ]
+    },
+    "pip_lead_seconds": null,
+    "prepare_lead_seconds": 45.0,
+    "catchup_grace_seconds": 120.0,
+    "max_sleep_seconds": 30.0
+  },
+  "audio": {
+    "backend": "auto",
+    "mixer": {
+      "frequency": 44100,
+      "size": -16,
+      "channels": 2,
+      "buffer": 4096
+    },
+    "gap_ms": 350,
+    "fade_in_ms": 2000,
+    "commands": {
+      ".wav": [
+        "aplay",
+        "-q",
+        "{path}"
+      ],
+      ".mp3": [
+        "mpg123",
+        "-q",
+        "{path}"
+      ]
+    },
+    "mock_max_seconds": 3.0
+  },
+  "time_signal": {
+    "short_pip": {
+      "frequency": 440.0,
+      "duration_ms": 100
+    },
+    "long_pip": {
+      "frequency": 880.0,
+      "duration_ms": 1000
+    },
+    "short_pip_count": 3,
+    "pip_interval_ms": 1000,
+    "volume": 0.6,
+    "envelope_ms": 5,
+    "output_file": "assets/generated/time_signal.wav",
+    "announce_template": "{period}{hour}時をお知らせしました。",
+    "use_noon_template": true,
+    "noon_template": "正午をお知らせしました。",
+    "period_am": "午前",
+    "period_pm": "午後"
+  },
+  "extra_segment": {
+    "enabled": true,
+    "weather_probability": 0.4,
+    "always_weather_hours": [
+      10
+    ],
+    "always_quote_hours": [],
+    "fallback_to_quote": true
+  },
+  "quotes": {
+    "file": "assets/quotes.json",
+    "avoid_recent": 8
+  },
+  "weather": {
+    "enabled": true,
+    "provider": "jma",
+    "timeout_seconds": 8.0,
+    "cache_minutes": 60,
+    "jma": {
+      "area_code": "250000",
+      "area_name": "南部",
+      "temp_area_name": "大津",
+      "label": "滋賀"
+    },
+    "open_meteo": {
+      "latitude": 35.0045,
+      "longitude": 135.8686,
+      "label": "滋賀"
+    },
+    "template": "{when}の{label}の天気は、{weather}。{details}",
+    "details_separator": "、",
+    "suffix": "です。"
+  },
+  "tts": {
+    "engines": [
+      "prerecorded",
+      "voicevox",
+      "open_jtalk"
+    ],
+    "cache_dir": "cache/tts",
+    "prerecorded_dir": "assets/voice",
+    "open_jtalk": {
+      "binary": "open_jtalk",
+      "dictionary": "",
+      "voice": "",
+      "sampling_frequency": 48000,
+      "speed": 1.0,
+      "additional_half_tone": 0.0,
+      "volume_gain_db": 0.0
+    },
+    "voicevox": {
+      "base_url": "http://127.0.0.1:50021",
+      "speaker": 3,
+      "timeout_seconds": 20.0
+    }
+  },
+  "closing": {
+    "announce_file": "assets/announce.wav",
+    "music_file": "assets/hotaru.mp3",
+    "extra_text": ""
+  },
+  "state": {
+    "file": "cache/state.json"
+  }
+}
