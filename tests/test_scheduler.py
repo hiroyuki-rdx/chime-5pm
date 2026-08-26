@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -128,6 +129,19 @@ class NextEventTest(unittest.TestCase):
         event = make_scheduler(settings).next_event(just_after_midnight)
         self.assertEqual(event.at, datetime(2026, 8, 26, 23, 0, tzinfo=TZ))
 
+    def test_catch_up_looks_back_more_than_one_day_for_large_grace(self):
+        """catchup_grace_seconds が 1 日を超える設定でも、その日数分は遡って拾う。"""
+        settings = {
+            "hourly": dict(SCHEDULE["hourly"], start_hour=23, end_hour=23, weekdays=[2]),
+            "closing": dict(SCHEDULE["closing"], enabled=False),
+            # 2026-08-26(水) 23:00 のみが該当日。約 47 時間の猶予を与える。
+            "catchup_grace_seconds": 170000,
+        }
+        two_days_later = datetime(2026, 8, 28, 10, 0, 0, tzinfo=TZ)
+        event = make_scheduler(settings).next_event(two_days_later)
+        self.assertIsNotNone(event)
+        self.assertEqual(event.at, datetime(2026, 8, 26, 23, 0, tzinfo=TZ))
+
     def test_returns_none_when_nothing_scheduled(self):
         settings = {
             "hourly": dict(SCHEDULE["hourly"], enabled=False),
@@ -164,6 +178,22 @@ class SleepUntilTest(unittest.TestCase):
         overshoot = (scheduler.now() - target).total_seconds()
         self.assertGreaterEqual(overshoot, 0.0)
         self.assertLess(overshoot, 0.2)
+
+    def test_stop_event_aborts_final_precise_adjustment(self):
+        """残り 0.25 秒未満の最終調整中でも停止要求を見逃さない。"""
+        scheduler = make_scheduler()
+        stop = threading.Event()
+        target = scheduler.now() + timedelta(milliseconds=200)
+        timer = threading.Timer(0.05, stop.set)
+        timer.start()
+        try:
+            started = time.monotonic()
+            result = scheduler.sleep_until(target, stop, precise=True)
+            elapsed = time.monotonic() - started
+        finally:
+            timer.cancel()
+        self.assertFalse(result)
+        self.assertLess(elapsed, 0.15)
 
     def test_clock_is_injectable(self):
         moments = iter([WEDNESDAY, WEDNESDAY + timedelta(hours=2)])

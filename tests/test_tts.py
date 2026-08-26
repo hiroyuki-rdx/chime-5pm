@@ -32,6 +32,20 @@ class FakeEngine(TTSEngine):
             handle.write(b"RIFF" + self.name.encode("utf-8"))
 
 
+class PartiallyWritingEngine(TTSEngine):
+    """open_jtalk のように、失敗時でも出力ファイルを書きかけで残すエンジン。"""
+
+    name = "partial"
+
+    def available(self):
+        return True
+
+    def synthesize(self, text, out_path):
+        with open(out_path, "wb") as handle:
+            handle.write(b"\x00")
+        raise TTSError("途中まで書いて失敗")
+
+
 def make_service(engines, cache_dir, prerecorded_dir=""):
     service = TTSService({"engines": []}, "/tmp", cache_dir,
                          prerecorded_dir or os.path.join(cache_dir, "voice"))
@@ -91,9 +105,23 @@ class ServiceTest(unittest.TestCase):
         service_b = make_service([beta], self.cache)
         self.assertNotEqual(service_a.synthesize("文言"), service_b.synthesize("文言"))
 
+    def test_digest_does_not_collide_across_part_boundaries(self):
+        # 空白区切りだと ("A", "B C") と ("A B", "C") が同じ文字列になり
+        # 衝突してしまう。境界をまたいでも別のダイジェストになること。
+        self.assertNotEqual(_digest("A", "B C"), _digest("A B", "C"))
+
     def test_no_temporary_file_is_left_behind(self):
         make_service([FakeEngine("first")], self.cache).synthesize("文言")
         self.assertEqual([name for name in os.listdir(self.cache) if name.endswith(".tmp")], [])
+
+    def test_temporary_file_is_removed_when_engine_fails_after_writing(self):
+        # open_jtalk 等が失敗時に書きかけの出力ファイルを残すケースを再現する。
+        service = make_service(
+            [PartiallyWritingEngine({}, "/tmp"), FakeEngine("fallback")], self.cache)
+        path = service.synthesize("文言")
+        self.assertTrue(os.path.exists(path))
+        leftovers = [name for name in os.listdir(self.cache) if name.endswith(".tmp")]
+        self.assertEqual(leftovers, [], "失敗したエンジンの一時ファイルが残っている")
 
     def test_describe_lists_engines(self):
         service = make_service([FakeEngine("a"), FakeEngine("b", available=False)], self.cache)

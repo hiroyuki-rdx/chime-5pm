@@ -143,15 +143,18 @@ class Scheduler:
         now = now or self.now()
         is_fired = is_fired or (lambda event: False)
 
-        # 取りこぼしの拾い上げ（過去 grace 秒以内）
+        # 取りこぼしの拾い上げ（過去 grace 秒以内）。
+        # 走査する日付は horizon から直接決める。catchup_grace_seconds が
+        # 1 日を超える設定でも取りこぼさず、grace が 0 以下なら今日だけを見る。
         horizon = now - timedelta(seconds=self.grace)
-        for offset in (-1, 0):
-            day = (now + timedelta(days=offset)).date()
+        day = min(horizon.date(), now.date())
+        while day <= now.date():
             for event in self.events_for_date(day):
                 if horizon <= event.play_at < now and not is_fired(event):
                     logger.warning("再生開始時刻を %.1f 秒過ぎています（追いかけ再生）: %s",
                                    (now - event.play_at).total_seconds(), event.describe())
                     return event
+            day += timedelta(days=1)
 
         for event in self.iter_events(now):
             if not is_fired(event):
@@ -169,9 +172,12 @@ class Scheduler:
             if remaining <= 0:
                 return True
             if precise and remaining <= 0.25:
-                # 正時ちょうどに鳴らすための最終調整
+                # 正時ちょうどに鳴らすための最終調整。
+                # この間も停止要求を見逃さないよう、都度確認する。
                 deadline = time.monotonic() + remaining
                 while time.monotonic() < deadline:
+                    if stop is not None and stop.is_set():
+                        return False
                     time.sleep(0.002)
                 return True
             chunk = min(remaining, self.max_sleep)

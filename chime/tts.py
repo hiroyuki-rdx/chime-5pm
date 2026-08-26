@@ -24,6 +24,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,7 +40,10 @@ class TTSError(RuntimeError):
 
 
 def _digest(*parts: str) -> str:
-    joined = " ".join(parts)
+    # 空白区切りだと voice_id と text の境界がずれた組み合わせ
+    # （例: ("A", "B C") と ("A B", "C")）が同じ文字列になり、
+    # キャッシュキーが衝突しうる。通常のテキストに現れない制御文字で区切る。
+    joined = "\x1f".join(parts)
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:20]
 
 
@@ -306,9 +310,21 @@ class TTSService:
                     return cached
 
                 os.makedirs(self.cache_dir, exist_ok=True)
-                temp_path = "{0}.{1}.tmp".format(cached, os.getpid())
-                engine.synthesize(text, temp_path)
-                os.replace(temp_path, cached)
+                # pid だけでは同一プロセス内の並行呼び出しで一時ファイル名が
+                # 衝突しうるため、スレッド ID も加えて一意にする。
+                temp_path = "{0}.{1}.{2}.tmp".format(
+                    cached, os.getpid(), threading.get_ident())
+                try:
+                    engine.synthesize(text, temp_path)
+                    os.replace(temp_path, cached)
+                except Exception:
+                    # 合成が失敗した場合、書きかけの一時ファイルを残さない。
+                    if os.path.exists(temp_path):
+                        try:
+                            os.remove(temp_path)
+                        except OSError:
+                            pass
+                    raise
                 logger.info("音声合成[%s]: %s", engine.name, text)
                 return cached
             except TTSError as exc:

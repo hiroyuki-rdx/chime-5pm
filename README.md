@@ -207,7 +207,7 @@ python3 -m unittest discover -s tests -t . -v
 ## 11. ライセンス・クレジット
 
 - **合成音声（同梱の `announce.wav`）:** VOICEVOX:ずんだもん
-- **実行時の音声合成:** [Open JTalk](https://open-jtalk.sourceforge.net/)（修正 BSD ライセンス）/ HTS Voice "NIT ATR503 M001"
+- **実行時の音声合成:** [Open JTalk](https://open-jtalk.sourceforge.net/)（修正 BSD ライセンス）/ HTS Voice "nitech_jp_atr503_m001"
 - **楽曲:** Auld Lang Syne（Public Domain / Copyright Free）
 - **天気予報:** [気象庁](https://www.jma.go.jp/bosai/) の防災情報 JSON、または [Open-Meteo](https://open-meteo.com/)（CC BY 4.0）
 - **時報音:** 本リポジトリのコードが実行時に合成（音源ファイルの同梱なし）
