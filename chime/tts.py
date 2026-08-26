@@ -216,6 +216,14 @@ class VoicevoxEngine(TTSEngine):
         self.base_url = str(self.settings.get("base_url", "")).rstrip("/")
         self.speaker = int(self.settings.get("speaker", 3))
         self.timeout = float(self.settings.get("timeout_seconds", 20.0))
+        # 疎通確認（GET /version）専用のタイムアウト。放送直前（実行時）に
+        # 呼ばれるため既定は短く（2 秒）保ち、エンジンが落ちていた場合に
+        # 即座に他のエンジンへフォールバックできるようにする。一方、VOICEVOX
+        # ENGINE は起動直後、モデル読み込みのため /version が数秒〜数十秒
+        # 応答しないことがある。事前生成スクリプト
+        # （scripts/generate_voicevox.py の --wait）は、この値をより長く
+        # 設定したインスタンスで疎通確認を繰り返すことで起動待ちを行う。
+        self.probe_timeout = float(self.settings.get("probe_timeout_seconds", 2.0))
 
     def voice_id(self) -> str:
         return "{0}|{1}".format(self.name, self.speaker)
@@ -224,7 +232,8 @@ class VoicevoxEngine(TTSEngine):
         if not self.base_url:
             return False
         try:
-            with urllib.request.urlopen(self.base_url + "/version", timeout=2.0) as response:
+            with urllib.request.urlopen(self.base_url + "/version",
+                                        timeout=self.probe_timeout) as response:
                 return getattr(response, "status", 200) == 200
         except (urllib.error.URLError, OSError, ValueError):
             return False

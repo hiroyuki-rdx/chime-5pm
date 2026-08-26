@@ -403,11 +403,30 @@ python3 campus_chime.py --test-hourly 15   # 確認
 
 既定では Open JTalk の音声（男性・機械的）で読み上げます。VOICEVOX:ずんだもんの声に揃えたい場合は、**PC 側で音声を作り置き**します（VOICEVOX ENGINE は Pi 3B 上で常時動かすには重すぎるため）。
 
-1. PC で VOICEVOX を起動する（エンジンが `http://127.0.0.1:50021` で待ち受けます）
+1. PC で VOICEVOX ENGINE を起動する（エンジンが `http://127.0.0.1:50021` で待ち受けます）。Docker で起動する場合は例えば次のようにします。
+
+```bash
+docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+```
+
+起動直後は ONNX モデルの読み込みのため、`/version` がしばらく応答しないことがあります。疎通確認は次のコマンドでできます。
+
+```bash
+curl -s http://127.0.0.1:50021/version
+```
+
 2. PC 側でリポジトリを clone し、次を実行
 
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes
+```
+
+`scripts/generate_voicevox.py` は既定でエンジンの起動を最大 90 秒待つため（`--wait` で変更可能）、起動直後で `/version` が応答しない状態でもそのまま実行して構いません。90 秒待っても応答しない場合はエラーメッセージの案内に従って確認してください。
+
+Docker Desktop（Windows）で VOICEVOX ENGINE を動かしている場合、WSL2 側から `127.0.0.1` では届かないことがあります。その場合は `--base-url` で Windows ホスト側の IP を指定してください。
+
+```bash
+python3 scripts/generate_voicevox.py --include-quotes --base-url http://<ホストのIP>:50021
 ```
 
 3. 生成された `assets/voice/` を commit して push

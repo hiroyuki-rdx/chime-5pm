@@ -141,7 +141,8 @@
     "voicevox": {
       "base_url": "http://127.0.0.1:50021",
       "speaker": 3,
-      "timeout_seconds": 20.0
+      "timeout_seconds": 20.0,
+      "probe_timeout_seconds": 2.0
     }
   },
   "closing": {

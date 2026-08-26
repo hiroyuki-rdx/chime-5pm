@@ -172,6 +172,7 @@
 | `open_jtalk.volume_gain_db` | `0.0` | 音量ゲイン（`-g`） |
 | `voicevox.base_url` | `http://127.0.0.1:50021` | VOICEVOX ENGINE の URL |
 | `voicevox.speaker` | `3` | 話者 ID（3 = ずんだもん・ノーマル） |
+| `voicevox.probe_timeout_seconds` | `2.0` | 疎通確認（`GET /version`）のタイムアウト。放送直前に呼ばれる実行時は短く保つ既定値で、`scripts/generate_voicevox.py` の起動待ちでは長めの値を設定して使う（4.4 章参照） |
 
 #### `closing` / `state` / `logging`
 
@@ -259,7 +260,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 | エンジン | `available()` | `synthesize()` |
 |---|---|---|
 | `PrerecordedEngine` | ディレクトリが存在する | 合成しない。`manifest.json`（文言→ファイル名）または `sha1(文言)[:20].wav` を探し、無ければ次のエンジンへ |
-| `VoicevoxEngine` | `GET /version` が 2 秒以内に 200 | `POST /audio_query` → `POST /synthesis` |
+| `VoicevoxEngine` | `GET /version` が `voicevox.probe_timeout_seconds`（既定 2 秒）以内に 200 | `POST /audio_query` → `POST /synthesis` |
 | `OpenJTalkEngine` | 実行ファイル・辞書・音響モデルが揃う | `open_jtalk -x DIC -m VOICE -r 話速 -fm 高さ -g 音量 -s 周波数 -ow OUT input.txt` |
 
 辞書・音響モデルは設定が空なら次の順に自動検出する。
@@ -268,6 +269,8 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 - 音響モデル: `/usr/share/hts-voice/*/*.htsvoice` ほか
 
 **キャッシュ:** `cache/tts/{sha1(voice_id + 文言)[:20]}.wav`。一時ファイルへ書いてから `os.replace` で原子的に置き換える。`voice_id` に話者・話速等を含めるため、設定を変えれば別キャッシュになる。同じ文言は 2 回目以降合成されない（時報の定型文は初回のみ）。
+
+**`voicevox.probe_timeout_seconds` について:** 放送直前（実行時）に呼ばれる `available()` は、エンジンが落ちていた場合に即座に他のエンジンへフォールバックできるよう、既定で短い（2 秒）タイムアウトを使う。一方、VOICEVOX ENGINE は Docker での起動直後、ONNX モデルの読み込みのため `/version` が数秒〜数十秒応答しないことがある。`scripts/generate_voicevox.py` はこの値を長めに設定した `VoicevoxEngine` で `available()` を数秒おきに再試行し、`--wait`（既定 90 秒）で指定した秒数まで起動を待つ。
 
 ### 4.5 `chime/weather.py`（責務: 天気予報の取得）
 

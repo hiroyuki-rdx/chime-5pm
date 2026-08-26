@@ -184,6 +184,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # 3 = ずんだもん（ノーマル）
             "speaker": 3,
             "timeout_seconds": 20.0,
+            # 疎通確認（GET /version）専用のタイムアウト。放送直前に呼ばれる
+            # 実行時は短く保ち（既定 2 秒）、エンジンが落ちていた場合に
+            # 即座に次のエンジンへフォールバックできるようにする。
+            # VOICEVOX ENGINE は起動直後、モデル読み込みのため数秒〜数十秒
+            # 応答しないことがあるため、事前生成スクリプト
+            # （scripts/generate_voicevox.py の --wait）ではこの値を長めに
+            # 設定して起動待ちに使う（詳細は chime/tts.py 参照）。
+            "probe_timeout_seconds": 2.0,
         },
     },
     "closing": {
