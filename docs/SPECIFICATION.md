@@ -546,7 +546,14 @@ python3 -m unittest discover -s tests -t . -v
 | `tests/test_app.py` | 常駐ループ、停止要求、例外時の継続 |
 | `tests/test_cli.py` | 引数解釈、終了コード、環境判定 |
 
-CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する。
+CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する。この `test` ジョブは意図的に `open_jtalk` 未導入のまま動かしており、音声合成（TTS）が全滅する環境でも時報本体（時報音・蛍の光）は成立することを回帰検出する。TTS が実際に機能する経路は別ジョブ（`tts`）で `open-jtalk` 一式を導入した上で `--generate-assets` と `--test-hourly` の合成結果を検証する。手元で `test` ジョブと同じ状態を再現するには、`open_jtalk` を一時的に退避し `cache/tts/` を消してから実行する。
+
+```bash
+sudo mv /usr/bin/open_jtalk /usr/bin/open_jtalk.bak
+rm -rf cache/tts
+python3 -m unittest discover -s tests -t .
+sudo mv /usr/bin/open_jtalk.bak /usr/bin/open_jtalk   # 必ず戻す
+```
 
 ### 10.2 実機での確認
 

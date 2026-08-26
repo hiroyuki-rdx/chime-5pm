@@ -44,3 +44,29 @@ jobs:
         run: bash -n scripts/setup.sh
       - name: shellcheck
         run: shellcheck scripts/setup.sh
+
+  tts:
+    name: 音声合成あり（open_jtalk）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: open_jtalk を導入
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            open-jtalk \
+            open-jtalk-mecab-naist-jdic \
+            hts-voice-nitech-jp-atr503-m001
+
+      - name: 時報の定型文を実際に合成できること
+        run: python campus_chime.py --generate-assets
+
+      - name: 合成結果が時刻アナウンスに反映されること
+        run: |
+          python campus_chime.py --test-hourly 12 --dry-run --backend mock \
+            | grep -F "正午をお知らせしました。"

@@ -86,7 +86,19 @@ class RunTest(unittest.TestCase):
         self.assertIn("設定エラー", output)
 
     def test_dry_run_hourly_does_not_play(self):
-        code, output = call(["--test-hourly", "12", "--dry-run", "--backend", "mock"])
+        """12 時の時報では「正午をお知らせしました。」という定型文が使われること。
+
+        この検証は音声合成（TTS）の成否とは無関係にしたい。しかし
+        時刻アナウンスの文言は再生セグメントのラベルとしてしか出力されず、
+        そのラベルは合成が成功した場合にのみ付く。実行環境に ``open_jtalk``
+        が無い（CI ランナー等）と合成が全滅し、警告ログだけが出て文言が
+        出力に現れないため、``TTSService.synthesize`` をスタブ化して
+        常に合成成功したことにする（``--dry-run`` のため実際のファイル
+        内容や存在は問われない）。
+        """
+        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, output = call(["--test-hourly", "12", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("正午をお知らせしました。", output)
         self.assertIn("dry-run", output)
