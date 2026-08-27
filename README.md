@@ -154,6 +154,12 @@ python3 campus_chime.py --print-config     # 適用中の設定を表示
 python3 campus_chime.py --dry-run --test   # 音を出さず内容だけ確認
 ```
 
+WSL 等の開発環境では、音を出さない mock バックエンドが自動選択されます（ログは流れますが音は鳴りません）。実際に鳴らして確かめたい場合は `--backend pygame` を明示してください。詳しくは [SETUP.md](docs/SETUP.md) の「10-6. WSL2 で試すと音が鳴らない」を参照してください。
+
+```bash
+python3 campus_chime.py --test-hourly 16 --backend pygame
+```
+
 ログの確認:
 
 ```bash

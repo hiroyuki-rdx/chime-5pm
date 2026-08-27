@@ -406,10 +406,30 @@ python3 campus_chime.py --test-hourly 15   # 確認
 1. PC で VOICEVOX ENGINE を起動する（エンジンが `http://127.0.0.1:50021` で待ち受けます）。Docker で起動する場合は例えば次のようにします。
 
 ```bash
-docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+docker run -d --name voicevox -p 50021:50021 voicevox/voicevox_engine:cpu-latest
 ```
 
-起動直後は ONNX モデルの読み込みのため、`/version` がしばらく応答しないことがあります。疎通確認は次のコマンドでできます。
+`-d` はバックグラウンド実行の指定で、付けないとターミナルが占有され続けて `curl` や生成スクリプトを実行できません。また `--rm` は付けません。付けると停止時にコンテナごと削除され、`docker start` で再開できなくなるためです。イメージのタグ（`cpu-latest` の部分）は環境によって異なることがあるため、`docker images` で手元にあるタグを確認して読み替えてください。
+
+次回以降は次で再開できます。
+
+```bash
+docker start voicevox
+```
+
+止めるときは次のとおりです（`--rm` を付けていないのでコンテナは消えません）。
+
+```bash
+docker stop voicevox
+```
+
+起動直後は ONNX モデルの読み込みのため、`/version` がしばらく応答しないことがあります。次のコマンドで `Application startup complete.` が表示されるまで待ってから疎通確認してください（`Ctrl+C` でログの表示を抜けてもコンテナ自体は止まりません）。
+
+```bash
+docker logs -f voicevox
+```
+
+疎通確認は次のコマンドでできます。
 
 ```bash
 curl -s http://127.0.0.1:50021/version
@@ -428,6 +448,8 @@ Docker Desktop（Windows）で VOICEVOX ENGINE を動かしている場合、WSL
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes --base-url http://<ホストのIP>:50021
 ```
+
+生成した音声を WSL2 側でその場で試聴する場合は、既定では音が鳴りません。`--backend pygame` を明示してください（詳しくは「10-6. WSL2 で試すと音が鳴らない」参照）。
 
 3. 生成された `assets/voice/` を commit して push
 4. Pi 側で反映
@@ -539,6 +561,19 @@ python3 campus_chime.py --print-config | python3 -c "import json,sys; print(json
 ```bash
 python3 campus_chime.py --weather
 ping -c 3 www.jma.go.jp
+```
+
+### 10-6. WSL2 で試すと音が鳴らない
+
+WSL2 上で動作確認をすると、ログは流れる（`[MOCK]` が並ぶ）のに音がまったく鳴らないことがあります。
+
+原因は、WSL が開発環境と判定され、音を出さない `mock` バックエンドが自動選択されるためです。これは Pi 以外の環境で誤って音を鳴らさないための意図した仕様であり、故障ではありません。実機（Raspberry Pi）では `auto` のままで正しく `pygame` が選ばれます。
+
+WSL2 上で実際に音を出して確認したい場合は、`--backend pygame` を明示してください。
+
+```bash
+python3 campus_chime.py --test-hourly 16 --backend pygame
+python3 campus_chime.py --test-all --backend pygame
 ```
 
 ---
