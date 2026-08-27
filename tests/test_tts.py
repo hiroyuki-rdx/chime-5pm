@@ -6,6 +6,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from chime.tts import (OpenJTalkEngine, PrerecordedEngine, TTSEngine, TTSError,
                        TTSService, VoicevoxEngine, _digest)
@@ -196,6 +197,25 @@ class EngineConfigurationTest(unittest.TestCase):
 
     def test_voicevox_voice_id_includes_speaker(self):
         self.assertEqual(VoicevoxEngine({"speaker": 3}, "/tmp").voice_id(), "voicevox|3")
+
+    def test_voicevox_probe_timeout_defaults_to_two_seconds(self):
+        # 放送直前（実行時）に呼ばれるため既定は短く、エンジンが落ちて
+        # いた場合に即座に次のエンジンへフォールバックできること。
+        self.assertEqual(VoicevoxEngine({}, "/tmp").probe_timeout, 2.0)
+
+    def test_voicevox_probe_timeout_is_configurable(self):
+        # 事前生成スクリプト（起動待ち）など、長めのタイムアウトが
+        # 必要な用途のために設定可能であること。
+        engine = VoicevoxEngine({"probe_timeout_seconds": 30.0}, "/tmp")
+        self.assertEqual(engine.probe_timeout, 30.0)
+
+    def test_voicevox_available_uses_probe_timeout(self):
+        engine = VoicevoxEngine(
+            {"base_url": "http://example.invalid:50021", "probe_timeout_seconds": 9.5}, "/tmp")
+        with mock.patch("chime.tts.urllib.request.urlopen") as mocked:
+            mocked.return_value.__enter__.return_value.status = 200
+            self.assertTrue(engine.available())
+        self.assertEqual(mocked.call_args.kwargs.get("timeout"), 9.5)
 
 
 if __name__ == "__main__":

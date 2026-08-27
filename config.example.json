@@ -74,18 +74,22 @@
     "volume": 0.6,
     "envelope_ms": 5,
     "output_file": "assets/generated/time_signal.wav",
-    "announce_template": "{period}{hour}時をお知らせしました。",
+    "announce_template": "{period}{hour_reading}をお知らせしました。",
     "use_noon_template": true,
     "noon_template": "正午をお知らせしました。",
     "period_am": "午前",
-    "period_pm": "午後"
+    "period_pm": "午後",
+    "hour_readings": {
+      "0": "れいじ",
+      "4": "よじ",
+      "7": "しちじ",
+      "9": "くじ"
+    }
   },
   "extra_segment": {
     "enabled": true,
-    "weather_probability": 0.4,
-    "always_weather_hours": [
-      10
-    ],
+    "weather_probability": 0.0,
+    "always_weather_hours": [],
     "always_quote_hours": [],
     "fallback_to_quote": true
   },
@@ -94,7 +98,7 @@
     "avoid_recent": 8
   },
   "weather": {
-    "enabled": true,
+    "enabled": false,
     "provider": "jma",
     "timeout_seconds": 8.0,
     "cache_minutes": 60,
@@ -102,7 +106,10 @@
       "area_code": "250000",
       "area_name": "南部",
       "temp_area_name": "大津",
-      "label": "滋賀"
+      "label": "滋賀",
+      "drop_after": [
+        "所により"
+      ]
     },
     "open_meteo": {
       "latitude": 35.0045,
@@ -111,7 +118,8 @@
     },
     "template": "{when}の{label}の天気は、{weather}。{details}",
     "details_separator": "、",
-    "suffix": "です。"
+    "suffix": "です。",
+    "max_weather_chars": 40
   },
   "tts": {
     "engines": [
@@ -133,7 +141,8 @@
     "voicevox": {
       "base_url": "http://127.0.0.1:50021",
       "speaker": 3,
-      "timeout_seconds": 20.0
+      "timeout_seconds": 20.0,
+      "probe_timeout_seconds": 2.0
     }
   },
   "closing": {

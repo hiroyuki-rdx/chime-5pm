@@ -3,6 +3,16 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [未リリース]
+
+### 変更
+
+- **運用方針の変更**: 時報のあとのおまけを既定で「ひとこと」のみにし、天気予報は既定で無効にした
+  - `weather.enabled`: `true` → `false`
+  - `extra_segment.weather_probability`: `0.4` → `0.0`
+  - `extra_segment.always_weather_hours`: `[10]` → `[]`
+  - 天気予報の機能自体は削除していない。上記 3 項目を設定で戻せば従来どおり利用できる（手順は `docs/SETUP.md` 7 章「天気予報を有効にする」）
+
 ## [3.0.0] - 2026-08-26
 
 Lite 移行による専用機化（v2.0.0 として設計されていた内容）と、時報機能の追加を同時に実施した版。

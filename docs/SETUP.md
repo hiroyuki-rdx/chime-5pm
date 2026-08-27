@@ -193,7 +193,7 @@ bash scripts/setup.sh
 ```bash
 cd /home/pi/campus-chime
 
-# 時報（ポ・ポ・ポ・ポーン → 時刻 → ひとこと or 天気予報）
+# 時報（ポ・ポ・ポ・ポーン → 時刻 → ひとこと）
 python3 campus_chime.py --test-hourly
 
 # 12 時の時報（「正午をお知らせしました。」）
@@ -201,16 +201,13 @@ python3 campus_chime.py --test-hourly 12
 
 # 閉館放送（アナウンス → 蛍の光）
 python3 campus_chime.py --test
-
-# 天気予報だけ確認
-python3 campus_chime.py --weather
 ```
 
 チェックポイント:
 
 - [ ] 短音が 3 回、続いて長めの音が 1 回鳴る
 - [ ] 「午前◯時をお知らせしました。」と読み上げられる
-- [ ] そのあと「ひとこと」か「天気予報」が流れる
+- [ ] そのあと「ひとこと」が流れる（天気予報は既定で無効。有効にする方法は 7 章「天気予報を有効にする」参照）
 - [ ] 蛍の光がだんだん大きくなる（2 秒フェードイン）
 - [ ] **音飛び・ぶつ切れがない**
 
@@ -278,6 +275,8 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 { "schedule": { "hourly": { "start_hour": 9, "end_hour": 17 } } }
 ```
 
+（9 時は Open JTalk が誤読しやすい時刻の一つですが、既定の `hour_readings` で正しく読めるよう対策済みです）
+
 **お昼の時報だけ止める**
 
 ```json
@@ -306,7 +305,49 @@ python3 campus_chime.py --schedule   # 反映されたか確認
     "noon_template": "ただいま正午です。" } }
 ```
 
-**天気予報の地域を変える**
+`{hour}` は数字のみ（例: `4`）のプレースホルダです。Open JTalk は「4時」を「よんじ」、「7時」を「ななじ」、「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読します（正しくは よじ／しちじ／くじ／れいじ）。誤読対策込みの読みが欲しい場合は `{hour}` の代わりに `{hour_reading}` を使ってください（既定のテンプレートはこちらを使っています）。
+
+```json
+{ "time_signal": {
+    "announce_template": "ただいま{period}{hour_reading}です。" } }
+```
+
+対象の時刻を増やしたい場合は `hour_readings` に追加します（キーは 12 時間表記の「時」、文字列）。
+
+```json
+{ "time_signal": { "hour_readings": { "0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ", "1": "いちじ" } } }
+```
+
+**天気予報を有効にする**
+
+既定では天気予報は無効で、時報のあとは常に「ひとこと」が流れます。有効にするには、次の 3 つをまとめて設定してください。どれか 1 つだけを変えると「無効にしたつもりが別経路で有効になる」といった誤解のもとになります。
+
+```json
+{ "weather": { "enabled": true },
+  "extra_segment": {
+    "weather_probability": 0.4,
+    "always_weather_hours": [10]
+  } }
+```
+
+- `weather.enabled`: 天気予報機能そのものの有効・無効（既定 `false`）
+- `extra_segment.weather_probability`: 天気予報を選ぶ確率（0.0〜1.0）。残りは「ひとこと」（既定 `0.0`）
+- `extra_segment.always_weather_hours`: 指定した時刻は確率に関わらず必ず天気予報にする（既定は空。上の例は 10 時固定）
+
+設定を反映したら、次で読み上げ文を確認します。
+
+```bash
+sudo systemctl restart campus_chime.service
+python3 campus_chime.py --weather
+```
+
+`weather.enabled` が `false` のままだと、`--weather` はネットワークの状態に関わらず必ず次のエラーで終了コード 1 を返します（実際に確認済み）。有効化して初めて気象庁 API への問い合わせを試みます。
+
+```
+天気予報を取得できませんでした: 天気予報機能が無効化されています。
+```
+
+**天気予報の地域を変える**（天気予報を有効にしている場合のみ意味を持ちます）
 
 既定値は滋賀県（一次細分区域「南部」＝大津・草津・近江八幡など、気温の観測地点は「大津」）です。
 
@@ -334,10 +375,11 @@ python3 campus_chime.py --schedule   # 反映されたか確認
     "open_meteo": { "latitude": 34.6937, "longitude": 135.5023, "label": "大阪" } } }
 ```
 
-**天気予報の頻度を変える**（`0.0` = 常にひとこと、`1.0` = 常に天気予報）
+**天気予報の頻度を変える**（`0.0` = 常にひとこと・既定値、`1.0` = 常に天気予報。天気予報を有効にしている場合のみ意味を持ちます）
 
 ```json
-{ "extra_segment": { "weather_probability": 0.6 } }
+{ "weather": { "enabled": true },
+  "extra_segment": { "weather_probability": 0.6 } }
 ```
 
 **おまけを止める（時報だけにする）**
@@ -361,11 +403,30 @@ python3 campus_chime.py --test-hourly 15   # 確認
 
 既定では Open JTalk の音声（男性・機械的）で読み上げます。VOICEVOX:ずんだもんの声に揃えたい場合は、**PC 側で音声を作り置き**します（VOICEVOX ENGINE は Pi 3B 上で常時動かすには重すぎるため）。
 
-1. PC で VOICEVOX を起動する（エンジンが `http://127.0.0.1:50021` で待ち受けます）
+1. PC で VOICEVOX ENGINE を起動する（エンジンが `http://127.0.0.1:50021` で待ち受けます）。Docker で起動する場合は例えば次のようにします。
+
+```bash
+docker run --rm -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+```
+
+起動直後は ONNX モデルの読み込みのため、`/version` がしばらく応答しないことがあります。疎通確認は次のコマンドでできます。
+
+```bash
+curl -s http://127.0.0.1:50021/version
+```
+
 2. PC 側でリポジトリを clone し、次を実行
 
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes
+```
+
+`scripts/generate_voicevox.py` は既定でエンジンの起動を最大 90 秒待つため（`--wait` で変更可能）、起動直後で `/version` が応答しない状態でもそのまま実行して構いません。90 秒待っても応答しない場合はエラーメッセージの案内に従って確認してください。
+
+Docker Desktop（Windows）で VOICEVOX ENGINE を動かしている場合、WSL2 側から `127.0.0.1` では届かないことがあります。その場合は `--base-url` で Windows ホスト側の IP を指定してください。
+
+```bash
+python3 scripts/generate_voicevox.py --include-quotes --base-url http://<ホストのIP>:50021
 ```
 
 3. 生成された `assets/voice/` を commit して push
@@ -463,7 +524,15 @@ python3 campus_chime.py --generate-assets
 
 ### 10-5. 天気予報だけ流れない
 
-これは**異常ではありません**。ネットワークが切れている、または気象庁側が応答しない場合、自動的に「ひとこと」へ切り替わります（時報は必ず鳴ります）。
+まず `weather.enabled` を確認してください。
+
+```bash
+python3 campus_chime.py --print-config | python3 -c "import json,sys; print(json.load(sys.stdin)['weather']['enabled'])"
+```
+
+`False` なら**異常ではありません**。既定値どおり天気予報は無効で、時報のあとは常に「ひとこと」になります（7 章「天気予報を有効にする」参照）。
+
+`True` にしているのに流れない場合は、ネットワークが切れている、または気象庁側が応答しない可能性があります。この場合も**異常ではありません**。自動的に「ひとこと」へ切り替わります（時報は必ず鳴ります）。
 
 切り分け:
 

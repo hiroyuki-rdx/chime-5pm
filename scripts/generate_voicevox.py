@@ -12,6 +12,10 @@ VOICEVOX ENGINE は Raspberry Pi 3B 上で常時動かすには重いため、
     python3 scripts/generate_voicevox.py --base-url http://192.168.1.10:50021
     python3 scripts/generate_voicevox.py --speaker 3 --include-quotes
 
+Docker で VOICEVOX ENGINE を起動した直後はモデル読み込みのため
+``/version`` がしばらく応答しないことがある。既定では起動を最大 90 秒
+待つ（``--wait 0`` で待たずに即座に判定する）。
+
 生成後は ``assets/voice/`` を git add してコミットし、Pi 側で git pull する。
 """
 
@@ -21,6 +25,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -28,6 +33,35 @@ from chime import timesignal  # noqa: E402
 from chime.config import load_config  # noqa: E402
 from chime.quotes import load_quotes  # noqa: E402
 from chime.tts import TTSError, VoicevoxEngine, _digest  # noqa: E402
+
+#: 起動待ち中に疎通確認を再試行する間隔（秒）。
+_POLL_INTERVAL_SECONDS = 3.0
+
+
+def wait_for_engine(engine: VoicevoxEngine, wait_seconds: float) -> bool:
+    """VOICEVOX ENGINE が応答するようになるまで、最大 ``wait_seconds`` 秒待つ。
+
+    Docker で起動した直後の VOICEVOX ENGINE は、ONNX モデルの読み込みに
+    より数秒〜数十秒 ``/version`` に応答しないことがある。無言で固まった
+    ように見えないよう、待っている間は残り時間を表示しながら数秒おきに
+    :meth:`VoicevoxEngine.available` を再試行する。``wait_seconds`` が
+    0 以下なら再試行せず、従来どおり 1 回だけ判定する。
+    """
+    if engine.available():
+        return True
+    if wait_seconds <= 0:
+        return False
+
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        print("VOICEVOX の起動を待っています…（残り {0:.0f} 秒）".format(remaining),
+              file=sys.stderr)
+        time.sleep(min(_POLL_INTERVAL_SECONDS, remaining))
+        if engine.available():
+            return True
 
 
 def collect_phrases(config, include_quotes: bool) -> list:
@@ -74,13 +108,31 @@ def main() -> int:
                         help="「ひとこと」もまとめて生成する")
     parser.add_argument("--force", action="store_true",
                         help="既存ファイルがあっても作り直す")
+    parser.add_argument("--wait", type=float, default=90.0,
+                        help="VOICEVOX ENGINE が応答するまで待つ秒数"
+                             "（既定 90 秒。0 なら待たずに即座に判定する）")
     args = parser.parse_args()
 
-    engine = VoicevoxEngine({"base_url": args.base_url, "speaker": args.speaker,
-                             "timeout_seconds": 60.0}, config.base_dir)
-    if not engine.available():
+    engine = VoicevoxEngine({
+        "base_url": args.base_url,
+        "speaker": args.speaker,
+        "timeout_seconds": 60.0,
+        # 起動待ちで繰り返す疎通確認は、実行時（既定 2 秒）より少し長めの
+        # タイムアウトにしておく。--wait による再試行が全体の待ち時間を
+        # 確保するので、ここは 1 回あたりの応答揺らぎを吸収する程度でよい。
+        "probe_timeout_seconds": 5.0,
+    }, config.base_dir)
+    if not wait_for_engine(engine, args.wait):
         print("VOICEVOX ENGINE に接続できません: {0}".format(args.base_url), file=sys.stderr)
-        print("VOICEVOX を起動してから再実行してください。", file=sys.stderr)
+        if args.wait > 0:
+            print("{0:.0f} 秒待ちましたが応答がありませんでした。".format(args.wait),
+                  file=sys.stderr)
+        print("次を確認してください。", file=sys.stderr)
+        print("  - 疎通確認: curl -s {0}/version".format(args.base_url), file=sys.stderr)
+        print("  - Docker Desktop（Windows）を使っている場合、WSL2 から 127.0.0.1 では"
+              " VOICEVOX ENGINE に届かないことがあります。"
+              "--base-url でホストの IP を指定してください"
+              "（例: --base-url http://<ホストのIP>:50021）。", file=sys.stderr)
         return 1
 
     os.makedirs(args.out, exist_ok=True)

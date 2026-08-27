@@ -112,6 +112,29 @@ class PickTest(unittest.TestCase):
         self.assertEqual(self.picker.pick(10), "新しい")
 
 
+class MisreadWordsTest(unittest.TestCase):
+    """特定の誤読を招く表記が紛れ込んでいないことを確認する（回帰防止）。
+
+    実際の読み（カタカナ）は Open JTalk の ``-ot`` トレースで別途確認済み。
+    かな書きへ置き換えれば正しく読めることを確認している。
+    """
+
+    def setUp(self):
+        self.quotes = load_quotes(SHIPPED_QUOTES)["general"]
+
+    def test_bunbetsu_is_not_written_with_kanji(self):
+        # 「分別」を漢字で書くと「思慮分別」の意味のフンベツと誤読される。
+        # 正しくは「ぶんべつ」（ゴミの分別）。
+        for quote in self.quotes:
+            self.assertNotIn("分別", quote)
+
+    def test_ippo_is_not_written_with_kanji(self):
+        # 「一歩」は 一(イチ) + 歩(ホ) に分割され、イチホと誤読される。
+        # 正しくは「いっぽ」。
+        for quote in self.quotes:
+            self.assertNotIn("一歩", quote)
+
+
 class ShippedQuotesTest(unittest.TestCase):
     """同梱の ``assets/quotes.json`` の健全性。"""
 

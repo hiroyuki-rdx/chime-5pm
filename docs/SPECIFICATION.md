@@ -115,18 +115,19 @@
 | `volume` | `0.6` | 振幅（0.0〜1.0） |
 | `envelope_ms` | `5` | クリックノイズ防止のフェード |
 | `output_file` | `assets/generated/time_signal.wav` | 生成先 |
-| `announce_template` | `"{period}{hour}時をお知らせしました。"` | 読み上げテンプレート |
+| `announce_template` | `"{period}{hour_reading}をお知らせしました。"` | 読み上げテンプレート。`{hour_reading}` は誤読対策込みの時刻表現、`{hour}` は後方互換の数値のみのプレースホルダ |
 | `use_noon_template` | `true` | 12 時に専用文言を使うか |
 | `noon_template` | `"正午をお知らせしました。"` | 12 時の文言 |
 | `period_am` / `period_pm` | `"午前"` / `"午後"` | テンプレートの `{period}` |
+| `hour_readings` | `{"0":"れいじ","4":"よじ","7":"しちじ","9":"くじ"}` | Open JTalk が誤読する時刻（12 時間表記）だけをかな書きで上書きする。キーは文字列。それ以外の時刻は正しく読めるため上書きしない（詳細は 4.2 章） |
 
 #### `extra_segment`
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
 | `enabled` | `true` | おまけ放送の有効／無効 |
-| `weather_probability` | `0.4` | 天気予報が選ばれる確率 |
-| `always_weather_hours` | `[10]` | 必ず天気予報にする時 |
+| `weather_probability` | `0.0` | 天気予報が選ばれる確率。既定は `0.0` で、天気予報が無効なため常にひとことになる |
+| `always_weather_hours` | `[]` | 必ず天気予報にする時。既定は空（天気予報が無効なため未使用） |
 | `always_quote_hours` | `[]` | 必ずひとことにする時 |
 | `fallback_to_quote` | `true` | 天気取得失敗時にひとことへ切り替えるか |
 
@@ -141,7 +142,7 @@
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
-| `enabled` | `true` | 天気予報の有効／無効 |
+| `enabled` | `false` | 天気予報の有効／無効。既定は無効で、時報のあとは常に「ひとこと」になる（任意機能。有効化の手順は `docs/SETUP.md` 7 章） |
 | `provider` | `"jma"` | `jma`（気象庁）または `open_meteo` |
 | `timeout_seconds` | `8.0` | HTTP タイムアウト |
 | `cache_minutes` | `60` | 取得結果のキャッシュ時間 |
@@ -149,10 +150,12 @@
 | `jma.area_name` | `"南部"` | 天気・降水確率の timeSeries 内で優先する細分区域名（前方一致）。滋賀県の一次細分区域は「南部」（大津・草津・近江八幡など）と「北部」（彦根・長浜・米原・高島など） |
 | `jma.temp_area_name` | `"大津"` | 気温の timeSeries 内で優先する観測地点名（前方一致）。天気・降水確率の細分区域名とは体系が異なるため別に指定する。空文字列なら `area_name` を使う（後方互換） |
 | `jma.label` | `"滋賀"` | 読み上げに使う地名 |
+| `jma.drop_after` | `["所により"]` | 予報文中でこの文字列が最初に現れる位置以降を切り捨てる（地域限定の但し書き除去）。空リストなら切り捨てない |
 | `open_meteo.latitude` / `longitude` | `35.0045` / `135.8686` | 座標（大津市付近） |
 | `open_meteo.label` | `"滋賀"` | 読み上げに使う地名 |
 | `template` | `"{when}の{label}の天気は、{weather}。{details}"` | 読み上げテンプレート |
 | `details_separator` / `suffix` | `"、"` / `"です。"` | 詳細部の区切りと語尾 |
+| `max_weather_chars` | `40` | `{weather}` 部分の文字数上限。予期しない長文への保険で、超えたら読点の位置で切り詰める（文の途中では切らない） |
 
 #### `tts`
 
@@ -169,6 +172,7 @@
 | `open_jtalk.volume_gain_db` | `0.0` | 音量ゲイン（`-g`） |
 | `voicevox.base_url` | `http://127.0.0.1:50021` | VOICEVOX ENGINE の URL |
 | `voicevox.speaker` | `3` | 話者 ID（3 = ずんだもん・ノーマル） |
+| `voicevox.probe_timeout_seconds` | `2.0` | 疎通確認（`GET /version`）のタイムアウト。放送直前に呼ばれる実行時は短く保つ既定値で、`scripts/generate_voicevox.py` の起動待ちでは長めの値を設定して使う（4.4 章参照） |
 
 #### `closing` / `state` / `logging`
 
@@ -214,10 +218,14 @@ pygame 2.x の `mixer.init()` は buffer 既定値が **512 サンプル**であ
 | `ensure_time_signal(path, ...)` | ファイルが無ければ生成する |
 | `lead_seconds(settings)` | 短音区間の長さ＝`short_pip_count × pip_interval_ms`（既定 3.0 秒） |
 | `total_seconds(settings)` | 時報音全体の長さ（既定 4.0 秒） |
-| `hour_parts(hour, settings)` | 12 時間表記の部品（`period` / `hour` / `hour24`） |
+| `hour_parts(hour, settings)` | 12 時間表記の部品（`period` / `hour` / `hour24` / `hour_reading`） |
 | `announce_text(hour, settings)` | 読み上げ文言。12 時は `noon_template` |
 
 波形は各トーンの前後に `envelope_ms` の直線フェードを掛け、クリックノイズを防ぐ。
+
+**時刻の読み誤り対策（`hour_readings`）**
+
+Open JTalk（MeCab）は「4時」を「よんじ」、「7時」を「ななじ」、「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読する（正しくは よじ／しちじ／くじ／れいじ）。数字部分だけをかな化すると（例:「午後よ時」）今度は「時」が「とき」と読まれるため、`hour_readings` は「時」を含めて丸ごとかな書きに置き換える（例: `"4": "よじ"`）。既定でこの 4 つの時刻のみを対象にしており、正しく読める時刻まで一律にかな化しないのは、TTS のアクセントがかえって不自然になるのを避けるため。`hour_parts()` はこの読みを `hour_reading` として返し、`announce_template` の既定値はこれを使う。
 
 **タイムライン（既定値）**
 
@@ -252,7 +260,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 | エンジン | `available()` | `synthesize()` |
 |---|---|---|
 | `PrerecordedEngine` | ディレクトリが存在する | 合成しない。`manifest.json`（文言→ファイル名）または `sha1(文言)[:20].wav` を探し、無ければ次のエンジンへ |
-| `VoicevoxEngine` | `GET /version` が 2 秒以内に 200 | `POST /audio_query` → `POST /synthesis` |
+| `VoicevoxEngine` | `GET /version` が `voicevox.probe_timeout_seconds`（既定 2 秒）以内に 200 | `POST /audio_query` → `POST /synthesis` |
 | `OpenJTalkEngine` | 実行ファイル・辞書・音響モデルが揃う | `open_jtalk -x DIC -m VOICE -r 話速 -fm 高さ -g 音量 -s 周波数 -ow OUT input.txt` |
 
 辞書・音響モデルは設定が空なら次の順に自動検出する。
@@ -261,6 +269,8 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 - 音響モデル: `/usr/share/hts-voice/*/*.htsvoice` ほか
 
 **キャッシュ:** `cache/tts/{sha1(voice_id + 文言)[:20]}.wav`。一時ファイルへ書いてから `os.replace` で原子的に置き換える。`voice_id` に話者・話速等を含めるため、設定を変えれば別キャッシュになる。同じ文言は 2 回目以降合成されない（時報の定型文は初回のみ）。
+
+**`voicevox.probe_timeout_seconds` について:** 放送直前（実行時）に呼ばれる `available()` は、エンジンが落ちていた場合に即座に他のエンジンへフォールバックできるよう、既定で短い（2 秒）タイムアウトを使う。一方、VOICEVOX ENGINE は Docker での起動直後、ONNX モデルの読み込みのため `/version` が数秒〜数十秒応答しないことがある。`scripts/generate_voicevox.py` はこの値を長めに設定した `VoicevoxEngine` で `available()` を数秒おきに再試行し、`--wait`（既定 90 秒）で指定した秒数まで起動を待つ。
 
 ### 4.5 `chime/weather.py`（責務: 天気予報の取得）
 
@@ -271,7 +281,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 **気象庁 JSON の解釈**
 
-- 天気: `timeSeries` のうち `weathers` を持つ系列から、`area_name`（細分区域名。前方一致、無ければ先頭）で選ぶ。`timeDefines` が当日の要素を優先し、全角スペースを除去する
+- 天気: `timeSeries` のうち `weathers` を持つ系列から、`area_name`（細分区域名。前方一致、無ければ先頭）で選ぶ。`timeDefines` が当日の要素を優先する。予報文中の空白（全角・半角）は形態素の境界を表すため、削除ではなく読点「、」に変換する（削除すると Open JTalk の形態素解析が崩れて読み上げが崩壊する）。続けて `drop_after`（既定 `["所により"]`）のいずれかが最初に現れる位置以降を切り捨てる
 - 最高／最低気温: `temps` を持つ系列を `timeDefines` と対にし、**時刻が 6 時未満なら最低・以降なら最高**として日付ごとに畳み込む。気温の地点名は天気・降水確率の細分区域名とは体系が異なる（例: 滋賀県なら細分区域は「南部」「北部」、気温の地点は「大津」「彦根」）ため、`temp_area_name`（空なら `area_name`）で選ぶ
 - 降水確率: `pops` を持つ系列から `area_name` で選んだ地域の、当日分の**最大値**を採る
 - いずれも欠落しうる前提で、取れた要素だけで文を組み立てる（当日昼発表の予報には当日の最低気温が無い、など）
@@ -282,7 +292,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 {when}の{label}の天気は、{weather}。最高気温は{max}度、最低気温は{min}度、降水確率は{pop}パーセントです。
 ```
 
-`when` は当日=「今日」、翌日=「明日」、それ以降は「M月D日」。詳細が 1 つも取れない場合は詳細部を丸ごと省略する。
+`when` は当日=「今日」、翌日=「明日」、それ以降は「M月D日」。詳細が 1 つも取れない場合は詳細部を丸ごと省略する。`{weather}` は組み立て直前に `max_weather_chars`（既定 40 文字）で長さを確認し、超えていれば読点の位置で切り詰める（予期しない長文への保険。文の途中では切らない）。
 
 取得結果は `cache_minutes` の間メモリ上に保持する（NFR-06）。あらゆる失敗は `WeatherError` に正規化し、呼び出し側が「ひとこと」へ切り替えられるようにする。
 

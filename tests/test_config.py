@@ -76,6 +76,40 @@ class ConfigAccessTest(unittest.TestCase):
         self.assertEqual(config.path("x"), expected)
 
 
+class DefaultConfigMisreadFixesTest(unittest.TestCase):
+    """時報・天気予報の誤読対策に関わる既定値の回帰防止。"""
+
+    def test_hour_readings_default_covers_the_four_misread_hours(self):
+        # Open JTalk が誤読する 4 つの時刻（詳細は chime/timesignal.py）。
+        self.assertEqual(
+            DEFAULT_CONFIG["time_signal"]["hour_readings"],
+            {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"})
+
+    def test_announce_template_uses_hour_reading_placeholder(self):
+        self.assertIn("{hour_reading}", DEFAULT_CONFIG["time_signal"]["announce_template"])
+
+    def test_weather_drops_region_specific_caveat_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["weather"]["jma"]["drop_after"], ["所により"])
+
+    def test_weather_has_a_max_character_safety_net(self):
+        self.assertEqual(DEFAULT_CONFIG["weather"]["max_weather_chars"], 40)
+
+
+class DefaultExtraIsQuoteOnlyTest(unittest.TestCase):
+    """運用方針の変更: 時報のあとは既定で「ひとこと」のみとし、天気予報は
+    流さない。3 箇所すべてが揃っていないと別経路で天気予報が有効になりうる
+    ため、まとめて回帰確認する。"""
+
+    def test_weather_is_disabled_by_default(self):
+        self.assertFalse(DEFAULT_CONFIG["weather"]["enabled"])
+
+    def test_weather_probability_is_zero_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_probability"], 0.0)
+
+    def test_always_weather_hours_is_empty_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["always_weather_hours"], [])
+
+
 class LoadConfigTest(unittest.TestCase):
     def test_local_config_overrides_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
