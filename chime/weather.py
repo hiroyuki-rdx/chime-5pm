@@ -325,37 +325,147 @@ def parse_open_meteo(payload: Any, settings: Mapping[str, Any], today: date) -> 
     }
 
 
+def _round_pop_to_step(pop: Any, pop_step: Any) -> Any:
+    """降水確率を ``pop_step`` の刻みに丸める。
+
+    ``pop_step`` が正の整数に変換できない場合は丸めずにそのまま返す
+    （呼び出し側の ``parts["pop"]`` 自体は変更しない方針とも一致する）。
+    Python 組み込みの :func:`round` は偶数丸め（銀行丸め）のため、
+    ちょうど中間の値（例: 25）は偶数側の刻み（20）に丸められる。
+    """
+    try:
+        step = int(pop_step)
+    except (TypeError, ValueError):
+        return pop
+    if step <= 0:
+        return pop
+    return int(round(pop / step)) * step
+
+
+def _format_weather_sentence(template: str, when: Any, label: Any, weather: Any,
+                             max_chars: Any) -> str:
+    # 予期しない長文の予報が来た場合の保険。読点の位置で切り詰める。
+    weather_text = truncate_weather_text(str(weather), max_chars)
+    return template.format(when=when, label=label, weather=weather_text)
+
+
+def _format_temp_max_sentence(template: str, temp_max: Any) -> str:
+    return template.format(temp_max=temp_max)
+
+
+def _format_pop_sentence(template: str, pop: Any, pop_step: Any) -> str:
+    return template.format(pop=_round_pop_to_step(pop, pop_step))
+
+
+def build_sentences(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> List[str]:
+    """1 地点ぶんの ``parts`` から読み上げ文のリストを返す（1〜3 文）。
+
+    地名・気温・降水確率を別々の完全な文に分けることで、各文の語彙が
+    有限に閉じ、全パターンを VOICEVOX で作り置きできるようにする
+    （1 文にまとめると組み合わせが爆発するため）。
+
+    - ``sentence_weather`` の文は常に出す（``parts["weather"]`` が空文字列に
+      ならないことは parse_jma / parse_open_meteo 側で保証済み）。
+    - ``parts["temp_max"]`` / ``parts["pop"]`` が ``None`` なら、対応する文は
+      出さない。
+    - テンプレートが空文字列（``""``）ならその文は出さない
+      （放送を短くしたい利用者向け）。
+    - ``pop`` は ``prerecord.pop_step`` の刻みに丸めてから埋め込む。
+      ``parts["pop"]`` 自体は生値のまま変更しない。
+    """
+    sentences: List[str] = []
+    max_chars = settings.get("max_weather_chars", 40)
+    pop_step = settings.get("prerecord", {}).get("pop_step")
+
+    weather_template = str(settings.get("sentence_weather", ""))
+    if weather_template:
+        sentences.append(_format_weather_sentence(
+            weather_template, parts.get("when", ""), parts.get("label", ""),
+            parts.get("weather", ""), max_chars))
+
+    temp_max = parts.get("temp_max")
+    temp_template = str(settings.get("sentence_temp_max", ""))
+    if temp_max is not None and temp_template:
+        sentences.append(_format_temp_max_sentence(temp_template, temp_max))
+
+    pop = parts.get("pop")
+    pop_template = str(settings.get("sentence_pop", ""))
+    if pop is not None and pop_template:
+        sentences.append(_format_pop_sentence(pop_template, pop, pop_step))
+
+    return sentences
+
+
+def prerecord_phrases(settings: Mapping[str, Any]) -> List[str]:
+    """作り置きすべき天気の文言を全列挙して返す（重複なし・順序安定）。
+
+    ``build_sentences`` と同じテンプレート・同じ丸め規則（``_format_*_sentence``
+    ヘルパー）を使って文を組み立てる。2 箇所に書くと語彙がずれるため、
+    文を作る処理はそのヘルパーに一本化している。
+
+    - ``open_meteo.locations`` の各 ``label`` × ``prerecord.whens`` ×
+      ``WMO_CODES`` の全値 → ``sentence_weather`` の文
+    - ``prerecord.temp_min`` 〜 ``temp_max``（両端含む） → ``sentence_temp_max`` の文
+    - 0 〜 100 を ``prerecord.pop_step`` 刻み → ``sentence_pop`` の文
+    - テンプレートが空文字列なら、その種類は列挙しない。
+    """
+    phrases: List[str] = []
+    seen = set()
+
+    def _add(text: str) -> None:
+        if text and text not in seen:
+            seen.add(text)
+            phrases.append(text)
+
+    prerecord = settings.get("prerecord", {}) or {}
+    max_chars = settings.get("max_weather_chars", 40)
+
+    weather_template = str(settings.get("sentence_weather", ""))
+    if weather_template:
+        locations = settings.get("open_meteo", {}).get("locations", []) or []
+        whens = list(prerecord.get("whens", []) or [])
+        for location in locations:
+            label = str(location.get("label", ""))
+            for when in whens:
+                for code in sorted(WMO_CODES):
+                    _add(_format_weather_sentence(
+                        weather_template, when, label, WMO_CODES[code], max_chars))
+
+    temp_template = str(settings.get("sentence_temp_max", ""))
+    if temp_template:
+        try:
+            temp_min = int(prerecord.get("temp_min", 0))
+            temp_max = int(prerecord.get("temp_max", 0))
+        except (TypeError, ValueError):
+            temp_min, temp_max = 0, -1  # 範囲が不正なら列挙しない
+        for value in range(temp_min, temp_max + 1):
+            _add(_format_temp_max_sentence(temp_template, value))
+
+    pop_template = str(settings.get("sentence_pop", ""))
+    if pop_template:
+        try:
+            pop_step = int(prerecord.get("pop_step"))
+        except (TypeError, ValueError):
+            pop_step = 0
+        if pop_step > 0:
+            for value in range(0, 101, pop_step):
+                _add(_format_pop_sentence(pop_template, value, pop_step))
+
+    return phrases
+
+
 def build_text(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> str:
-    """抜き出した要素から読み上げ文を組み立てる。
+    """抜き出した要素から読み上げ文（1 本の文字列）を組み立てる。
 
     ``parts["weather"]`` が空文字列にならないことはここでは保証しない。
     空文字ガードは呼び出し側の parse_jma / parse_open_meteo に集約しており
     （空なら WeatherError を送出する）、ここで二重に防御はしない。
+
+    文を作る処理自体は :func:`build_sentences` に一本化しており、ここでは
+    それを連結するだけ（後方互換用。1 文ずつの再生には ``build_sentences``
+    を使うこと）。
     """
-    details: List[str] = []
-    if parts.get("temp_max") is not None:
-        details.append("最高気温は{0}度".format(parts["temp_max"]))
-    if parts.get("temp_min") is not None:
-        details.append("最低気温は{0}度".format(parts["temp_min"]))
-    if parts.get("pop") is not None:
-        details.append("降水確率は{0}パーセント".format(parts["pop"]))
-
-    separator = str(settings.get("details_separator", "、"))
-    suffix = str(settings.get("suffix", "です。"))
-    detail_text = separator.join(details) + suffix if details else ""
-
-    # 予期しない長文の予報が来た場合の保険。読点の位置で切り詰める。
-    weather_text = truncate_weather_text(
-        str(parts.get("weather", "")), settings.get("max_weather_chars", 40))
-
-    template = str(settings.get("template", "{when}の{label}の天気は、{weather}。{details}"))
-    text = template.format(
-        when=parts.get("when", ""),
-        label=parts.get("label", ""),
-        weather=weather_text,
-        details=detail_text,
-    )
-    return text.strip()
+    return "".join(build_sentences(parts, settings))
 
 
 class WeatherService:
@@ -366,22 +476,36 @@ class WeatherService:
         self.provider = str(self.settings.get("provider", "jma")).lower()
         self.timeout = float(self.settings.get("timeout_seconds", 8.0))
         self.cache_seconds = float(self.settings.get("cache_minutes", 60)) * 60.0
-        self._cache: Optional[Tuple[float, date, str]] = None
+        # 地点ごとにキャッシュを持つ（大津のキャッシュが京都に流用されないように）。
+        # キーは jma なら固定の "jma"、open_meteo なら地点の label。
+        self._cache: Dict[str, Tuple[float, date, List[str]]] = {}
 
     @property
     def enabled(self) -> bool:
         return bool(self.settings.get("enabled", True))
 
-    def url(self) -> str:
-        """使用する API の URL を返す。"""
+    def url(self, location: Optional[Mapping[str, Any]] = None) -> str:
+        """使用する API の URL を返す。
+
+        ``open_meteo`` の複数地点一括クエリは応答形式が変わる（配列になる）
+        ため使わず、地点ごとに個別の URL を組み立てる。``location`` に
+        ``{"latitude": ..., "longitude": ...}`` を渡すとその地点の URL を、
+        省略すると ``open_meteo.locations`` の先頭地点の URL を返す
+        （地点を特定しない既存の呼び出し元、例えば ``--weather`` CLI の
+        URL 表示との後方互換のため）。
+        """
         if self.provider == "jma":
             area_code = str(self.settings.get("jma", {}).get("area_code", "130000"))
             return JMA_ENDPOINT.format(area_code=area_code)
         if self.provider == "open_meteo":
-            section = self.settings.get("open_meteo", {})
+            if location is None:
+                locations = self.settings.get("open_meteo", {}).get("locations", []) or []
+                if not locations:
+                    raise WeatherError("Open-Meteo の地点が設定されていません。")
+                location = locations[0]
             query = urllib.parse.urlencode({
-                "latitude": section.get("latitude", 35.6895),
-                "longitude": section.get("longitude", 139.6917),
+                "latitude": location.get("latitude"),
+                "longitude": location.get("longitude"),
                 "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
                          "precipitation_probability_max",
                 "timezone": "Asia/Tokyo",
@@ -397,24 +521,85 @@ class WeatherService:
             return parse_open_meteo(payload, self.settings.get("open_meteo", {}), today)
         raise WeatherError("未知の天気提供元です: {0}".format(self.provider))
 
-    def describe(self, today: Optional[date] = None, use_cache: bool = True) -> str:
-        """読み上げ用の天気予報テキストを返す。"""
+    def _targets(self) -> List[Tuple[str, str, Dict[str, Any]]]:
+        """``(キャッシュキー, URL, parse 用設定)`` のリストを返す。
+
+        jma は従来どおり単一地域のまま（後方互換）。open_meteo は
+        ``open_meteo.locations`` の各要素ごとに個別の URL を組み立てる。
+        """
+        if self.provider == "jma":
+            return [("jma", self.url(), dict(self.settings.get("jma", {})))]
+        if self.provider == "open_meteo":
+            locations = self.settings.get("open_meteo", {}).get("locations", []) or []
+            targets: List[Tuple[str, str, Dict[str, Any]]] = []
+            for location in locations:
+                label = str(location.get("label", ""))
+                targets.append((label, self.url(location), {"label": label}))
+            return targets
+        raise WeatherError("未知の天気提供元です: {0}".format(self.provider))
+
+    def _parse_one(self, payload: Any, parse_settings: Mapping[str, Any],
+                   today: date) -> Dict[str, Any]:
+        if self.provider == "jma":
+            return parse_jma(payload, parse_settings, today)
+        if self.provider == "open_meteo":
+            return parse_open_meteo(payload, parse_settings, today)
+        raise WeatherError("未知の天気提供元です: {0}".format(self.provider))
+
+    def _describe_one(self, cache_key: str, url: str, parse_settings: Mapping[str, Any],
+                      today: date, use_cache: bool) -> List[str]:
+        now = time.monotonic()
+        cached = self._cache.get(cache_key)
+        if (use_cache and cached
+                and cached[1] == today
+                and now - cached[0] < self.cache_seconds):
+            logger.debug("天気予報をキャッシュから取得しました（%s）。", cache_key)
+            return cached[2]
+
+        payload = fetch_json(url, self.timeout)
+        parts = self._parse_one(payload, parse_settings, today)
+        sentences = build_sentences(parts, self.settings)
+        if not sentences:
+            raise WeatherError("天気予報の読み上げ文を組み立てられませんでした。")
+
+        self._cache[cache_key] = (now, today, sentences)
+        return sentences
+
+    def describe_sentences(self, today: Optional[date] = None,
+                           use_cache: bool = True) -> List[str]:
+        """全地点ぶんの文を、地点の順に平坦なリストで返す。
+
+        1 地点の取得に失敗しても、取得できた地点の文は返す（例えば大津だけ
+        取れたら大津だけ読む）。失敗した地点は警告ログを出す。全地点が
+        失敗したときだけ :class:`WeatherError` を送出する。``enabled`` が
+        ``False`` の場合は従来どおり :class:`WeatherError` を送出する。
+        """
         if not self.enabled:
             raise WeatherError("天気予報機能が無効化されています。")
 
         resolved_today = today or date.today()
-        now = time.monotonic()
-        if (use_cache and self._cache
-                and self._cache[1] == resolved_today
-                and now - self._cache[0] < self.cache_seconds):
-            logger.debug("天気予報をキャッシュから取得しました。")
-            return self._cache[2]
+        targets = self._targets()
+        if not targets:
+            raise WeatherError("天気予報の取得先が設定されていません。")
 
-        payload = fetch_json(self.url(), self.timeout)
-        parts = self.parse(payload, resolved_today)
-        text = build_text(parts, self.settings)
-        if not text:
-            raise WeatherError("天気予報の読み上げ文を組み立てられませんでした。")
+        sentences: List[str] = []
+        failures = 0
+        for cache_key, url, parse_settings in targets:
+            try:
+                sentences.extend(self._describe_one(
+                    cache_key, url, parse_settings, resolved_today, use_cache))
+            except WeatherError as exc:
+                failures += 1
+                logger.warning("天気予報を取得できませんでした（%s）: %s", cache_key, exc)
 
-        self._cache = (now, resolved_today, text)
-        return text
+        if failures == len(targets):
+            raise WeatherError("天気予報を取得できませんでした（全地点で失敗）。")
+        return sentences
+
+    def describe(self, today: Optional[date] = None, use_cache: bool = True) -> str:
+        """読み上げ用の天気予報テキストを 1 本の文字列として返す（後方互換）。
+
+        1 文ずつ独立した音声として再生したい場合は :meth:`describe_sentences`
+        を使うこと。文を作る処理自体はそちらに一本化している。
+        """
+        return "".join(self.describe_sentences(today=today, use_cache=use_cache))

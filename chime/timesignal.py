@@ -141,7 +141,7 @@ def hour_parts(hour: int, settings: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def announce_text(hour: int, settings: Mapping[str, Any]) -> str:
-    """「午前10時をお知らせしました。」のような読み上げ文言を組み立てる。
+    """「午前10時をお知らせしたのだ。」のような読み上げ文言を組み立てる。
 
     テンプレートの ``{hour_reading}`` は誤読対策込みの時刻表現
     （例: 16 時なら「よじ」）。後方互換のため、数値のみの ``{hour}`` も

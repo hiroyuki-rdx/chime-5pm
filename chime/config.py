@@ -94,10 +94,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "envelope_ms": 5,
         "output_file": "assets/generated/time_signal.wav",
         # 「午前10時をお知らせしました。」（{hour_reading} は下記 hour_readings 参照）
-        "announce_template": "{period}{hour_reading}をお知らせしました。",
+        "announce_template": "{period}{hour_reading}をお知らせしたのだ。",
         # 12 時台のみ差し替える（NHK 準拠）
         "use_noon_template": True,
-        "noon_template": "正午をお知らせしました。",
+        "noon_template": "正午をお知らせしたのだ。",
         "period_am": "午前",
         "period_pm": "午後",
         # Open JTalk が誤読する時刻（12 時間表記の「時」）だけ、読みをかな書きで
@@ -106,17 +106,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "hour_readings": {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"},
     },
     "extra_segment": {
-        # 時報のあとに「ひとこと」または「天気予報」を流す
+        # 時報のあとにおまけを流す
         "enabled": True,
-        # 天気予報を選ぶ確率（0.0〜1.0）。残りは「ひとこと」。
-        # 既定は 0.0（天気予報は流さず、常に「ひとこと」にする）。
+        # "both"   … 天気予報 → ひとこと の順に両方流す（既定）
+        # "choice" … 従来どおり、どちらか一方を選ぶ
+        # "choice" のときだけ weather_probability / always_weather_hours /
+        # always_quote_hours / fallback_to_quote が効く。
+        "mode": "both",
+        # 天気予報を選ぶ確率（0.0〜1.0）。残りは「ひとこと」。mode="choice" 専用。
         "weather_probability": 0.0,
-        # この時刻は必ず天気予報にする
-        # 既定は空（天気予報機能自体は残すが、既定では有効化しない）。
+        # この時刻は必ず天気予報にする。mode="choice" 専用。
         "always_weather_hours": [],
-        # この時刻は必ず「ひとこと」にする
+        # この時刻は必ず「ひとこと」にする。mode="choice" 専用。
         "always_quote_hours": [],
-        # 天気取得に失敗したら「ひとこと」に切り替える
+        # 天気取得に失敗したら「ひとこと」に切り替える。mode="choice" 専用。
+        # mode="both" では、ひとことは天気の成否に関わらず必ず流れるため、
+        # 取得に失敗した天気は黙って飛ばす（この値は参照されない）。
         "fallback_to_quote": True,
     },
     "quotes": {
@@ -125,11 +130,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "avoid_recent": 8,
     },
     "weather": {
-        # 既定は無効（時報のあとは「ひとこと」のみ）。天気予報機能自体は
-        # 残しているため、必要になれば true にして再度有効化できる。
-        "enabled": False,
+        # 毎正時に天気予報を流す。無効にすると時報のあとは「ひとこと」だけになる。
+        "enabled": True,
         # "jma"（気象庁・キー不要）または "open_meteo"（キー不要）
-        "provider": "jma",
+        #
+        # 既定が open_meteo なのは、読み上げ文を作り置きできるようにするため。
+        # 気象庁の予報文は自由文なので事前生成できず、実行時に Open JTalk が
+        # 合成することになり、天気だけ別人の男性音声になる。open_meteo は
+        # 天気コード（WMO_CODES・28 語）で語彙が閉じるため、全パターンを
+        # VOICEVOX で作り置きでき、放送全体をずんだもんの声で揃えられる。
+        # jma に戻す場合はこの点を承知しておくこと（docs/SETUP.md 参照）。
+        "provider": "open_meteo",
         "timeout_seconds": 8.0,
         "cache_minutes": 60,
         "jma": {
@@ -153,15 +164,34 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "drop_after": ["所により"],
         },
         "open_meteo": {
-            "latitude": 35.0045,
-            "longitude": 135.8686,
-            "label": "滋賀",
+            # 読み上げる地点。上から順に読む。1 つに減らせば放送が短くなる。
+            # label はそのまま読み上げられるので、読み間違えない表記にすること。
+            "locations": [
+                {"label": "大津", "latitude": 35.0045, "longitude": 135.8686},
+                {"label": "京都", "latitude": 35.0116, "longitude": 135.7681},
+            ],
         },
-        "template": "{when}の{label}の天気は、{weather}。{details}",
-        "details_separator": "、",
-        "suffix": "です。",
-        # 天気の説明部分（{weather}）の文字数上限。予期しない長文の予報が来た
-        # 場合の保険で、超えたら読点の位置で切り詰める（文の途中では切らない）。
+        # 読み上げは 1 文ずつ独立した音声ファイルとして再生する。文を分けて
+        # おくと、地名・気温・降水確率のそれぞれが有限の語彙に収まり、全パターンを
+        # 作り置きできる（1 文にまとめると組み合わせが爆発して作り置きできない）。
+        # 空文字列にするとその文を読まない（放送を短くしたいときに使う）。
+        "sentence_weather": "{when}の{label}の天気は{weather}なのだ。",
+        "sentence_temp_max": "最高気温は{temp_max}度なのだ。",
+        "sentence_pop": "降水確率は{pop}パーセントなのだ。",
+        # 作り置きする語彙の範囲（scripts/generate_voicevox.py が参照する）。
+        # ここを広げるほど生成するファイルが増える。範囲外の値が来た場合は
+        # その 1 文だけ作り置きが外れて Open JTalk が合成する（放送は止まらない）。
+        "prerecord": {
+            "temp_min": -5,
+            "temp_max": 40,
+            # 降水確率はこの刻みに丸めて読み上げる（語彙を 11 通りに閉じるため）。
+            "pop_step": 10,
+            # forecast_days=1 で問い合わせるため実際には常に「今日」になる。
+            # 「明日」も作り置きしたい場合はここに足す（+56 件）。
+            "whens": ["今日"],
+        },
+        # 天気の説明部分（{weather}）の文字数上限。provider="jma" のときだけ
+        # 意味を持つ（気象庁の自由文が予期せず長い場合の保険）。
         "max_weather_chars": 40,
     },
     "tts": {

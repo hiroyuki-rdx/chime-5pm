@@ -95,19 +95,75 @@ class DefaultConfigMisreadFixesTest(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["weather"]["max_weather_chars"], 40)
 
 
-class DefaultExtraIsQuoteOnlyTest(unittest.TestCase):
-    """運用方針の変更: 時報のあとは既定で「ひとこと」のみとし、天気予報は
-    流さない。3 箇所すべてが揃っていないと別経路で天気予報が有効になりうる
-    ため、まとめて回帰確認する。"""
+class DefaultExtraIsWeatherThenQuoteTest(unittest.TestCase):
+    """運用方針: 時報のあとは毎回「天気予報 → ひとこと」の両方を流す。
 
-    def test_weather_is_disabled_by_default(self):
-        self.assertFalse(DEFAULT_CONFIG["weather"]["enabled"])
+    天気を流すには enabled と mode の両方が揃っている必要があり、片方だけでは
+    意図した放送にならないため、まとめて回帰確認する。
+    """
 
-    def test_weather_probability_is_zero_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_probability"], 0.0)
+    def test_weather_is_enabled_by_default(self):
+        self.assertTrue(DEFAULT_CONFIG["weather"]["enabled"])
 
-    def test_always_weather_hours_is_empty_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["always_weather_hours"], [])
+    def test_extra_mode_is_both_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["mode"], "both")
+
+
+class PrerecordableWeatherTest(unittest.TestCase):
+    """天気の読み上げを作り置きできる状態に保つための回帰確認。
+
+    気象庁（jma）の予報文は自由文なので語彙が閉じず、事前生成できない。
+    事前生成が外れた文は実行時に Open JTalk が合成するため、天気だけ
+    別人の男性音声になる。既定を open_meteo（天気コードで語彙が 28 語に
+    閉じる）に保つことが、放送全体をずんだもんの声で揃える前提になっている。
+    """
+
+    def test_provider_is_open_meteo_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["weather"]["provider"], "open_meteo")
+
+    def test_locations_are_otsu_and_kyoto(self):
+        labels = [str(item.get("label"))
+                  for item in DEFAULT_CONFIG["weather"]["open_meteo"]["locations"]]
+        self.assertEqual(labels, ["大津", "京都"])
+
+    def test_every_location_has_coordinates(self):
+        for item in DEFAULT_CONFIG["weather"]["open_meteo"]["locations"]:
+            self.assertIsInstance(item.get("latitude"), float, item)
+            self.assertIsInstance(item.get("longitude"), float, item)
+
+    def test_prerecord_range_is_defined(self):
+        prerecord = DEFAULT_CONFIG["weather"]["prerecord"]
+        self.assertLess(prerecord["temp_min"], prerecord["temp_max"])
+        self.assertGreater(prerecord["pop_step"], 0)
+        self.assertEqual(prerecord["whens"], ["今日"])
+
+
+class ZundamonToneTest(unittest.TestCase):
+    """読み上げの語尾をずんだもんの「のだ」調に揃えている回帰確認。
+
+    語尾を変えると作り置き音声の照合（文言の完全一致）が外れるため、
+    うっかり戻すと放送全体が Open JTalk の男性音声になる。
+    """
+
+    def _templates(self):
+        signal = DEFAULT_CONFIG["time_signal"]
+        weather = DEFAULT_CONFIG["weather"]
+        return [
+            signal["announce_template"],
+            signal["noon_template"],
+            weather["sentence_weather"],
+            weather["sentence_temp_max"],
+            weather["sentence_pop"],
+        ]
+
+    def test_every_template_ends_with_noda(self):
+        for template in self._templates():
+            self.assertTrue(template.endswith("のだ。"), template)
+
+    def test_no_template_keeps_the_old_desu_masu_ending(self):
+        for template in self._templates():
+            self.assertNotIn("しました。", template)
+            self.assertNotIn("です。", template)
 
 
 class LoadConfigTest(unittest.TestCase):

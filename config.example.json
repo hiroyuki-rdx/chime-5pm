@@ -74,9 +74,9 @@
     "volume": 0.6,
     "envelope_ms": 5,
     "output_file": "assets/generated/time_signal.wav",
-    "announce_template": "{period}{hour_reading}をお知らせしました。",
+    "announce_template": "{period}{hour_reading}をお知らせしたのだ。",
     "use_noon_template": true,
-    "noon_template": "正午をお知らせしました。",
+    "noon_template": "正午をお知らせしたのだ。",
     "period_am": "午前",
     "period_pm": "午後",
     "hour_readings": {
@@ -88,6 +88,7 @@
   },
   "extra_segment": {
     "enabled": true,
+    "mode": "both",
     "weather_probability": 0.0,
     "always_weather_hours": [],
     "always_quote_hours": [],
@@ -98,8 +99,8 @@
     "avoid_recent": 8
   },
   "weather": {
-    "enabled": false,
-    "provider": "jma",
+    "enabled": true,
+    "provider": "open_meteo",
     "timeout_seconds": 8.0,
     "cache_minutes": 60,
     "jma": {
@@ -112,13 +113,30 @@
       ]
     },
     "open_meteo": {
-      "latitude": 35.0045,
-      "longitude": 135.8686,
-      "label": "滋賀"
+      "locations": [
+        {
+          "label": "大津",
+          "latitude": 35.0045,
+          "longitude": 135.8686
+        },
+        {
+          "label": "京都",
+          "latitude": 35.0116,
+          "longitude": 135.7681
+        }
+      ]
     },
-    "template": "{when}の{label}の天気は、{weather}。{details}",
-    "details_separator": "、",
-    "suffix": "です。",
+    "sentence_weather": "{when}の{label}の天気は{weather}なのだ。",
+    "sentence_temp_max": "最高気温は{temp_max}度なのだ。",
+    "sentence_pop": "降水確率は{pop}パーセントなのだ。",
+    "prerecord": {
+      "temp_min": -5,
+      "temp_max": 40,
+      "pop_step": 10,
+      "whens": [
+        "今日"
+      ]
+    },
     "max_weather_chars": 40
   },
   "tts": {

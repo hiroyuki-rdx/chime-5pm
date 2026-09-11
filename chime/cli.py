@@ -195,11 +195,15 @@ def show_weather(app: ChimeApp) -> int:
     print("提供元: {0}".format(app.weather.provider))
     try:
         print("URL: {0}".format(app.weather.url()))
-        text = app.weather.describe(today=app.now().date())
+        sentences = app.weather.describe_sentences(today=app.now().date())
     except WeatherError as exc:
         print("天気予報を取得できませんでした: {0}".format(exc), file=sys.stderr)
         return 1
-    print("読み上げ文: {0}".format(text))
+    # 1 文ずつ表示・再生する。放送でも 1 文ずつ別のセグメントとして鳴らして
+    # おり、連結すると作り置き音声との照合が外れて実行時合成に落ちるため、
+    # ここでも同じ単位で扱って実際の放送と食い違わないようにする。
+    for index, sentence in enumerate(sentences, start=1):
+        print("読み上げ文 {0}/{1}: {2}".format(index, len(sentences), sentence))
     if not app.dry_run:
-        app.play(app.builder.build_text(text))
+        app.play(app.builder.build_texts(sentences))
     return 0

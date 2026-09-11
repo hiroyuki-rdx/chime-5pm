@@ -86,7 +86,7 @@ class RunTest(unittest.TestCase):
         self.assertIn("設定エラー", output)
 
     def test_dry_run_hourly_does_not_play(self):
-        """12 時の時報では「正午をお知らせしました。」という定型文が使われること。
+        """12 時の時報では「正午をお知らせしたのだ。」という定型文が使われること。
 
         この検証は音声合成（TTS）の成否とは無関係にしたい。しかし
         時刻アナウンスの文言は再生セグメントのラベルとしてしか出力されず、
@@ -100,7 +100,7 @@ class RunTest(unittest.TestCase):
         with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
             code, output = call(["--test-hourly", "12", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
-        self.assertIn("正午をお知らせしました。", output)
+        self.assertIn("正午をお知らせしたのだ。", output)
         self.assertIn("dry-run", output)
 
     def test_dry_run_closing(self):
@@ -127,18 +127,29 @@ class RunTest(unittest.TestCase):
         self.assertIn("天気予報を取得できませんでした", output)
 
     def test_weather_success_prints_text(self):
-        # 天気予報は既定で無効なので、明示的に有効化する。
-        fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "jma_130000.json")
+        # 既定 provider は open_meteo（天気コードで語彙が閉じ、作り置きできる）。
+        fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "open_meteo.json")
         with open(fixture, encoding="utf-8") as handle:
             payload = json.load(handle)
-        with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "config.json")
-            with open(path, "w", encoding="utf-8") as handle:
-                json.dump({"weather": {"enabled": True}}, handle)
-            with mock.patch("chime.weather.fetch_json", return_value=payload):
-                code, output = call(["--config", path, "--weather", "--dry-run"])
+        with mock.patch("chime.weather.fetch_json", return_value=payload):
+            code, output = call(["--weather", "--dry-run"])
         self.assertEqual(code, 0)
-        self.assertIn("の天気は、", output)
+        self.assertIn("の天気は", output)
+        self.assertIn("なのだ。", output)
+
+    def test_weather_prints_one_line_per_sentence(self):
+        """読み上げは 1 文ずつ別のセグメントとして鳴らすため、確認用の出力も
+        同じ単位にする。連結した文字列では作り置き音声との照合が外れる。"""
+        fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "open_meteo.json")
+        with open(fixture, encoding="utf-8") as handle:
+            payload = json.load(handle)
+        with mock.patch("chime.weather.fetch_json", return_value=payload):
+            code, output = call(["--weather", "--dry-run"])
+        self.assertEqual(code, 0)
+        # 既定は 2 地点 × 最大 3 文。地点ごとに天気・最高気温・降水確率が出る。
+        lines = [line for line in output.splitlines() if line.startswith("読み上げ文 ")]
+        self.assertEqual(len(lines), 6, output)
+        self.assertTrue(all(line.endswith("なのだ。") for line in lines), lines)
 
     def test_config_file_is_applied(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -156,18 +167,21 @@ class RunTest(unittest.TestCase):
 
         修正前は ``app.weather.describe()`` を引数なしで呼んでいたため、
         ``describe()`` 側で ``today=None`` を受け取り OS のローカル日付
-        （``date.today()``）にフォールバックしていた。
+        （``date.today()``）にフォールバックしていた。天気が複数文になり
+        ``describe_sentences()`` を呼ぶようになった今も、同じ不具合を
+        踏まないことを確認する。
         """
         fake_today = date.today() + timedelta(days=1)
         captured = {}
 
-        def fake_describe(self, today=None, use_cache=True):
+        def fake_describe_sentences(self, today=None, use_cache=True):
             captured["today"] = today
-            return "テスト日和です。"
+            return ["テスト日和なのだ。"]
 
         with mock.patch("chime.app.ChimeApp.now",
                         return_value=datetime.combine(fake_today, datetime.min.time())), \
-                mock.patch("chime.weather.WeatherService.describe", fake_describe):
+                mock.patch("chime.weather.WeatherService.describe_sentences",
+                           fake_describe_sentences):
             code, output = call(["--weather", "--dry-run"])
 
         self.assertEqual(code, 0)
@@ -242,15 +256,17 @@ class RunTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("天気予報を取得できませんでした", output)
 
-    def test_test_hourly_default_config_uses_a_quote_not_weather(self):
-        """既定設定では、天気予報ではなく「ひとこと」が流れること
-        （10 時は以前の既定では必ず天気予報になっていた）。"""
+    def test_test_hourly_default_config_uses_weather_and_quote(self):
+        """既定設定では、時報のあとに天気予報と「ひとこと」の両方が流れること。
+
+        天気の取得はここでは失敗する（この環境からは外部に出られない）が、
+        取得できなくても「ひとこと」は必ず流れる、という設計の確認も兼ねる。
+        """
         wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
         with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
             code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("ひとこと", output)
-        self.assertNotIn("天気予報", output)
 
     # -- 不具合4: 音源ファイルが全て欠落していても --test 系が 0 を返していた --
     # （仕様書 4.11 章「再生可能なセグメントを 1 つも用意できなかった場合は 1」に
