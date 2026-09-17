@@ -282,32 +282,28 @@ def _collect_jma_pop(time_series: List[Mapping[str, Any]], area_name: str,
 
 
 def parse_open_meteo(payload: Any, settings: Mapping[str, Any], today: date) -> Dict[str, Any]:
-    """Open-Meteo JSON から読み上げに必要な要素を抜き出す。"""
+    """Open-Meteo JSON から読み上げに必要な要素を抜き出す。
+
+    天気・気温は ``current``（現況）から取る。時報で知りたいのは「今」の
+    天気・気温であり、``daily`` の値はその日 1 日ぶんの予報であって現況ではない
+    ため。``daily`` は ``sentence_temp_max`` / ``sentence_pop`` を設定で
+    有効にした場合の opt-in 用に残しており、無くても現況の天気・気温は
+    組み立てられる（temp_max / temp_min / pop は ``None`` になるだけ）。
+    """
     if not isinstance(payload, Mapping):
         raise WeatherError("Open-Meteo の応答形式が想定外です。")
-    daily = payload.get("daily")
-    if not isinstance(daily, Mapping) or not daily.get("time"):
-        raise WeatherError("Open-Meteo の応答に日別予報が含まれていません。")
 
-    def _at(key: str) -> Any:
-        values = daily.get(key)
-        if isinstance(values, list) and values:
-            return values[0]
-        return None
+    current = payload.get("current")
+    if not isinstance(current, Mapping):
+        raise WeatherError("Open-Meteo の応答に現況（current）が含まれていません。")
 
-    raw_date = str(daily["time"][0])
-    try:
-        target_date = date.fromisoformat(raw_date)
-    except ValueError:
-        target_date = today
-
-    code = _at("weather_code")
+    code = current.get("weather_code")
     try:
         weather = WMO_CODES.get(int(code), "")
     except (TypeError, ValueError):
         weather = ""
     if not weather:
-        raise WeatherError("Open-Meteo の天気コードを解釈できません: {0}".format(code))
+        raise WeatherError("Open-Meteo の現況の天気コードを解釈できません: {0}".format(code))
 
     def _as_int(value: Any) -> Optional[int]:
         try:
@@ -315,10 +311,29 @@ def parse_open_meteo(payload: Any, settings: Mapping[str, Any], today: date) -> 
         except (TypeError, ValueError):
             return None
 
+    daily = payload.get("daily")
+    if not isinstance(daily, Mapping):
+        daily = {}
+
+    def _at(key: str) -> Any:
+        values = daily.get(key)
+        if isinstance(values, list) and values:
+            return values[0]
+        return None
+
+    target_date = today
+    raw_date = _at("time")
+    if raw_date is not None:
+        try:
+            target_date = date.fromisoformat(str(raw_date))
+        except ValueError:
+            target_date = today
+
     return {
         "when": _relative_label(target_date, today),
         "label": str(settings.get("label", "")),
         "weather": weather,
+        "temp": _as_int(current.get("temperature_2m")),
         "temp_max": _as_int(_at("temperature_2m_max")),
         "temp_min": _as_int(_at("temperature_2m_min")),
         "pop": _as_int(_at("precipitation_probability_max")),
@@ -349,6 +364,10 @@ def _format_weather_sentence(template: str, when: Any, label: Any, weather: Any,
     return template.format(when=when, label=label, weather=weather_text)
 
 
+def _format_temp_sentence(template: str, temp: Any) -> str:
+    return template.format(temp=temp)
+
+
 def _format_temp_max_sentence(template: str, temp_max: Any) -> str:
     return template.format(temp_max=temp_max)
 
@@ -358,18 +377,21 @@ def _format_pop_sentence(template: str, pop: Any, pop_step: Any) -> str:
 
 
 def build_sentences(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> List[str]:
-    """1 地点ぶんの ``parts`` から読み上げ文のリストを返す（1〜3 文）。
+    """1 地点ぶんの ``parts`` から読み上げ文のリストを返す（1〜4 文）。
 
-    地名・気温・降水確率を別々の完全な文に分けることで、各文の語彙が
-    有限に閉じ、全パターンを VOICEVOX で作り置きできるようにする
+    地名・気温・最高気温・降水確率を別々の完全な文に分けることで、各文の
+    語彙が有限に閉じ、全パターンを VOICEVOX で作り置きできるようにする
     （1 文にまとめると組み合わせが爆発するため）。
+
+    文の順序は 天気 → 気温（現況） → 最高気温 → 降水確率 で固定。
 
     - ``sentence_weather`` の文は常に出す（``parts["weather"]`` が空文字列に
       ならないことは parse_jma / parse_open_meteo 側で保証済み）。
-    - ``parts["temp_max"]`` / ``parts["pop"]`` が ``None`` なら、対応する文は
-      出さない。
+    - ``parts["temp"]`` / ``parts["temp_max"]`` / ``parts["pop"]`` が
+      ``None`` なら、対応する文は出さない。
     - テンプレートが空文字列（``""``）ならその文は出さない
-      （放送を短くしたい利用者向け）。
+      （放送を短くしたい利用者向け。既定では ``sentence_temp_max`` /
+      ``sentence_pop`` が空文字列で、現況の天気・気温だけを読む）。
     - ``pop`` は ``prerecord.pop_step`` の刻みに丸めてから埋め込む。
       ``parts["pop"]`` 自体は生値のまま変更しない。
     """
@@ -383,10 +405,15 @@ def build_sentences(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> Li
             weather_template, parts.get("when", ""), parts.get("label", ""),
             parts.get("weather", ""), max_chars))
 
+    temp = parts.get("temp")
+    temp_template = str(settings.get("sentence_temp", ""))
+    if temp is not None and temp_template:
+        sentences.append(_format_temp_sentence(temp_template, temp))
+
     temp_max = parts.get("temp_max")
-    temp_template = str(settings.get("sentence_temp_max", ""))
-    if temp_max is not None and temp_template:
-        sentences.append(_format_temp_max_sentence(temp_template, temp_max))
+    temp_max_template = str(settings.get("sentence_temp_max", ""))
+    if temp_max is not None and temp_max_template:
+        sentences.append(_format_temp_max_sentence(temp_max_template, temp_max))
 
     pop = parts.get("pop")
     pop_template = str(settings.get("sentence_pop", ""))
@@ -405,8 +432,12 @@ def prerecord_phrases(settings: Mapping[str, Any]) -> List[str]:
 
     - ``open_meteo.locations`` の各 ``label`` × ``prerecord.whens`` ×
       ``WMO_CODES`` の全値 → ``sentence_weather`` の文
+    - ``prerecord.temp_min`` 〜 ``temp_max``（両端含む） → ``sentence_temp`` の文
+      （現況の気温。既定で有効）
     - ``prerecord.temp_min`` 〜 ``temp_max``（両端含む） → ``sentence_temp_max`` の文
+      （その日の最高気温。既定では空文字列で無効）
     - 0 〜 100 を ``prerecord.pop_step`` 刻み → ``sentence_pop`` の文
+      （既定では空文字列で無効）
     - テンプレートが空文字列なら、その種類は列挙しない。
     """
     phrases: List[str] = []
@@ -431,7 +462,7 @@ def prerecord_phrases(settings: Mapping[str, Any]) -> List[str]:
                     _add(_format_weather_sentence(
                         weather_template, when, label, WMO_CODES[code], max_chars))
 
-    temp_template = str(settings.get("sentence_temp_max", ""))
+    temp_template = str(settings.get("sentence_temp", ""))
     if temp_template:
         try:
             temp_min = int(prerecord.get("temp_min", 0))
@@ -439,7 +470,17 @@ def prerecord_phrases(settings: Mapping[str, Any]) -> List[str]:
         except (TypeError, ValueError):
             temp_min, temp_max = 0, -1  # 範囲が不正なら列挙しない
         for value in range(temp_min, temp_max + 1):
-            _add(_format_temp_max_sentence(temp_template, value))
+            _add(_format_temp_sentence(temp_template, value))
+
+    temp_max_template = str(settings.get("sentence_temp_max", ""))
+    if temp_max_template:
+        try:
+            temp_min = int(prerecord.get("temp_min", 0))
+            temp_max = int(prerecord.get("temp_max", 0))
+        except (TypeError, ValueError):
+            temp_min, temp_max = 0, -1  # 範囲が不正なら列挙しない
+        for value in range(temp_min, temp_max + 1):
+            _add(_format_temp_max_sentence(temp_max_template, value))
 
     pop_template = str(settings.get("sentence_pop", ""))
     if pop_template:
@@ -506,6 +547,10 @@ class WeatherService:
             query = urllib.parse.urlencode({
                 "latitude": location.get("latitude"),
                 "longitude": location.get("longitude"),
+                # 現況（読み上げの本体）。daily は sentence_temp_max /
+                # sentence_pop を有効にしたときの opt-in 用に残す。1 地点
+                # 1 回の HTTP で両方が返るようにしておく。
+                "current": "weather_code,temperature_2m",
                 "daily": "weather_code,temperature_2m_max,temperature_2m_min,"
                          "precipitation_probability_max",
                 "timezone": "Asia/Tokyo",

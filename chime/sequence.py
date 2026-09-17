@@ -49,6 +49,24 @@ class PlaybackPlan:
         return "\n".join(lines)
 
 
+def _resolve_weather_hours(settings: Mapping[str, Any]) -> set:
+    """``extra_segment.weather_hours`` を ``int`` の集合として返す。
+
+    JSON 由来の設定では要素に文字列（例 ``"10"``）が混ざりうるため、
+    ``int()`` で正規化してから比較する。変換できない要素は警告ログを
+    出して無視する（設定ミス 1 件で放送全体が落ちないようにするため）。
+    """
+    hours = set()
+    for raw in settings.get("weather_hours", []) or []:
+        try:
+            hours.add(int(raw))
+        except (TypeError, ValueError):
+            logger.warning(
+                "extra_segment.weather_hours の要素を解釈できません: %r。無視します。",
+                raw)
+    return hours
+
+
 def choose_extra(hour: int, settings: Mapping[str, Any],
                  rng: random.Random) -> Optional[str]:
     """時報のあとに流す内容（天気予報／ひとこと）を抽選する。"""
@@ -94,10 +112,13 @@ class SequenceBuilder:
 
         おまけ（``extra_segment``）は ``mode`` で分岐する。
 
-        - ``"both"``（既定） 天気予報 → ひとこと の順に両方流す。天気の
-          成否に関わらずひとことは必ず流す（``_append_weather`` に
-          ``fallback=False`` を渡し、失敗時に「ひとこと」が二重に
-          流れるのを防ぐ）。
+        - ``"both"``（既定） ``extra_segment.weather_hours`` に含まれる時刻
+          だけ 天気予報 → ひとこと の順に両方流す。含まれない時刻は
+          ひとことだけを流す（``WeatherService`` は呼ばない。毎正時に
+          無駄な HTTP リクエストが発生するのを避けるため）。天気を流す
+          時刻でも、その成否に関わらずひとことは必ず流す
+          （``_append_weather`` に ``fallback=False`` を渡し、失敗時に
+          「ひとこと」が二重に流れるのを防ぐ）。
         - ``"choice"``       従来どおり :func:`choose_extra` の抽選結果で、
           天気予報／ひとことのどちらか一方だけを流す。
         - それ以外（設定ミス） 警告ログを出したうえで ``"both"`` として
@@ -129,7 +150,8 @@ class SequenceBuilder:
                     logger.warning(
                         "未知の extra_segment.mode です: %s。\"both\" として扱います。",
                         mode)
-                self._append_weather(plan, hour, fallback=False)
+                if hour in _resolve_weather_hours(extra_settings):
+                    self._append_weather(plan, hour, fallback=False)
                 self._append_quote(plan, hour)
         return plan
 

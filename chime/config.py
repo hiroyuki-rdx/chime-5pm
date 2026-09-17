@@ -113,6 +113,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # "choice" のときだけ weather_probability / always_weather_hours /
         # always_quote_hours / fallback_to_quote が効く。
         "mode": "both",
+        # mode="both" で天気予報を流す正時の一覧。ここに無い時刻は
+        # 時報＋ひとことだけになる。空リストにすると一度も流さない。
+        # 既定は 2 時間おき。毎正時に流すなら 10〜16 をすべて並べる。
+        # 閉館放送（16:57）は時報とは別の経路なので、ここに何を書いても
+        # 天気は付かない。
+        "weather_hours": [10, 12, 14, 16],
         # 天気予報を選ぶ確率（0.0〜1.0）。残りは「ひとこと」。mode="choice" 専用。
         "weather_probability": 0.0,
         # この時刻は必ず天気予報にする。mode="choice" 専用。
@@ -140,6 +146,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 天気コード（WMO_CODES・28 語）で語彙が閉じるため、全パターンを
         # VOICEVOX で作り置きでき、放送全体をずんだもんの声で揃えられる。
         # jma に戻す場合はこの点を承知しておくこと（docs/SETUP.md 参照）。
+        #
+        # またこの既定は「現在の」天気と気温を読む前提になっている。気象庁に
+        # 現況は無いため、jma に戻すと気温の文が消えて天気 1 文だけになり、
+        # かつ sentence_weather の「今の」が実態（今日 1 日の予報）と食い違う。
+        # jma を使うなら sentence_weather を予報の言い回しに戻し、
+        # sentence_temp_max / sentence_pop を有効にすること。
         "provider": "open_meteo",
         "timeout_seconds": 8.0,
         "cache_minutes": 60,
@@ -172,12 +184,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             ],
         },
         # 読み上げは 1 文ずつ独立した音声ファイルとして再生する。文を分けて
-        # おくと、地名・気温・降水確率のそれぞれが有限の語彙に収まり、全パターンを
+        # おくと、地名・気温のそれぞれが有限の語彙に収まり、全パターンを
         # 作り置きできる（1 文にまとめると組み合わせが爆発して作り置きできない）。
         # 空文字列にするとその文を読まない（放送を短くしたいときに使う）。
-        "sentence_weather": "{when}の{label}の天気は{weather}なのだ。",
-        "sentence_temp_max": "最高気温は{temp_max}度なのだ。",
-        "sentence_pop": "降水確率は{pop}パーセントなのだ。",
+        #
+        # 既定は「現在の」天気と気温を読む（provider="open_meteo" が current で
+        # 返す値）。時報で知りたいのは今どうなのかであり、その日の予想最高気温を
+        # 午後に読んでも実感と合わないため。
+        "sentence_weather": "今の{label}の天気は{weather}なのだ。",
+        "sentence_temp": "気温は{temp}度なのだ。",
+        # 以下は今日 1 日の予報。既定では読まない（空文字列）。読みたくなったら
+        # 文言を入れて scripts/generate_voicevox.py を再実行すること
+        # （空のあいだは作り置きが生成されず、有効化しただけでは声が揃わない）。
+        # 降水確率は現況が存在しないため、有効にすると現況と予報が混在する。
+        "sentence_temp_max": "",
+        "sentence_pop": "",
         # 作り置きする語彙の範囲（scripts/generate_voicevox.py が参照する）。
         # ここを広げるほど生成するファイルが増える。範囲外の値が来た場合は
         # その 1 文だけ作り置きが外れて Open JTalk が合成する（放送は止まらない）。

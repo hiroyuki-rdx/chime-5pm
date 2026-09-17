@@ -89,6 +89,12 @@
   "extra_segment": {
     "enabled": true,
     "mode": "both",
+    "weather_hours": [
+      10,
+      12,
+      14,
+      16
+    ],
     "weather_probability": 0.0,
     "always_weather_hours": [],
     "always_quote_hours": [],
@@ -126,9 +132,10 @@
         }
       ]
     },
-    "sentence_weather": "{when}の{label}の天気は{weather}なのだ。",
-    "sentence_temp_max": "最高気温は{temp_max}度なのだ。",
-    "sentence_pop": "降水確率は{pop}パーセントなのだ。",
+    "sentence_weather": "今の{label}の天気は{weather}なのだ。",
+    "sentence_temp": "気温は{temp}度なのだ。",
+    "sentence_temp_max": "",
+    "sentence_pop": "",
     "prerecord": {
       "temp_min": -5,
       "temp_max": 40,

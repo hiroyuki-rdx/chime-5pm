@@ -20,15 +20,13 @@ from chime.weather import WeatherError
 
 EXTRA = DEFAULT_CONFIG["extra_segment"]
 
-#: StubWeather の既定の読み上げ文。2 地点（大津・京都）× 3 文
-#: （天気／最高気温／降水確率）を模した、実運用のパターン数と揃えた 6 要素。
+#: StubWeather の既定の読み上げ文。2 地点（大津・京都）× 2 文
+#: （現在の天気／気温）を模した、実運用のパターン数と揃えた 4 要素。
 DEFAULT_WEATHER_SENTENCES = [
-    "今日の大津の天気はおおむね晴れなのだ。",
-    "最高気温は28度なのだ。",
-    "降水確率は10パーセントなのだ。",
-    "今日の京都の天気はくもりなのだ。",
-    "最高気温は27度なのだ。",
-    "降水確率は20パーセントなのだ。",
+    "今の大津の天気は晴れなのだ。",
+    "気温は28度なのだ。",
+    "今の京都の天気はくもりなのだ。",
+    "気温は29度なのだ。",
 ]
 
 
@@ -183,15 +181,16 @@ class BuildHourlyTest(BuilderTestCase):
 
     # -- mode="both"（既定） ---------------------------------------------
 
-    def test_default_config_appends_weather_then_quote(self):
+    def test_weather_hours_get_weather_then_quote(self):
         """既定設定（config.json を作らない場合、mode="both"）では、
-        時報のあとに天気予報（複数文）→ ひとこと の順に両方流れること
-        （運用方針の変更を回帰確認する）。
+        ``extra_segment.weather_hours``（既定 10/12/14/16 時）に含まれる
+        時刻だけ、時報のあとに天気予報（複数文）→ ひとこと の順に両方流れる
+        こと（2 時間おきに天気を流す、という新方針を回帰確認する）。
 
-        スタブが 6 文返す場合、セグメントは
-        時報音 1 + 時刻 1 + 天気 6 + ひとこと 1 = 9 個になる。
+        スタブが 4 文返す場合、セグメントは
+        時報音 1 + 時刻 1 + 天気 4 + ひとこと 1 = 7 個になる。
         """
-        for hour in (10, 11, 12, 14, 16):
+        for hour in (10, 12, 14, 16):
             with self.subTest(hour=hour):
                 weather = StubWeather()
                 builder = self.make_builder(weather=weather)
@@ -202,11 +201,73 @@ class BuildHourlyTest(BuilderTestCase):
                 for sentence in weather.sentences:
                     self.assertIn(sentence, plan.spoken)
 
+    def test_non_weather_hours_get_quote_only_and_never_call_weather(self):
+        """``weather_hours`` に無い時刻（既定では 11/13/15 時）は、天気を
+        まったく流さず「時報音 + 時刻 + ひとこと」の 3 個だけになること。
+        また、その時刻では ``WeatherService`` を一度も呼ばないこと
+        （呼ぶと毎正時に無駄な HTTP リクエストが発生してしまう）。
+        """
+        for hour in (11, 13, 15):
+            with self.subTest(hour=hour):
+                weather = StubWeather()
+                builder = self.make_builder(weather=weather)
+                plan = builder.build_hourly(hour)
+                self.assertEqual(weather.calls, 0)
+                self.assertEqual(len(plan.segments), 3)
+                self.assertIsNotNone(plan.quote)
+                weather_labels = [label for label in self.labels(plan) if "天気予報" in label]
+                self.assertEqual(weather_labels, [])
+
+    def test_empty_weather_hours_never_plays_weather(self):
+        # weather_hours を空リストにすると、設定で天気だけ止められる
+        # （どの時刻でも天気は一度も流れない）。
+        self.config.data["extra_segment"]["weather_hours"] = []
+        weather = StubWeather()
+        for hour in (10, 11, 12, 13, 14, 15, 16):
+            with self.subTest(hour=hour):
+                builder = self.make_builder(weather=weather)
+                plan = builder.build_hourly(hour)
+                self.assertEqual(len(plan.segments), 3)
+        self.assertEqual(weather.calls, 0)
+
+    def test_weather_hours_accepts_string_elements_and_ignores_bad_ones(self):
+        # JSON 由来の設定では要素が文字列で来ることがある（例 "10"）。
+        # int() で正規化して比較すること。変換できない要素があっても
+        # 放送は落ちず、その要素だけ無視されること。
+        self.config.data["extra_segment"]["weather_hours"] = ["10", "12", "not-a-number", None]
+        weather = StubWeather()
+        builder = self.make_builder(weather=weather)
+
+        plan10 = builder.build_hourly(10)
+        self.assertEqual(len(plan10.segments), 2 + len(weather.sentences) + 1)
+
+        plan11 = builder.build_hourly(11)
+        self.assertEqual(len(plan11.segments), 3)
+
+        self.assertEqual(weather.calls, 1)
+
+    def test_choice_mode_does_not_consult_weather_hours(self):
+        # mode="choice" では weather_hours を一切参照せず、従来どおり
+        # choose_extra() の抽選結果だけで天気予報／ひとことが決まること。
+        # weather_hours を空にしても、choice モードでは影響しない。
+        self.config.data["extra_segment"]["mode"] = "choice"
+        self.config.data["extra_segment"]["weather_probability"] = 1.0
+        self.config.data["extra_segment"]["weather_hours"] = []
+        weather = StubWeather()
+        # 11 時は weather_hours が空でも対象外だが、choice モードでは
+        # weather_probability=1.0 なので天気予報が選ばれるはず。
+        plan = self.make_builder(rng=FixedRandom(0.0), weather=weather).build_hourly(11)
+        self.assertEqual(weather.calls, 1)
+        for sentence in weather.sentences:
+            self.assertIn(sentence, plan.spoken)
+        self.assertIsNone(plan.quote)
+
     def test_weather_sentences_are_appended_as_separate_segments(self):
         # 天気の各文が 1 つの文字列に連結されず、文ごとに独立したセグメント
         # として積まれること（作り置き音声は文単位のため、連結すると
         # 照合が外れて Open JTalk にフォールバックしてしまう）。
-        plan = self.make_builder().build_hourly(11)
+        # 10 時は既定の weather_hours に含まれる時刻。
+        plan = self.make_builder().build_hourly(10)
 
         weather_start = 1  # plan.spoken[0] は時刻アナウンス
         weather_spoken = plan.spoken[weather_start:weather_start + len(self.weather.sentences)]
@@ -226,9 +287,9 @@ class BuildHourlyTest(BuilderTestCase):
         # 天気が全滅（WeatherError）しても、ひとことは必ず流れること。
         # かつ、ひとことが 2 つ流れないこと（mode="both" では
         # _append_weather(fallback=False) のため、ここでの失敗はひとことへ
-        # 二重に落とさない）。
+        # 二重に落とさない）。10 時は既定の weather_hours に含まれる時刻。
         builder = self.make_builder(weather=StubWeather(fail=True))
-        plan = builder.build_hourly(11)
+        plan = builder.build_hourly(10)
 
         self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
         self.assertIsNotNone(plan.quote)
@@ -245,7 +306,8 @@ class BuildHourlyTest(BuilderTestCase):
         logging.disable(logging.NOTSET)
         try:
             with self.assertLogs("chime.sequence", level="WARNING") as cm:
-                plan = self.make_builder().build_hourly(11)
+                # 10 時は既定の weather_hours に含まれる時刻。
+                plan = self.make_builder().build_hourly(10)
         finally:
             logging.disable(logging.CRITICAL)
         self.assertTrue(any("mode" in message for message in cm.output))
@@ -357,6 +419,20 @@ class BuildClosingTest(BuilderTestCase):
         plan = self.make_builder().build_closing()
         self.assertEqual(len(plan.segments), 3)
         self.assertIn("本日もご利用ありがとうございました。", plan.spoken)
+
+    def test_closing_never_includes_weather(self):
+        """利用者の「17 時には流さない」という要望は、確認したところ
+        時報（``build_hourly``）とは別経路の閉館放送（16:57、アナウンスが
+        「午後五時をお知らせするのだ」と言う）を指していた。閉館放送は
+        天気を含まない経路であり、この要望はすでに満たされている
+        （コードを変える必要はない）。この事実を固定する回帰テスト。
+        """
+        weather = StubWeather()
+        plan = self.make_builder(weather=weather).build_closing()
+        self.assertEqual(len(plan.segments), 2)
+        self.assertIn("閉館アナウンス", plan.segments[0].label)
+        self.assertIn("蛍の光", plan.segments[1].label)
+        self.assertEqual(weather.calls, 0, "閉館放送で WeatherService を呼んではいけない")
 
 
 class BuildTextTest(BuilderTestCase):
