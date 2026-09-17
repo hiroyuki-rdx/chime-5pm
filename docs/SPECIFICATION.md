@@ -26,6 +26,7 @@
 ├── chime/                     # アプリケーション本体（下記 4 章）
 ├── assets/
 │   ├── announce.wav           # 閉館アナウンス（VOICEVOX:ずんだもん / 24kHz mono）
+│   │                          #   「午後五時をお知らせするのだ。とっとと帰るのだ」
 │   ├── hotaru.mp3             # 蛍の光（Public Domain / 44.1kHz stereo）
 │   ├── quotes.json            # 「ひとこと」定義
 │   ├── voice/                 # 事前生成音声（任意）＋ manifest.json
@@ -115,9 +116,9 @@
 | `volume` | `0.6` | 振幅（0.0〜1.0） |
 | `envelope_ms` | `5` | クリックノイズ防止のフェード |
 | `output_file` | `assets/generated/time_signal.wav` | 生成先 |
-| `announce_template` | `"{period}{hour_reading}をお知らせしました。"` | 読み上げテンプレート。`{hour_reading}` は誤読対策込みの時刻表現、`{hour}` は後方互換の数値のみのプレースホルダ |
+| `announce_template` | `"{period}{hour_reading}をお知らせしたのだ。"` | 読み上げテンプレート。`{hour_reading}` は誤読対策込みの時刻表現、`{hour}` は後方互換の数値のみのプレースホルダ |
 | `use_noon_template` | `true` | 12 時に専用文言を使うか |
-| `noon_template` | `"正午をお知らせしました。"` | 12 時の文言 |
+| `noon_template` | `"正午をお知らせしたのだ。"` | 12 時の文言 |
 | `period_am` / `period_pm` | `"午前"` / `"午後"` | テンプレートの `{period}` |
 | `hour_readings` | `{"0":"れいじ","4":"よじ","7":"しちじ","9":"くじ"}` | Open JTalk が誤読する時刻（12 時間表記）だけをかな書きで上書きする。キーは文字列。それ以外の時刻は正しく読めるため上書きしない（詳細は 4.2 章） |
 
@@ -126,10 +127,12 @@
 | 項目 | 既定値 | 意味 |
 |---|---|---|
 | `enabled` | `true` | おまけ放送の有効／無効 |
-| `weather_probability` | `0.0` | 天気予報が選ばれる確率。既定は `0.0` で、天気予報が無効なため常にひとことになる |
-| `always_weather_hours` | `[]` | 必ず天気予報にする時。既定は空（天気予報が無効なため未使用） |
-| `always_quote_hours` | `[]` | 必ずひとことにする時 |
-| `fallback_to_quote` | `true` | 天気取得失敗時にひとことへ切り替えるか |
+| `mode` | `"both"` | `both` = 天気予報 → ひとこと の順に両方流す。`choice` = どちらか一方を選ぶ（従来方式） |
+| `weather_hours` | `[10, 12, 14, 16]` | `mode="both"` で天気予報を流す正時。ここに無い時刻は「ひとこと」だけになる。空リストなら一度も流さない。要素は文字列でも可（`int` に正規化し、変換できない要素は警告して無視）。**閉館放送は別経路のため、ここに何を書いても天気は付かない** |
+| `weather_probability` | `0.0` | 天気予報が選ばれる確率。**`mode="choice"` 専用** |
+| `always_weather_hours` | `[]` | 必ず天気予報にする時。**`mode="choice"` 専用** |
+| `always_quote_hours` | `[]` | 必ずひとことにする時。**`mode="choice"` 専用** |
+| `fallback_to_quote` | `true` | 天気取得失敗時にひとことへ切り替えるか。**`mode="choice"` 専用**（`mode="both"` ではひとことが必ず後続するため、失敗した天気は黙って飛ばす） |
 
 #### `quotes`
 
@@ -142,8 +145,8 @@
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
-| `enabled` | `false` | 天気予報の有効／無効。既定は無効で、時報のあとは常に「ひとこと」になる（任意機能。有効化の手順は `docs/SETUP.md` 7 章） |
-| `provider` | `"jma"` | `jma`（気象庁）または `open_meteo` |
+| `enabled` | `true` | 天気予報の有効／無効。無効にすると時報のあとは「ひとこと」だけになる |
+| `provider` | `"open_meteo"` | `open_meteo` または `jma`（気象庁）。**既定が `open_meteo` なのは、読み上げ文を事前生成できるようにするため**（下記の注記を参照） |
 | `timeout_seconds` | `8.0` | HTTP タイムアウト |
 | `cache_minutes` | `60` | 取得結果のキャッシュ時間 |
 | `jma.area_code` | `"250000"` | 気象庁の地域コード（府県予報区。既定は滋賀県） |
@@ -151,11 +154,28 @@
 | `jma.temp_area_name` | `"大津"` | 気温の timeSeries 内で優先する観測地点名（前方一致）。天気・降水確率の細分区域名とは体系が異なるため別に指定する。空文字列なら `area_name` を使う（後方互換） |
 | `jma.label` | `"滋賀"` | 読み上げに使う地名 |
 | `jma.drop_after` | `["所により"]` | 予報文中でこの文字列が最初に現れる位置以降を切り捨てる（地域限定の但し書き除去）。空リストなら切り捨てない |
-| `open_meteo.latitude` / `longitude` | `35.0045` / `135.8686` | 座標（大津市付近） |
-| `open_meteo.label` | `"滋賀"` | 読み上げに使う地名 |
-| `template` | `"{when}の{label}の天気は、{weather}。{details}"` | 読み上げテンプレート |
-| `details_separator` / `suffix` | `"、"` / `"です。"` | 詳細部の区切りと語尾 |
-| `max_weather_chars` | `40` | `{weather}` 部分の文字数上限。予期しない長文への保険で、超えたら読点の位置で切り詰める（文の途中では切らない） |
+| `open_meteo.locations` | 大津 / 京都 の 2 件 | 読み上げる地点の配列（`label` / `latitude` / `longitude`）。**上から順に読む**。1 件に減らせば放送が短くなる。`label` はそのまま読み上げられるので、読み間違えない表記にすること |
+| `sentence_weather` | `"今の{label}の天気は{weather}なのだ。"` | 天気の文。**現在の天気**を読む |
+| `sentence_temp` | `"気温は{temp}度なのだ。"` | 気温の文。**現在の気温**を読む |
+| `sentence_temp_max` | `""` | 今日の最高気温の文。既定は空＝読まない |
+| `sentence_pop` | `""` | 今日の降水確率の文。既定は空＝読まない |
+| `prerecord.temp_min` / `temp_max` | `-5` / `40` | 事前生成する気温の範囲（両端含む） |
+| `prerecord.pop_step` | `10` | 降水確率を丸める刻み（`sentence_pop` を有効にしたときに効く） |
+| `prerecord.whens` | `["今日"]` | 事前生成する `{when}` の一覧（予報の文を有効にしたときに効く） |
+| `max_weather_chars` | `40` | `{weather}` 部分の文字数上限。**`provider="jma"` のときだけ意味を持つ**（気象庁の自由文が予期せず長い場合の保険） |
+
+**読み上げを 1 文ずつに分けている理由。** 地名・気温をそれぞれ別の文にすると、各文の語彙が
+有限に収まり、全パターンを VOICEVOX で事前生成できる（`assets/voice/`）。1 文にまとめると
+値の組み合わせが爆発して事前生成できず、実行時に Open JTalk が合成することになり、
+**天気だけ別人の男性音声になる**。テンプレートを空文字列にするとその文を読まない。
+
+**`provider` の既定が `open_meteo` である理由。** 気象庁の予報文は自由文で語彙が閉じず、
+事前生成できない。Open-Meteo は天気コード（`WMO_CODES`・28 語）で語彙が閉じるため、
+全パターンを作り置きできる。`jma` に戻すこと自体は可能だが、(1) 天気だけ男性音声になる、
+(2) 気象庁に現況が無いため `sentence_temp` が出力されず天気 1 文だけになる、
+(3) `sentence_weather` の「今の」が実態（今日 1 日の予報）と食い違う、の 3 点を承知すること。
+`jma` を使うなら `sentence_weather` を予報の言い回しに戻し、`sentence_temp_max` /
+`sentence_pop` を有効にする（手順は `docs/SETUP.md`）。
 
 #### `tts`
 
@@ -277,7 +297,11 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 | 提供元 | エンドポイント |
 |---|---|
 | `jma` | `https://www.jma.go.jp/bosai/forecast/data/forecast/{area_code}.json` |
-| `open_meteo` | `https://api.open-meteo.com/v1/forecast?...&timezone=Asia/Tokyo&forecast_days=1` |
+| `open_meteo` | `https://api.open-meteo.com/v1/forecast?...&current=weather_code,temperature_2m&daily=...&timezone=Asia/Tokyo&forecast_days=1` |
+
+`open_meteo` は `weather.open_meteo.locations` の**地点ごとに個別に問い合わせる**。
+複数地点の一括クエリは応答形式が変わる（配列になる）ため使わない。地点数が少ないうちは
+素直に地点ごとに叩くほうが堅い。キャッシュも地点ごとに持つ。
 
 **気象庁 JSON の解釈**
 
@@ -286,15 +310,44 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 - 降水確率: `pops` を持つ系列から `area_name` で選んだ地域の、当日分の**最大値**を採る
 - いずれも欠落しうる前提で、取れた要素だけで文を組み立てる（当日昼発表の予報には当日の最低気温が無い、など）
 
+**Open-Meteo JSON の解釈**
+
+- 天気: **`current.weather_code`** を `WMO_CODES`（28 語）で引く。`daily.weather_code`（今日 1 日を
+  代表する予報）ではなく**現況**を使う。時報で知りたいのは今どうなのかであり、その日の
+  予想を午後に読んでも実感と合わないため
+- 気温: **`current.temperature_2m`** を四捨五入して整数化する（現況）
+- `daily` も同時に取得し、`temp_max` / `temp_min` / `pop` / `when` として保持する。
+  既定では読まないが、`sentence_temp_max` / `sentence_pop` を有効にすれば使われる
+- `current` が無い、または現況の天気コードを解釈できない場合は `WeatherError`。
+  その地点だけ飛ばされ、**他の地点は読み上げられる**
+
 **読み上げ文の組み立て**
 
+読み上げは**1 文ずつ独立した音声ファイル**として再生する。`build_sentences()` が 1 地点ぶんの
+文のリストを返し、`describe_sentences()` が全地点ぶんを地点の順に平坦なリストで返す。
+
 ```
-{when}の{label}の天気は、{weather}。最高気温は{max}度、最低気温は{min}度、降水確率は{pop}パーセントです。
+今の大津の天気は晴れなのだ。      ← sentence_weather
+気温は28度なのだ。                ← sentence_temp
+今の京都の天気はくもりなのだ。
+気温は29度なのだ。
 ```
 
-`when` は当日=「今日」、翌日=「明日」、それ以降は「M月D日」。詳細が 1 つも取れない場合は詳細部を丸ごと省略する。`{weather}` は組み立て直前に `max_weather_chars`（既定 40 文字）で長さを確認し、超えていれば読点の位置で切り詰める（予期しない長文への保険。文の途中では切らない）。
+値が `None` の文、テンプレートが空文字列の文は出力しない。`sentence_pop` を有効にした場合、
+降水確率は `prerecord.pop_step` の刻みに丸めて読み上げる（語彙を閉じるため）。丸めは文の
+組み立て時のみ行い、`parts["pop"]` は生値のまま保持する。
 
-取得結果は `cache_minutes` の間メモリ上に保持する（NFR-06）。あらゆる失敗は `WeatherError` に正規化し、呼び出し側が「ひとこと」へ切り替えられるようにする。
+`prerecord_phrases()` は、事前生成すべき文言（地点 × 天気コード、気温の全域、
+降水確率の全段階）を全列挙する。`build_sentences()` と同じ関数を通して文を組み立てるため、
+両者の文言がずれることはない。この網羅性は `tests/test_weather.py` の語彙網羅テストが
+機械的に検証している（**これが「天気だけ男性音声になる」ことを防ぐ唯一の担保**）。
+
+`{weather}` は `provider="jma"` のときのみ `max_weather_chars`（既定 40 文字）で長さを確認し、
+超えていれば読点の位置で切り詰める（予期しない長文への保険。文の途中では切らない）。
+
+取得結果は `cache_minutes` の間、**地点ごとに**メモリ上に保持する（NFR-06）。あらゆる失敗は
+`WeatherError` に正規化する。全地点が失敗したときだけ `describe_sentences()` が送出し、
+呼び出し側が天気を飛ばせるようにする。
 
 ### 4.6 `chime/quotes.py`（責務: ひとことの選択）
 
@@ -345,20 +398,41 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 | メソッド | 生成される `Segment` |
 |---|---|
-| `build_hourly(hour)` | ①時報音 ②時刻アナウンス ③おまけ（ひとこと／天気予報） |
+| `build_hourly(hour)` | ①時報音 ②時刻アナウンス ③おまけ（天気予報・ひとこと） |
 | `build_closing()` | ①閉館アナウンス ②（任意）追加読み上げ ③蛍の光（フェードイン） |
-| `build_text(text)` | 任意文言の読み上げのみ |
+| `build_text(text)` / `build_texts(texts)` | 任意文言の読み上げのみ。複数文は 1 文ずつ別セグメントにする |
 
-`choose_extra(hour, settings, rng)` の判定順序:
+**おまけの決まり方**
 
-1. `enabled` が `false` → なし
-2. `hour` が `always_weather_hours` に含まれる → 天気予報
-3. `hour` が `always_quote_hours` に含まれる → ひとこと
-4. `rng.random() < weather_probability` → 天気予報、そうでなければひとこと
+`extra_segment.enabled` が `false` ならおまけは出ない。以降は `extra_segment.mode` で分かれる。
+
+`mode = "both"`（既定）:
+
+1. `hour` が `weather_hours`（既定 `[10, 12, 14, 16]`）に含まれる → 天気予報を積む。
+   含まれなければ**天気 API を呼ばない**
+2. 続けて必ずひとことを積む（天気の成否に関わらず）
+
+`mode = "choice"`（従来方式）— `choose_extra(hour, settings, rng)` の判定順序:
+
+1. `hour` が `always_weather_hours` に含まれる → 天気予報
+2. `hour` が `always_quote_hours` に含まれる → ひとこと
+3. `rng.random() < weather_probability` → 天気予報、そうでなければひとこと
+
+未知の `mode` は警告を出して `"both"` として扱う（設定ミスで放送が壊れないように）。
+`weather_hours` の要素は `int` に正規化し、変換できない要素は警告して無視する。
+
+**閉館放送は `build_closing()` という別経路のため、`weather_hours` に何を書いても
+天気は付かない**（回帰テストで固定している）。
+
+**天気の読み上げは 1 文 = 1 セグメント**。`describe_sentences()` が返す各文を
+個別に積む。連結すると作り置き音声との照合が外れ、実行時合成（別人の声）に落ちるため。
 
 **失敗時の扱い（重要）**
 
-- 天気取得失敗 → 警告を記録し、`fallback_to_quote` ならひとことへ
+- 天気取得失敗
+  - `mode="both"` → 警告を記録して**天気を黙って飛ばす**。ひとことは後続で必ず流れるため
+    沈黙せず、ここでひとことへ切り替えるとひとことが 2 つ流れてしまう
+  - `mode="choice"` → 警告を記録し、`fallback_to_quote` ならひとことへ
 - 音声合成失敗 → 当該セグメントを落として続行（**時報音そのものは必ず鳴る**）
 
 ### 4.10 `chime/app.py`（責務: 全体の組み立てと常駐ループ）
@@ -427,7 +501,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
       ↓
 09:59:57 ポ ─ 09:59:58 ポ ─ 09:59:59 ポ ─ 10:00:00 ポーン
       ↓
-[「午前10時をお知らせしました。」]
+[「午前10時をお知らせしたのだ。」]
       ↓
 [ひとこと または 天気予報]
       ↓

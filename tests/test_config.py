@@ -95,19 +95,124 @@ class DefaultConfigMisreadFixesTest(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["weather"]["max_weather_chars"], 40)
 
 
-class DefaultExtraIsQuoteOnlyTest(unittest.TestCase):
-    """運用方針の変更: 時報のあとは既定で「ひとこと」のみとし、天気予報は
-    流さない。3 箇所すべてが揃っていないと別経路で天気予報が有効になりうる
-    ため、まとめて回帰確認する。"""
+class DefaultExtraIsWeatherThenQuoteTest(unittest.TestCase):
+    """運用方針: 時報のあとは毎回「天気予報 → ひとこと」の両方を流す。
 
-    def test_weather_is_disabled_by_default(self):
-        self.assertFalse(DEFAULT_CONFIG["weather"]["enabled"])
+    天気を流すには enabled と mode の両方が揃っている必要があり、片方だけでは
+    意図した放送にならないため、まとめて回帰確認する。
+    """
 
-    def test_weather_probability_is_zero_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_probability"], 0.0)
+    def test_weather_is_enabled_by_default(self):
+        self.assertTrue(DEFAULT_CONFIG["weather"]["enabled"])
 
-    def test_always_weather_hours_is_empty_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["always_weather_hours"], [])
+    def test_extra_mode_is_both_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["mode"], "both")
+
+
+class PrerecordableWeatherTest(unittest.TestCase):
+    """天気の読み上げを作り置きできる状態に保つための回帰確認。
+
+    気象庁（jma）の予報文は自由文なので語彙が閉じず、事前生成できない。
+    事前生成が外れた文は実行時に Open JTalk が合成するため、天気だけ
+    別人の男性音声になる。既定を open_meteo（天気コードで語彙が 28 語に
+    閉じる）に保つことが、放送全体をずんだもんの声で揃える前提になっている。
+    """
+
+    def test_provider_is_open_meteo_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["weather"]["provider"], "open_meteo")
+
+    def test_locations_are_otsu_and_kyoto(self):
+        labels = [str(item.get("label"))
+                  for item in DEFAULT_CONFIG["weather"]["open_meteo"]["locations"]]
+        self.assertEqual(labels, ["大津", "京都"])
+
+    def test_every_location_has_coordinates(self):
+        for item in DEFAULT_CONFIG["weather"]["open_meteo"]["locations"]:
+            self.assertIsInstance(item.get("latitude"), float, item)
+            self.assertIsInstance(item.get("longitude"), float, item)
+
+    def test_prerecord_range_is_defined(self):
+        prerecord = DEFAULT_CONFIG["weather"]["prerecord"]
+        self.assertLess(prerecord["temp_min"], prerecord["temp_max"])
+        self.assertGreater(prerecord["pop_step"], 0)
+        self.assertEqual(prerecord["whens"], ["今日"])
+
+
+class ZundamonToneTest(unittest.TestCase):
+    """読み上げの語尾をずんだもんの「のだ」調に揃えている回帰確認。
+
+    語尾を変えると作り置き音声の照合（文言の完全一致）が外れるため、
+    うっかり戻すと放送全体が Open JTalk の男性音声になる。
+    """
+
+    def _templates(self):
+        """読み上げに使うテンプレートのうち、空でない（＝実際に読む）もの。
+
+        空文字列は「その文を読まない」という意味で、語尾を問う対象にならない。
+        """
+        signal = DEFAULT_CONFIG["time_signal"]
+        weather = DEFAULT_CONFIG["weather"]
+        candidates = [
+            signal["announce_template"],
+            signal["noon_template"],
+            weather["sentence_weather"],
+            weather["sentence_temp"],
+            weather["sentence_temp_max"],
+            weather["sentence_pop"],
+        ]
+        return [template for template in candidates if template]
+
+    def test_every_template_ends_with_noda(self):
+        for template in self._templates():
+            self.assertTrue(template.endswith("のだ。"), template)
+
+    def test_no_template_keeps_the_old_desu_masu_ending(self):
+        for template in self._templates():
+            self.assertNotIn("しました。", template)
+            self.assertNotIn("です。", template)
+
+
+class WeatherIsCurrentConditionsTest(unittest.TestCase):
+    """天気は「今日 1 日の予報」ではなく「現在の天気と気温」を読む。
+
+    予報を読んでいた頃は、14 時に「最高気温は31度なのだ」と、その日の
+    予想最高気温を読み上げていた。時報で知りたいのは今どうなのかなので
+    現況に切り替えた。降水確率は現況が存在しないため読まない。
+    """
+
+    def test_weather_sentence_says_now_not_a_date(self):
+        template = DEFAULT_CONFIG["weather"]["sentence_weather"]
+        self.assertIn("今の", template)
+        self.assertNotIn("{when}", template)
+
+    def test_current_temperature_is_read(self):
+        self.assertIn("{temp}", DEFAULT_CONFIG["weather"]["sentence_temp"])
+
+    def test_forecast_sentences_are_disabled_by_default(self):
+        # キーごと消さずに空文字列で残してある。あとから読みたくなったら
+        # 文言を入れて作り置きを再生成すれば戻せる。
+        self.assertEqual(DEFAULT_CONFIG["weather"]["sentence_temp_max"], "")
+        self.assertEqual(DEFAULT_CONFIG["weather"]["sentence_pop"], "")
+
+
+class WeatherHoursTest(unittest.TestCase):
+    """天気予報は 2 時間おき（10/12/14/16 時）に流す。"""
+
+    def test_weather_hours_are_every_two_hours(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_hours"],
+                         [10, 12, 14, 16])
+
+    def test_weather_hours_are_within_the_hourly_schedule(self):
+        """時報が鳴らない時刻を指定しても天気は流れない。
+
+        weather_hours は時報のあとのおまけを決める設定なので、
+        schedule.hourly の範囲外を書いても効かない。設定ミスの検出。
+        """
+        hourly = DEFAULT_CONFIG["schedule"]["hourly"]
+        scheduled = set(range(hourly["start_hour"], hourly["end_hour"] + 1))
+        scheduled -= set(hourly["skip_hours"])
+        for hour in DEFAULT_CONFIG["extra_segment"]["weather_hours"]:
+            self.assertIn(hour, scheduled, hour)
 
 
 class LoadConfigTest(unittest.TestCase):

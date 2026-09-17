@@ -1,0 +1,19 @@
+{
+  "latitude": 35.0116,
+  "longitude": 135.7681,
+  "timezone": "Asia/Tokyo",
+  "daily_units": {"temperature_2m_max": "°C"},
+  "current": {
+    "time": "2026-08-26T14:00",
+    "interval": 900,
+    "temperature_2m": 29.6,
+    "weather_code": 61
+  },
+  "daily": {
+    "time": ["2026-08-26"],
+    "weather_code": [0],
+    "temperature_2m_max": [33.2],
+    "temperature_2m_min": [26.1],
+    "precipitation_probability_max": [70]
+  }
+}

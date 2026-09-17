@@ -69,4 +69,4 @@ jobs:
       - name: 合成結果が時刻アナウンスに反映されること
         run: |
           python campus_chime.py --test-hourly 12 --dry-run --backend mock \
-            | grep -F "正午をお知らせしました。"
+            | grep -F "正午をお知らせしたのだ。"

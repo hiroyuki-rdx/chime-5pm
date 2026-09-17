@@ -21,7 +21,7 @@
 ```
 09:59:57  ポ、ポ、ポ、        ← 440Hz 短音 × 3
 10:00:00              ポーン  ← 880Hz 長音（ここが正時）
-10:00:01  「午前10時をお知らせしました。」
+10:00:01  「午前10時をお知らせしたのだ。」
 10:00:04  「ひとこと」（天気予報は任意機能。既定では無効）
 ```
 
@@ -50,7 +50,7 @@ python3 campus_chime.py --test-hourly      # 時報（現在時刻）
 python3 campus_chime.py --test-hourly 12   # 12 時の時報
 python3 campus_chime.py --test             # 閉館放送
 python3 campus_chime.py --test-all         # 両方
-python3 campus_chime.py --weather          # 天気予報（既定では無効。有効化は SETUP.md 7 章「天気予報を有効にする」参照）
+python3 campus_chime.py --weather          # 天気予報の読み上げ文を確認（大津・京都の現況）
 python3 campus_chime.py --say "テストです"
 
 # 音を出さずに内容だけ見る
@@ -93,6 +93,17 @@ git pull
 bash scripts/setup.sh --no-apt
 sudo systemctl restart campus_chime.service
 ```
+
+反映後は、読み上げが**すべてずんだもんの声**であることを耳で確認する。
+
+```bash
+python3 campus_chime.py --test-hourly 10
+```
+
+**男性の声が混ざっていたら、その文言の作り置きが無い。** 読み上げ音声は文言との
+完全一致で引いているため、文言（語尾・ひとこと・天気の地点や読み上げ項目）を変えたのに
+PC 側で作り直していないと、変えた分だけ Open JTalk が合成する。`git pull` だけでは
+作り置きは増えない。作り直しの手順は `docs/SETUP.md` 9 章 B を参照。
 
 ### 3-4. 一時的に止める（休業日など）
 

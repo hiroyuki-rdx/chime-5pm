@@ -6,6 +6,11 @@ VOICEVOX ENGINE は Raspberry Pi 3B 上で常時動かすには重いため、
 使い方を想定している。生成物は ``assets/voice/`` に置かれ、実行時は
 ``prerecorded`` エンジンがこれを最優先で使う（合成処理は発生しない）。
 
+天気予報（``chime.weather.prerecord_phrases`` が列挙する語彙）は
+``--include-quotes`` の指定に関わらず常に事前生成対象になる。天気だけ
+作り置きが無いと、Pi 上で天気予報のときだけ Open JTalk の男性音声に
+なってしまうため。
+
 使い方（PC 側で VOICEVOX を起動した状態で）::
 
     python3 scripts/generate_voicevox.py
@@ -15,6 +20,13 @@ VOICEVOX ENGINE は Raspberry Pi 3B 上で常時動かすには重いため、
 Docker で VOICEVOX ENGINE を起動した直後はモデル読み込みのため
 ``/version`` がしばらく応答しないことがある。既定では起動を最大 90 秒
 待つ（``--wait 0`` で待たずに即座に判定する）。
+
+文言（定型文の言い回しなど）を変更すると、古い文言の manifest エントリと
+WAV が ``assets/voice/`` に残り続ける（マージ書き込みのため）。
+``--prune`` を付けると、現在の文言集合に含まれない古いエントリと WAV を
+削除する（既定は off。誤って消さないよう、明示的に指定した場合のみ動く）::
+
+    python3 scripts/generate_voicevox.py --include-quotes --prune
 
 生成後は ``assets/voice/`` を git add してコミットし、Pi 側で git pull する。
 """
@@ -29,7 +41,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from chime import timesignal  # noqa: E402
+from chime import timesignal, weather  # noqa: E402
 from chime.config import load_config  # noqa: E402
 from chime.quotes import load_quotes  # noqa: E402
 from chime.tts import TTSError, VoicevoxEngine, _digest  # noqa: E402
@@ -65,7 +77,15 @@ def wait_for_engine(engine: VoicevoxEngine, wait_seconds: float) -> bool:
 
 
 def collect_phrases(config, include_quotes: bool) -> list:
-    """事前生成する文言を集める。"""
+    """事前生成する文言を集める。
+
+    天気予報の文言（``chime.weather.prerecord_phrases``）は
+    ``include_quotes`` の指定に関わらず常に含める。天気だけ作り置きが
+    無いと、Pi 上で天気予報のときだけ Open JTalk の男性音声になって
+    しまうため。``weather.enabled`` が False の場合も同様に含める
+    （あとで有効化したときに作り置きが無くて困るより、常に列挙しておく
+    ほうが安全という判断）。
+    """
     settings = config.section("time_signal")
     hourly = config.section("schedule.hourly")
     phrases = [
@@ -84,12 +104,24 @@ def collect_phrases(config, include_quotes: bool) -> list:
         for values in quotes.get("by_hour", {}).values():
             phrases.extend(values)
 
+    phrases.extend(weather.prerecord_phrases(config.section("weather")))
+
     seen, unique = set(), []
     for phrase in phrases:
         if phrase and phrase not in seen:
             seen.add(phrase)
             unique.append(phrase)
     return unique
+
+
+def find_stale_entries(manifest: dict, keep_phrases) -> list:
+    """``manifest`` のうち、``keep_phrases`` に含まれないエントリを列挙する。
+
+    実際の削除は行わない（呼び出し側が ``--prune`` のときだけ削除に使う）。
+    削除前に「何が消えるか」を確認できるよう、判定と実行を分けている。
+    """
+    keep = set(keep_phrases)
+    return [(phrase, filename) for phrase, filename in manifest.items() if phrase not in keep]
 
 
 def main() -> int:
@@ -111,6 +143,10 @@ def main() -> int:
     parser.add_argument("--wait", type=float, default=90.0,
                         help="VOICEVOX ENGINE が応答するまで待つ秒数"
                              "（既定 90 秒。0 なら待たずに即座に判定する）")
+    parser.add_argument("--prune", action="store_true",
+                        help="現在の文言集合に含まれない古い manifest エントリと"
+                             "対応する WAV を削除する（既定 off。誤って消さないよう"
+                             "明示的に指定した場合のみ動く）")
     args = parser.parse_args()
 
     engine = VoicevoxEngine({
@@ -144,6 +180,21 @@ def main() -> int:
 
     phrases = collect_phrases(config, args.include_quotes)
     print("{0} 件の文言を生成します（話者 {1}）。".format(len(phrases), args.speaker))
+
+    stale = find_stale_entries(manifest, phrases)
+    if args.prune:
+        for phrase, filename in stale:
+            path = os.path.join(args.out, filename)
+            if os.path.exists(path):
+                os.remove(path)
+                print("  prune {0} -> {1}".format(phrase, filename))
+            else:
+                print("  prune {0} -> {1}（ファイルなし）".format(phrase, filename))
+            del manifest[phrase]
+        print("{0} 件の古いエントリを削除しました。".format(len(stale)))
+    elif stale:
+        print("{0} 件の古いエントリが残っています（--prune を付けると削除されます）。"
+              .format(len(stale)))
 
     failures = 0
     for phrase in phrases:
