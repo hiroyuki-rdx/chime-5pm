@@ -3,7 +3,33 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
-## [未リリース]
+## [4.0.0] - 2026-09-17
+
+読み上げをずんだもんの声と「なのだ」調に統一し、天気予報を「今日の予報」から
+「現在の天気と気温」に作り替えた版。
+
+### 移行方法（`config.json` を置いている場合のみ必要）
+
+`config.json` はリポジトリに含めていない（現地ごとに異なるため `.gitignore` 済み）。
+Pi や PC に置いていない場合、この節は読み飛ばしてよい。
+
+天気予報の設定に**後方非互換**がある。次のキーを書いている場合は書き換えること。
+**書き換えないと黙って無視され、既定値（大津・京都の 2 地点）が使われる。**
+
+| 旧 | 新 |
+|---|---|
+| `weather.open_meteo.latitude` / `longitude` / `label` | `weather.open_meteo.locations`（地点の配列） |
+| `weather.template` / `details_separator` / `suffix` | `weather.sentence_weather` / `sentence_temp` / `sentence_temp_max` / `sentence_pop`（文ごとに分割） |
+
+```json
+{ "weather": { "open_meteo": { "locations": [
+    { "label": "大津", "latitude": 35.0045, "longitude": 135.8686 }
+] } } }
+```
+
+**設定を変えたら、PC 側で音声を作り直すこと**（`docs/SETUP.md` 9 章 B）。
+読み上げ音声は文言との完全一致で引いているため、作り直さないと変更した文言だけ
+Open JTalk が合成し、そこだけ男性音声になる。
 
 ### 変更
 
@@ -135,4 +161,5 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[4.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v4.0.0
 [3.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v3.0.0

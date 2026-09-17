@@ -37,7 +37,8 @@
 |---|---|---|
 | v1.x | 2025/11 | 初版。天気ボット `weather.py` とデスクトップ環境が同居する Pi に相乗り。音飛び・パス不一致・`pkill` 依存などの問題があった |
 | v2.0.0 | 2026/08 | OS を Lite に入れ替えて**チャイム専用機化**する方針を策定（設計のみ） |
-| **v3.0.0** | **2026/08** | **時報機能・おまけ機能を追加**し、v2.0.0 の専用機化と同時に実装。詳細は [CHANGELOG.md](CHANGELOG.md) |
+| v3.0.0 | 2026/08 | **時報機能・おまけ機能を追加**し、v2.0.0 の専用機化と同時に実装 |
+| **v4.0.0** | **2026/09** | 読み上げを**ずんだもんの声と「なのだ」調に統一**（全文言を事前生成して同梱）。天気予報を**現在の天気と気温**にし、大津・京都の 2 地点を 2 時間おきに流す。詳細は [CHANGELOG.md](CHANGELOG.md) |
 
 v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです。
 
@@ -202,21 +203,7 @@ sudo systemctl restart campus_chime.service
 
 ## 9. 更新のしかた
 
-**ふだんの更新は 9-1 だけです。** ただし**読み上げる言葉を変えたときだけ**、その前に PC 側の作業（9-2）が要ります。
-
-| 変えたもの | やること |
-|---|---|
-| 時刻・曜日・音量・天気の時刻など | **9-1 だけ** |
-| **読み上げる言葉**（下記） | **9-2 → 9-1 の順** |
-
-「読み上げる言葉」に当たるのは次です。**天気の地名**も含まれる点に注意してください。
-
-- 時刻アナウンスの言い回し、ひとこと（`assets/quotes.json`）
-- 天気の文（`weather.sentence_*`）、**天気を読む地点**（`weather.open_meteo.locations`）
-
-読み上げ音声は言葉と 1 対 1 で作り置きしてあり、**1 文字でも変えると使われなくなります**。その言葉だけ機械音声（男性）で読まれるようになるため、言葉を変えたら作り直しが要ります。
-
-### 9-1. ふだんの更新（Pi だけ）
+Raspberry Pi にログインして、次の 4 つを順に実行します。
 
 ```bash
 cd /home/pi/campus-chime
@@ -234,7 +221,9 @@ bash scripts/setup.sh --no-apt
 sudo systemctl restart campus_chime.service
 ```
 
-確認します。
+`scripts/setup.sh --no-apt` は設定の追加分の反映と時報音の生成を行います。何度実行しても安全で、`config.json` は上書きしません。
+
+### 確認する
 
 ```bash
 sudo systemctl status campus_chime.service
@@ -256,66 +245,21 @@ sudo systemctl is-enabled campus_chime.service
 
 `enabled` と出れば自動起動します。
 
-### 9-2. 読み上げる言葉を変えたとき（先に PC で）
-
-**Pi ではなく、VOICEVOX を動かせる PC で行います。** Pi では VOICEVOX を動かせません。
-
-```bash
-docker start voicevox
-```
-
-```bash
-curl -s http://127.0.0.1:50021/version
-```
-
-バージョンが返ってから、音声を作り直します（数分かかります）。
-
-```bash
-python3 scripts/generate_voicevox.py --include-quotes --prune
-```
-
-聴いて確かめます（WSL2 では `--backend pygame` が必須）。
-
-```bash
-python3 campus_chime.py --test-hourly 10 --backend pygame
-```
-
-よければコミットして push します。
-
-```bash
-git add assets/voice/
-```
-
-```bash
-git commit -m "assets: 読み上げ音声を再生成"
-```
-
-```bash
-git push
-```
-
-**push が通ったか必ず確認してください。**
-
-```bash
-git status
-```
-
-`up to date` なら届いています。`ahead of ... by N commits` と出ていれば**まだ送れていません**。この状態で Pi 側を更新しても古い音声のままです。
-
-ここまで済んだら 9-1 に進みます。
-
-### 9-3. うまくいかないとき
+### うまくいかないとき
 
 | 症状 | 原因と対処 |
 |---|---|
-| **男性の声が混ざる** | その言葉の作り置きが無い。9-2 をやり直す（`--prune` を忘れずに） |
-| 11・13・15 時に天気が流れない | **仕様です。** 天気は 2 時間おき（10/12/14/16 時）。変えるなら `extra_segment.weather_hours` |
+| **男性の声が混ざる** | その言葉の音声が用意されていない。読み上げる言葉を変えた場合は、Pi ではなく PC 側での作業が要る（下記） |
+| 11・13・15 時に天気が流れない | **仕様です。** 天気は 2 時間おき（10/12/14/16 時） |
 | 天気だけ流れない | ネットワークを確認。取れないときは黙って飛ばす設計で、時報とひとことは鳴ります |
-| 音が鳴らない（WSL2） | `--backend pygame` を付ける |
-| 音が鳴らない（Pi） | [docs/SETUP.md](docs/SETUP.md) 10 章 |
+| 音が鳴らない | [docs/SETUP.md](docs/SETUP.md) 10 章 |
 | サービスが動いていない | `journalctl -u campus_chime.service -n 50` でログを見る |
 
-詳しい手順は [docs/SETUP.md](docs/SETUP.md) 9 章にあります。
+### 読み上げる言葉を変えたとき
+
+読み上げ音声はあらかじめ作って同梱してあり、**言葉と 1 文字単位で結びついています**。時報の言い回し・ひとこと・天気の文や**天気を読む地点**を変えた場合は、Pi に配る前に **PC 側で音声を作り直す**必要があります（Pi では作れません）。
+
+手順は **[docs/SETUP.md](docs/SETUP.md) 9 章 B** にあります。作り直したあと、このページの 4 つのコマンドに戻ってください。
 
 ## 10. テスト
 
