@@ -194,6 +194,7 @@ sudo systemctl restart campus_chime.service
 | 土曜も鳴らす | `schedule.*.weekdays` に `5` を追加（月=0〜日=6） |
 | 読み上げ文言を変える | `time_signal.announce_template` |
 | 天気予報の時刻・地域を変える | `extra_segment.weather_hours` / `weather.open_meteo.locations`。変更後は音声の作り置きを作り直すこと（[docs/SETUP.md](docs/SETUP.md) 7・8 章） |
+| 更新を取り込む | [docs/SETUP.md](docs/SETUP.md) 9 章。**読み上げる文言を変えた場合は、Pi に配る前に PC 側で音声を作り直す**必要がある |
 | 天気の地域を変える（有効化後） | `weather.jma.area_code` / `area_name` / `temp_area_name` / `label`（既定は滋賀・南部） |
 | おまけを止める | `extra_segment.enabled` を `false` |
 

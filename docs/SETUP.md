@@ -506,12 +506,156 @@ python3 campus_chime.py --test-hourly
 
 ## 9. 更新のしかた
 
+**更新の前に、読み上げる文言を変えたかどうかを確認してください。** ここで経路が分かれます。
+
+| 変えたもの | 必要な作業 |
+|---|---|
+| コード・設定値（時刻、曜日、音量など） | **A だけ**（Pi で pull して再起動） |
+| **読み上げる文言** | **B → A の順**（PC で音声を作り直してから Pi へ） |
+
+「読み上げる文言を変えた」には次が含まれます。うっかり踏みやすいのは**天気の地点**です。
+
+- 時刻アナウンスの言い回し（`time_signal.announce_template` / `noon_template`）
+- ひとこと（`assets/quotes.json`）
+- 天気の文（`weather.sentence_*`）や**読み上げる地点**（`weather.open_meteo.locations`）
+- 事前生成の範囲（`weather.prerecord`）
+
+**なぜ分かれるのか。** 読み上げ音声は文言と 1 対 1 で作り置きしてあり、実行時は
+**文字列の完全一致**で引いています。1 文字でも変えると照合が外れ、その文言だけ
+実行時に Open JTalk が合成します。結果、**そこだけ別人の男性音声**になります。
+`git pull` だけでは作り置きは増えないため、Pi に配る前に作り直す必要があります。
+
+---
+
+### A. Pi 側で反映する
+
 ```bash
 cd /home/pi/campus-chime
+```
+
+```bash
 git pull
-bash scripts/setup.sh --no-apt      # 設定の追加分と音源を反映
+```
+
+```bash
+bash scripts/setup.sh --no-apt
+```
+
+```bash
 sudo systemctl restart campus_chime.service
 ```
+
+`scripts/setup.sh --no-apt` は、設定の追加分の反映と時報音の生成を行います（apt は実行しません）。
+何度実行しても安全で、`config.json` は上書きしません。
+
+反映されたか確認します。
+
+```bash
+sudo systemctl status campus_chime.service
+```
+
+```bash
+python3 campus_chime.py --test-hourly 10
+```
+
+- [ ] `Active: active (running)` になっている
+- [ ] **読み上げがすべてずんだもんの声**である（男性の声が混ざったら B が済んでいません）
+- [ ] 天気が流れる時刻（既定 10/12/14/16 時）で天気が読み上げられる
+
+```bash
+python3 campus_chime.py --schedule
+```
+
+- [ ] 翌営業日の予定が並ぶ
+
+自動起動の確認もしておくと安心です（電源を入れ直せば勝手に動く状態かどうか）。
+
+```bash
+sudo systemctl is-enabled campus_chime.service
+```
+
+`enabled` と出れば、電源投入時に自動起動します。実際に再起動して確かめる場合は次のとおりです。
+
+```bash
+sudo reboot
+```
+
+再接続して、
+
+```bash
+sudo systemctl status campus_chime.service
+```
+
+---
+
+### B. 文言を変えたとき（PC 側で音声を作り直す）
+
+**Pi ではなく、VOICEVOX を動かせる PC 側で行います。** Pi 3B では VOICEVOX を動かせません。
+
+```bash
+docker start voicevox
+```
+
+コンテナを作っていない場合は 8 章を参照してください。
+
+```bash
+curl -s http://127.0.0.1:50021/version
+```
+
+バージョンが返ってから、
+
+```bash
+python3 scripts/generate_voicevox.py --include-quotes --prune
+```
+
+`--prune` は、**使われなくなった古い音声と manifest のエントリを削除**します。manifest は
+マージ方式で書き戻すため、これを付けないと古いファイルが残り続けます。付けない場合も
+残存件数は表示されるので、消す前に確認できます。
+
+生成できたか確認します。
+
+```bash
+ls assets/voice/*.wav | wc -l
+```
+
+```bash
+python3 campus_chime.py --test-hourly 10 --backend pygame
+```
+
+WSL2 では `--backend pygame` が必須です（付けないとログだけ流れて音が鳴りません。10-6 参照）。
+**読み上げがすべてずんだもんの声**であることを耳で確認してください。
+
+問題なければコミットして push します。
+
+```bash
+git add assets/voice/
+```
+
+```bash
+git status --short
+```
+
+追加・削除された音声ファイルが並ぶことを確認してから、
+
+```bash
+git commit -m "assets: 読み上げ音声を再生成"
+```
+
+```bash
+git push
+```
+
+**push が通ったことを必ず確認してください。** コミットしただけ、あるいは認証で止まった
+ままだと、Pi 側で `git pull` しても古い音声のままになります。
+
+```bash
+git status
+```
+
+`Your branch is up to date with 'origin/...'` と出れば届いています。`ahead of ... by N commits`
+と出ていれば push できていません。
+
+ここまで済んだら **A** に進みます。
 
 ---
 

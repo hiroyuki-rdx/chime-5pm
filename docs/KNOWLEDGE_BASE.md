@@ -94,6 +94,17 @@ bash scripts/setup.sh --no-apt
 sudo systemctl restart campus_chime.service
 ```
 
+反映後は、読み上げが**すべてずんだもんの声**であることを耳で確認する。
+
+```bash
+python3 campus_chime.py --test-hourly 10
+```
+
+**男性の声が混ざっていたら、その文言の作り置きが無い。** 読み上げ音声は文言との
+完全一致で引いているため、文言（語尾・ひとこと・天気の地点や読み上げ項目）を変えたのに
+PC 側で作り直していないと、変えた分だけ Open JTalk が合成する。`git pull` だけでは
+作り置きは増えない。作り直しの手順は `docs/SETUP.md` 9 章 B を参照。
+
 ### 3-4. 一時的に止める（休業日など）
 
 ```bash

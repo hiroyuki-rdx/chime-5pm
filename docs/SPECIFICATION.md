@@ -398,20 +398,41 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 | メソッド | 生成される `Segment` |
 |---|---|
-| `build_hourly(hour)` | ①時報音 ②時刻アナウンス ③おまけ（ひとこと／天気予報） |
+| `build_hourly(hour)` | ①時報音 ②時刻アナウンス ③おまけ（天気予報・ひとこと） |
 | `build_closing()` | ①閉館アナウンス ②（任意）追加読み上げ ③蛍の光（フェードイン） |
-| `build_text(text)` | 任意文言の読み上げのみ |
+| `build_text(text)` / `build_texts(texts)` | 任意文言の読み上げのみ。複数文は 1 文ずつ別セグメントにする |
 
-`choose_extra(hour, settings, rng)` の判定順序:
+**おまけの決まり方**
 
-1. `enabled` が `false` → なし
-2. `hour` が `always_weather_hours` に含まれる → 天気予報
-3. `hour` が `always_quote_hours` に含まれる → ひとこと
-4. `rng.random() < weather_probability` → 天気予報、そうでなければひとこと
+`extra_segment.enabled` が `false` ならおまけは出ない。以降は `extra_segment.mode` で分かれる。
+
+`mode = "both"`（既定）:
+
+1. `hour` が `weather_hours`（既定 `[10, 12, 14, 16]`）に含まれる → 天気予報を積む。
+   含まれなければ**天気 API を呼ばない**
+2. 続けて必ずひとことを積む（天気の成否に関わらず）
+
+`mode = "choice"`（従来方式）— `choose_extra(hour, settings, rng)` の判定順序:
+
+1. `hour` が `always_weather_hours` に含まれる → 天気予報
+2. `hour` が `always_quote_hours` に含まれる → ひとこと
+3. `rng.random() < weather_probability` → 天気予報、そうでなければひとこと
+
+未知の `mode` は警告を出して `"both"` として扱う（設定ミスで放送が壊れないように）。
+`weather_hours` の要素は `int` に正規化し、変換できない要素は警告して無視する。
+
+**閉館放送は `build_closing()` という別経路のため、`weather_hours` に何を書いても
+天気は付かない**（回帰テストで固定している）。
+
+**天気の読み上げは 1 文 = 1 セグメント**。`describe_sentences()` が返す各文を
+個別に積む。連結すると作り置き音声との照合が外れ、実行時合成（別人の声）に落ちるため。
 
 **失敗時の扱い（重要）**
 
-- 天気取得失敗 → 警告を記録し、`fallback_to_quote` ならひとことへ
+- 天気取得失敗
+  - `mode="both"` → 警告を記録して**天気を黙って飛ばす**。ひとことは後続で必ず流れるため
+    沈黙せず、ここでひとことへ切り替えるとひとことが 2 つ流れてしまう
+  - `mode="choice"` → 警告を記録し、`fallback_to_quote` ならひとことへ
 - 音声合成失敗 → 当該セグメントを落として続行（**時報音そのものは必ず鳴る**）
 
 ### 4.10 `chime/app.py`（責務: 全体の組み立てと常駐ループ）
