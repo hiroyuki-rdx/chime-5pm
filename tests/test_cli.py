@@ -90,11 +90,12 @@ class RunTest(unittest.TestCase):
 
         この検証は音声合成（TTS）の成否とは無関係にしたい。しかし
         時刻アナウンスの文言は再生セグメントのラベルとしてしか出力されず、
-        そのラベルは合成が成功した場合にのみ付く。実行環境に ``open_jtalk``
-        が無い（CI ランナー等）と合成が全滅し、警告ログだけが出て文言が
-        出力に現れないため、``TTSService.synthesize`` をスタブ化して
-        常に合成成功したことにする（``--dry-run`` のため実際のファイル
-        内容や存在は問われない）。
+        そのラベルは合成が成功した場合にのみ付く。この文言はたまたま
+        作り置き（``assets/voice/``）にあるため実際には合成が成功するが、
+        それは実行環境の事情（作り置きの内容や VOICEVOX ENGINE の有無）に
+        依存しており、この検証の意図ではない。``TTSService.synthesize`` を
+        スタブ化して常に合成成功したことにする（``--dry-run`` のため
+        実際のファイル内容や存在は問われない）。
         """
         wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
         with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):

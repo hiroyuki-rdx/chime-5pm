@@ -142,8 +142,9 @@ class PrerecordableWeatherTest(unittest.TestCase):
 class ZundamonToneTest(unittest.TestCase):
     """読み上げの語尾をずんだもんの「のだ」調に揃えている回帰確認。
 
-    語尾を変えると作り置き音声の照合（文言の完全一致）が外れるため、
-    うっかり戻すと放送全体が Open JTalk の男性音声になる。
+    語尾を変えると作り置き音声の照合（文言の完全一致）が外れる。v5.0.0 で
+    実行時合成のフォールバックを廃したため、うっかり戻すと読み上げが
+    すべて無音になる。
     """
 
     def _templates(self):
@@ -327,6 +328,26 @@ class LoadConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ConfigError):
                 load_config(os.path.join(tmp, "nope.json"), base_dir=tmp)
+
+
+class NoRuntimeSynthesisFallbackTest(unittest.TestCase):
+    """合成フォールバック（Open JTalk）を既定から締め出していることの回帰確認。
+
+    作り置きに無い文言を「別人の男性音声」で鳴らしてしまう事故が繰り返された
+    ため、v5.0.0 でエンジンごと削除した。既定に戻すと、壊れているのに音だけは
+    鳴る状態が復活する。
+    """
+
+    def test_default_engines_are_prerecorded_then_voicevox(self):
+        self.assertEqual(DEFAULT_CONFIG["tts"]["engines"],
+                         ["prerecorded", "voicevox"])
+
+    def test_defaults_carry_no_open_jtalk_settings(self):
+        self.assertNotIn("open_jtalk", DEFAULT_CONFIG["tts"])
+
+    def test_no_default_mentions_open_jtalk_anywhere(self):
+        self.assertNotIn("open_jtalk", json.dumps(DEFAULT_CONFIG,
+                                                  ensure_ascii=False))
 
 
 class ExampleConfigTest(unittest.TestCase):

@@ -8,29 +8,25 @@
 ``voicevox``
     VOICEVOX ENGINE の HTTP API を叩く。Pi 上では重いため、LAN 上の PC を
     指す想定（``base_url`` で指定）。
-``open_jtalk``
-    Raspberry Pi 上でオフライン合成する最終フォールバック。
 
 合成結果は ``cache/tts/`` にキャッシュするため、同じ文言は 2 回目以降
 合成されない（時報の定型文はネットワーク・CPU をほとんど使わなくなる）。
+
+作り置きにも VOICEVOX にも無い文言は、合成できずそのセグメントが
+無音になる（他人の声にフォールバックすることはない）。
 """
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import json
 import logging
 import os
-import subprocess
-import tempfile
 import threading
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Mapping, Optional
-
-from . import env
 
 logger = logging.getLogger(__name__)
 
@@ -117,95 +113,6 @@ class PrerecordedEngine(TTSEngine):
         raise TTSError("事前生成済み音声にこの文言はありません。")
 
 
-class OpenJTalkEngine(TTSEngine):
-    """Open JTalk によるオフライン合成。"""
-
-    name = "open_jtalk"
-
-    DICT_CANDIDATES = (
-        "/var/lib/mecab/dic/open-jtalk/naist-jdic",
-        "/usr/share/open_jtalk/open_jtalk_dic_utf_8-*",
-        "/usr/local/dic",
-    )
-    VOICE_CANDIDATES = (
-        "/usr/share/hts-voice/*/*.htsvoice",
-        "/usr/share/hts-voice/**/*.htsvoice",
-        "/usr/local/share/hts-voice/**/*.htsvoice",
-    )
-
-    def __init__(self, settings: Mapping[str, Any], base_dir: str) -> None:
-        super().__init__(settings, base_dir)
-        self.binary = str(self.settings.get("binary", "open_jtalk"))
-        self._dictionary: Optional[str] = None
-        self._voice: Optional[str] = None
-
-    @staticmethod
-    def _first_match(configured: str, patterns) -> Optional[str]:
-        if configured and os.path.exists(configured):
-            return configured
-        for pattern in patterns:
-            matches = sorted(glob.glob(pattern, recursive=True))
-            if matches:
-                return matches[0]
-        return None
-
-    def dictionary(self) -> Optional[str]:
-        if self._dictionary is None:
-            self._dictionary = self._first_match(
-                str(self.settings.get("dictionary", "")), self.DICT_CANDIDATES)
-        return self._dictionary
-
-    def voice(self) -> Optional[str]:
-        if self._voice is None:
-            self._voice = self._first_match(
-                str(self.settings.get("voice", "")), self.VOICE_CANDIDATES)
-        return self._voice
-
-    def voice_id(self) -> str:
-        return "|".join([
-            self.name,
-            os.path.basename(self.voice() or "none"),
-            str(self.settings.get("speed", 1.0)),
-            str(self.settings.get("additional_half_tone", 0.0)),
-            str(self.settings.get("sampling_frequency", 48000)),
-        ])
-
-    def available(self) -> bool:
-        if not env.has_command(self.binary):
-            return False
-        return bool(self.dictionary() and self.voice())
-
-    def synthesize(self, text: str, out_path: str) -> None:
-        dictionary, voice = self.dictionary(), self.voice()
-        if not dictionary or not voice:
-            raise TTSError("Open JTalk の辞書または音響モデルが見つかりません。")
-
-        command = [
-            self.binary,
-            "-x", dictionary,
-            "-m", voice,
-            "-r", str(self.settings.get("speed", 1.0)),
-            "-fm", str(self.settings.get("additional_half_tone", 0.0)),
-            "-g", str(self.settings.get("volume_gain_db", 0.0)),
-            "-s", str(int(self.settings.get("sampling_frequency", 48000))),
-            "-ow", out_path,
-        ]
-
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".txt",
-                                         delete=False) as handle:
-            handle.write(text)
-            input_path = handle.name
-        try:
-            result = subprocess.run(command + [input_path], check=False,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        finally:
-            os.unlink(input_path)
-
-        if result.returncode != 0 or not os.path.exists(out_path):
-            detail = result.stderr.decode("utf-8", "replace").strip()
-            raise TTSError("open_jtalk が失敗しました: " + (detail or str(result.returncode)))
-
-
 class VoicevoxEngine(TTSEngine):
     """VOICEVOX ENGINE（HTTP API）による合成。"""
 
@@ -280,8 +187,6 @@ class TTSService:
             name = str(name)
             if name == "prerecorded":
                 engines.append(PrerecordedEngine({}, self.base_dir, self.prerecorded_dir))
-            elif name == "open_jtalk":
-                engines.append(OpenJTalkEngine(self.settings.get("open_jtalk", {}), self.base_dir))
             elif name == "voicevox":
                 engines.append(VoicevoxEngine(self.settings.get("voicevox", {}), self.base_dir))
             else:

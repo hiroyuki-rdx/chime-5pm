@@ -8,8 +8,8 @@ VOICEVOX ENGINE は Raspberry Pi 3B 上で常時動かすには重いため、
 
 天気予報（``chime.weather.prerecord_phrases`` が列挙する語彙）は
 ``--include-quotes`` の指定に関わらず常に事前生成対象になる。天気だけ
-作り置きが無いと、Pi 上で天気予報のときだけ Open JTalk の男性音声に
-なってしまうため。
+作り置きが無いと、Pi 上で天気の文だけ無音になってしまうため
+（v5.0.0 で実行時合成のフォールバックを廃した）。
 
 使い方（PC 側で VOICEVOX を起動した状態で）::
 
@@ -81,8 +81,8 @@ def collect_phrases(config, include_quotes: bool) -> list:
 
     天気予報の文言（``chime.weather.prerecord_phrases``）は
     ``include_quotes`` の指定に関わらず常に含める。天気だけ作り置きが
-    無いと、Pi 上で天気予報のときだけ Open JTalk の男性音声になって
-    しまうため。``weather.enabled`` が False の場合も同様に含める
+    無いと、Pi 上で天気の文だけ無音になってしまうため。
+    ``weather.enabled`` が False の場合も同様に含める
     （あとで有効化したときに作り置きが無くて困るより、常に列挙しておく
     ほうが安全という判断）。
     """

@@ -3,6 +3,6 @@
 # pip で入れる場合のみ、このファイルを使ってください。
 #   pip3 install -r requirements.txt --break-system-packages
 #
-# pygame 以外の依存はありません（天気予報・音声合成・時報音生成はすべて
-# 標準ライブラリと apt パッケージ（open-jtalk）だけで動きます）。
+# pygame 以外の依存はありません（天気予報・時報音生成は標準ライブラリだけで
+# 動き、読み上げは事前生成済みの WAV を再生するだけです）。
 pygame>=2.5.0

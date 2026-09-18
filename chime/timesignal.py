@@ -126,7 +126,7 @@ def hour_parts(hour: int, settings: Mapping[str, Any]) -> Dict[str, Any]:
     else:
         period, hour12 = settings.get("period_pm", "午後"), hour - 12
 
-    # Open JTalk（MeCab）は「4時」を「よんじ」、「7時」を「ななじ」、
+    # 読み上げエンジンは「4時」を「よんじ」、「7時」を「ななじ」、
     # 「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読する
     # （正しくは よじ／しちじ／くじ／れいじ）。「午後よ時」のように数字部分
     # だけをかな化すると今度は「時」が「とき」と読まれてしまうため、

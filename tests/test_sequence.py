@@ -265,7 +265,7 @@ class BuildHourlyTest(BuilderTestCase):
     def test_weather_sentences_are_appended_as_separate_segments(self):
         # 天気の各文が 1 つの文字列に連結されず、文ごとに独立したセグメント
         # として積まれること（作り置き音声は文単位のため、連結すると
-        # 照合が外れて Open JTalk にフォールバックしてしまう）。
+        # 照合が外れてその文が無音になってしまう）。
         # 10 時は既定の weather_hours に含まれる時刻。
         plan = self.make_builder().build_hourly(10)
 
