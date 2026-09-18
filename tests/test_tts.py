@@ -35,7 +35,7 @@ class FakeEngine(TTSEngine):
 
 
 class PartiallyWritingEngine(TTSEngine):
-    """open_jtalk のように、失敗時でも出力ファイルを書きかけで残すエンジン。"""
+    """失敗時でも出力ファイルを書きかけで残すエンジン。"""
 
     name = "partial"
 
@@ -117,7 +117,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual([name for name in os.listdir(self.cache) if name.endswith(".tmp")], [])
 
     def test_temporary_file_is_removed_when_engine_fails_after_writing(self):
-        # open_jtalk 等が失敗時に書きかけの出力ファイルを残すケースを再現する。
+        # 合成が途中で失敗し、書きかけの出力ファイルが残るケースを再現する。
         service = make_service(
             [PartiallyWritingEngine({}, "/tmp"), FakeEngine("fallback")], self.cache)
         path = service.synthesize("文言")

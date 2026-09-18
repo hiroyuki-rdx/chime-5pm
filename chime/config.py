@@ -394,9 +394,9 @@ def _warn_if_defaults_were_copied(path: str, override: Mapping[str, Any]) -> Non
     logger.warning(
         "%s は既定値と同じ値を %d 項目書いています。既定値の丸ごとコピーの"
         "可能性があります。この状態だと、更新しても新しい既定値が届きません"
-        "（読み上げ文言が古いままだと、作り置き音声に当たらず男性音声に"
-        "なります）。変えたい項目だけを残してください。詳しくは "
-        "docs/SETUP.md の「読み上げが男性音声になる」を参照。",
+        "（読み上げ文言が古いままだと、作り置き音声に当たらず読み上げが"
+        "無音になります）。変えたい項目だけを残してください。詳しくは "
+        "docs/SETUP.md の「読み上げが無音になる」を参照。",
         path, len(redundant))
     logger.warning("  既定値と同じ項目の例: %s", "、".join(redundant[:5]))
 

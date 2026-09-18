@@ -81,7 +81,7 @@ class DefaultConfigMisreadFixesTest(unittest.TestCase):
     """時報・天気予報の誤読対策に関わる既定値の回帰防止。"""
 
     def test_hour_readings_default_covers_the_four_misread_hours(self):
-        # Open JTalk が誤読する 4 つの時刻（詳細は chime/timesignal.py）。
+        # 読み上げエンジンが誤読する 4 つの時刻（詳細は chime/timesignal.py）。
         self.assertEqual(
             DEFAULT_CONFIG["time_signal"]["hour_readings"],
             {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"})
@@ -114,9 +114,9 @@ class PrerecordableWeatherTest(unittest.TestCase):
     """天気の読み上げを作り置きできる状態に保つための回帰確認。
 
     気象庁（jma）の予報文は自由文なので語彙が閉じず、事前生成できない。
-    事前生成が外れた文は実行時に Open JTalk が合成するため、天気だけ
-    別人の男性音声になる。既定を open_meteo（天気コードで語彙が 28 語に
-    閉じる）に保つことが、放送全体をずんだもんの声で揃える前提になっている。
+    v5.0.0 で実行時合成を廃したため、事前生成が外れた文は無音になる。
+    既定を open_meteo（天気コードで語彙が 28 語に閉じる）に保つことが、
+    放送全体をずんだもんの声で揃える前提になっている。
     """
 
     def test_provider_is_open_meteo_by_default(self):
@@ -225,7 +225,8 @@ class RedundantKeysTest(unittest.TestCase):
     config.json として複製していたこと。そうして作られた設定はその時点の
     既定値を凍結するため、更新しても新しい既定値が届かない。読み上げ文言が
     古いまま上書きされ、事前生成した音声（文言との完全一致で引く）に当たらず、
-    Open JTalk が合成していた。
+    当時あった Open JTalk のフォールバックが合成していた（v5.0.0 でその
+    フォールバックは削除したため、いま同じことが起きれば無音になる）。
     """
 
     def test_an_override_that_differs_is_not_redundant(self):
