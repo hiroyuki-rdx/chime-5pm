@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import unittest
 from unittest import mock
 
-from chime.tts import (OpenJTalkEngine, PrerecordedEngine, TTSEngine, TTSError,
+from chime.tts import (PrerecordedEngine, TTSEngine, TTSError,
                        TTSService, VoicevoxEngine, _digest)
 
 
@@ -34,7 +35,7 @@ class FakeEngine(TTSEngine):
 
 
 class PartiallyWritingEngine(TTSEngine):
-    """open_jtalk のように、失敗時でも出力ファイルを書きかけで残すエンジン。"""
+    """失敗時でも出力ファイルを書きかけで残すエンジン。"""
 
     name = "partial"
 
@@ -116,7 +117,7 @@ class ServiceTest(unittest.TestCase):
         self.assertEqual([name for name in os.listdir(self.cache) if name.endswith(".tmp")], [])
 
     def test_temporary_file_is_removed_when_engine_fails_after_writing(self):
-        # open_jtalk 等が失敗時に書きかけの出力ファイルを残すケースを再現する。
+        # 合成が途中で失敗し、書きかけの出力ファイルが残るケースを再現する。
         service = make_service(
             [PartiallyWritingEngine({}, "/tmp"), FakeEngine("fallback")], self.cache)
         path = service.synthesize("文言")
@@ -131,10 +132,38 @@ class ServiceTest(unittest.TestCase):
         self.assertIn("b(利用不可)", described)
 
     def test_engines_are_built_from_settings(self):
-        service = TTSService({"engines": ["prerecorded", "voicevox", "open_jtalk", "???"]},
+        service = TTSService({"engines": ["prerecorded", "voicevox", "???"]},
                              "/tmp", self.cache, self.cache)
         self.assertEqual([engine.name for engine in service.engines],
-                         ["prerecorded", "voicevox", "open_jtalk"])
+                         ["prerecorded", "voicevox"])
+
+    def test_open_jtalk_engine_name_is_ignored_with_a_warning(self):
+        # Open JTalk はコードごと削除済み（v5.0.0）。古い config.json が
+        # "open_jtalk" を残していても、既存の「未知のエンジンは警告して
+        # 無視する」経路に乗って安全に無視され、男性音声が復活しないこと。
+        # tests/__init__.py がテスト全体でログを抑制している（logging.disable
+        # (logging.CRITICAL)）ため、assertLogs で拾えるよう tests/test_sequence.py
+        # と同じ手順でこのテストの間だけ一時的に解除する。
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs("chime.tts", level="WARNING") as cm:
+                service = TTSService(
+                    {"engines": ["prerecorded", "voicevox", "open_jtalk"]},
+                    "/tmp", self.cache, self.cache)
+        finally:
+            logging.disable(logging.CRITICAL)
+        self.assertEqual([engine.name for engine in service.engines],
+                         ["prerecorded", "voicevox"])
+        self.assertTrue(any("open_jtalk" in message for message in cm.output))
+
+    def test_synthesize_raises_when_no_fallback_exists(self):
+        # Open JTalk 削除により、作り置きにも VOICEVOX にも無い文言は
+        # 合成できず、他人の声に化けることなく TTSError になること
+        # （放送そのものは chime.sequence 側でこの文言だけ落として続く）。
+        service = TTSService({"engines": ["prerecorded", "voicevox"]},
+                             "/tmp", self.cache, os.path.join(self.cache, "voice"))
+        with self.assertRaises(TTSError):
+            service.synthesize("これはどこにも作り置きの無い文言です")
 
 
 class PrerecordedEngineTest(unittest.TestCase):
@@ -183,15 +212,6 @@ class PrerecordedEngineTest(unittest.TestCase):
 
 
 class EngineConfigurationTest(unittest.TestCase):
-    def test_open_jtalk_is_unavailable_without_binary(self):
-        engine = OpenJTalkEngine({"binary": "definitely-not-installed"}, "/tmp")
-        self.assertFalse(engine.available())
-
-    def test_open_jtalk_voice_id_reflects_settings(self):
-        slow = OpenJTalkEngine({"speed": 0.8}, "/tmp").voice_id()
-        fast = OpenJTalkEngine({"speed": 1.2}, "/tmp").voice_id()
-        self.assertNotEqual(slow, fast)
-
     def test_voicevox_is_unavailable_without_url(self):
         self.assertFalse(VoicevoxEngine({"base_url": ""}, "/tmp").available())
 

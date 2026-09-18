@@ -1,8 +1,8 @@
 # キャンパス時報システム 仕様書
 
 **プロジェクト名:** Campus Chime System
-**バージョン:** 3.0.0
-**対応要件定義:** `docs/REQUIREMENTS.md` v3.0.0
+**バージョン:** 5.0.0
+**対応要件定義:** `docs/REQUIREMENTS.md` v5.0.0
 **作成日:** 2026/08/26
 
 ---
@@ -29,7 +29,7 @@
 │   │                          #   「午後五時をお知らせするのだ。とっとと帰るのだ」
 │   ├── hotaru.mp3             # 蛍の光（Public Domain / 44.1kHz stereo）
 │   ├── quotes.json            # 「ひとこと」定義
-│   ├── voice/                 # 事前生成音声（任意）＋ manifest.json
+│   ├── voice/                 # 事前生成音声＋ manifest.json
 │   └── generated/             # 実行時に生成される時報音（Git 管理外）
 ├── cache/                     # 状態・TTS キャッシュ（Git 管理外）
 │   ├── state.json
@@ -120,7 +120,7 @@
 | `use_noon_template` | `true` | 12 時に専用文言を使うか |
 | `noon_template` | `"正午をお知らせしたのだ。"` | 12 時の文言 |
 | `period_am` / `period_pm` | `"午前"` / `"午後"` | テンプレートの `{period}` |
-| `hour_readings` | `{"0":"れいじ","4":"よじ","7":"しちじ","9":"くじ"}` | Open JTalk が誤読する時刻（12 時間表記）だけをかな書きで上書きする。キーは文字列。それ以外の時刻は正しく読めるため上書きしない（詳細は 4.2 章） |
+| `hour_readings` | `{"0":"れいじ","4":"よじ","7":"しちじ","9":"くじ"}` | 読み上げエンジンが誤読する時刻（12 時間表記）だけをかな書きで上書きする。キーは文字列。それ以外の時刻は正しく読めるため上書きしない（詳細は 4.2 章） |
 
 #### `extra_segment`
 
@@ -166,12 +166,12 @@
 
 **読み上げを 1 文ずつに分けている理由。** 地名・気温をそれぞれ別の文にすると、各文の語彙が
 有限に収まり、全パターンを VOICEVOX で事前生成できる（`assets/voice/`）。1 文にまとめると
-値の組み合わせが爆発して事前生成できず、実行時に Open JTalk が合成することになり、
-**天気だけ別人の男性音声になる**。テンプレートを空文字列にするとその文を読まない。
+値の組み合わせが爆発して事前生成できず、**その文だけ無音になる**（他の文・時報音は鳴る）。
+テンプレートを空文字列にするとその文を読まない。
 
 **`provider` の既定が `open_meteo` である理由。** 気象庁の予報文は自由文で語彙が閉じず、
 事前生成できない。Open-Meteo は天気コード（`WMO_CODES`・28 語）で語彙が閉じるため、
-全パターンを作り置きできる。`jma` に戻すこと自体は可能だが、(1) 天気だけ男性音声になる、
+全パターンを作り置きできる。`jma` に戻すこと自体は可能だが、(1) 天気だけ無音になる、
 (2) 気象庁に現況が無いため `sentence_temp` が出力されず天気 1 文だけになる、
 (3) `sentence_weather` の「今の」が実態（今日 1 日の予報）と食い違う、の 3 点を承知すること。
 `jma` を使うなら `sentence_weather` を予報の言い回しに戻し、`sentence_temp_max` /
@@ -181,18 +181,17 @@
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
-| `engines` | `["prerecorded","voicevox","open_jtalk"]` | 上から順に試す |
+| `engines` | `["prerecorded","voicevox"]` | 上から順に試す。どちらでも合成できない文言はその 1 文だけ無音になる（放送は続く） |
 | `cache_dir` | `cache/tts` | 合成結果のキャッシュ先 |
 | `prerecorded_dir` | `assets/voice` | 事前生成音声の置き場 |
-| `open_jtalk.binary` | `"open_jtalk"` | 実行ファイル |
-| `open_jtalk.dictionary` / `voice` | `""` | 空なら既知の場所から自動検出 |
-| `open_jtalk.sampling_frequency` | `48000` | 合成サンプリング周波数 |
-| `open_jtalk.speed` | `1.0` | 話速（`-r`） |
-| `open_jtalk.additional_half_tone` | `0.0` | 音の高さ（`-fm`） |
-| `open_jtalk.volume_gain_db` | `0.0` | 音量ゲイン（`-g`） |
 | `voicevox.base_url` | `http://127.0.0.1:50021` | VOICEVOX ENGINE の URL |
 | `voicevox.speaker` | `3` | 話者 ID（3 = ずんだもん・ノーマル） |
 | `voicevox.probe_timeout_seconds` | `2.0` | 疎通確認（`GET /version`）のタイムアウト。放送直前に呼ばれる実行時は短く保つ既定値で、`scripts/generate_voicevox.py` の起動待ちでは長めの値を設定して使う（4.4 章参照） |
+
+**v5.0.0 で `open_jtalk` エンジンをコードごと削除した。** 古い `config.json` が
+`engines` に `"open_jtalk"` を残していても、`engines` に含まれる未知のエンジン名は
+警告ログ（`未知の TTS エンジン '...' は無視します。`）を出して無視されるだけで、
+動作には影響しない。
 
 #### `closing` / `state` / `logging`
 
@@ -245,7 +244,7 @@ pygame 2.x の `mixer.init()` は buffer 既定値が **512 サンプル**であ
 
 **時刻の読み誤り対策（`hour_readings`）**
 
-Open JTalk（MeCab）は「4時」を「よんじ」、「7時」を「ななじ」、「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読する（正しくは よじ／しちじ／くじ／れいじ）。数字部分だけをかな化すると（例:「午後よ時」）今度は「時」が「とき」と読まれるため、`hour_readings` は「時」を含めて丸ごとかな書きに置き換える（例: `"4": "よじ"`）。既定でこの 4 つの時刻のみを対象にしており、正しく読める時刻まで一律にかな化しないのは、TTS のアクセントがかえって不自然になるのを避けるため。`hour_parts()` はこの読みを `hour_reading` として返し、`announce_template` の既定値はこれを使う。
+読み上げエンジンは「4時」を「よんじ」、「7時」を「ななじ」、「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読する（正しくは よじ／しちじ／くじ／れいじ）。数字部分だけをかな化すると（例:「午後よ時」）今度は「時」が「とき」と読まれるため、`hour_readings` は「時」を含めて丸ごとかな書きに置き換える（例: `"4": "よじ"`）。既定でこの 4 つの時刻のみを対象にしており、正しく読める時刻まで一律にかな化しないのは、TTS のアクセントがかえって不自然になるのを避けるため。`hour_parts()` はこの読みを `hour_reading` として返し、`announce_template` の既定値はこれを使う。
 
 **タイムライン（既定値）**
 
@@ -281,12 +280,14 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 |---|---|---|
 | `PrerecordedEngine` | ディレクトリが存在する | 合成しない。`manifest.json`（文言→ファイル名）または `sha1(文言)[:20].wav` を探し、無ければ次のエンジンへ |
 | `VoicevoxEngine` | `GET /version` が `voicevox.probe_timeout_seconds`（既定 2 秒）以内に 200 | `POST /audio_query` → `POST /synthesis` |
-| `OpenJTalkEngine` | 実行ファイル・辞書・音響モデルが揃う | `open_jtalk -x DIC -m VOICE -r 話速 -fm 高さ -g 音量 -s 周波数 -ow OUT input.txt` |
 
-辞書・音響モデルは設定が空なら次の順に自動検出する。
-
-- 辞書: `/var/lib/mecab/dic/open-jtalk/naist-jdic` → `/usr/share/open_jtalk/open_jtalk_dic_utf_8-*` → `/usr/local/dic`
-- 音響モデル: `/usr/share/hts-voice/*/*.htsvoice` ほか
+**フォールバックは実行時合成ではなく無音（v5.0.0）。** どちらのエンジンでも合成できない
+文言は `TTSError` を送出し、呼び出し側（`chime/sequence.py` の `_append_speech()`）が
+これを捕捉してエラーログと `plan.warnings` を残し、そのセグメントだけを落とす
+（時報音・蛍の光・他の文言は再生を続ける）。v4.x までは最終段に `OpenJTalkEngine`
+（実行時にオフライン合成する最終フォールバック）を置いていたが、フォールバックが
+あるせいで壊れた状態（作り置き不足・古い `config.json`）でも別人の男性音声で
+「それらしく」鳴ってしまい、故障の発覚を妨げていたため v5.0.0 でコードごと削除した。
 
 **キャッシュ:** `cache/tts/{sha1(voice_id + 文言)[:20]}.wav`。一時ファイルへ書いてから `os.replace` で原子的に置き換える。`voice_id` に話者・話速等を含めるため、設定を変えれば別キャッシュになる。同じ文言は 2 回目以降合成されない（時報の定型文は初回のみ）。
 
@@ -305,7 +306,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 **気象庁 JSON の解釈**
 
-- 天気: `timeSeries` のうち `weathers` を持つ系列から、`area_name`（細分区域名。前方一致、無ければ先頭）で選ぶ。`timeDefines` が当日の要素を優先する。予報文中の空白（全角・半角）は形態素の境界を表すため、削除ではなく読点「、」に変換する（削除すると Open JTalk の形態素解析が崩れて読み上げが崩壊する）。続けて `drop_after`（既定 `["所により"]`）のいずれかが最初に現れる位置以降を切り捨てる
+- 天気: `timeSeries` のうち `weathers` を持つ系列から、`area_name`（細分区域名。前方一致、無ければ先頭）で選ぶ。`timeDefines` が当日の要素を優先する。予報文中の空白（全角・半角）は形態素の境界を表すため、削除ではなく読点「、」に変換する（削除すると読み上げエンジンの形態素解析が崩れて読み上げが崩壊する）。続けて `drop_after`（既定 `["所により"]`）のいずれかが最初に現れる位置以降を切り捨てる
 - 最高／最低気温: `temps` を持つ系列を `timeDefines` と対にし、**時刻が 6 時未満なら最低・以降なら最高**として日付ごとに畳み込む。気温の地点名は天気・降水確率の細分区域名とは体系が異なる（例: 滋賀県なら細分区域は「南部」「北部」、気温の地点は「大津」「彦根」）ため、`temp_area_name`（空なら `area_name`）で選ぶ
 - 降水確率: `pops` を持つ系列から `area_name` で選んだ地域の、当日分の**最大値**を採る
 - いずれも欠落しうる前提で、取れた要素だけで文を組み立てる（当日昼発表の予報には当日の最低気温が無い、など）
@@ -340,7 +341,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 `prerecord_phrases()` は、事前生成すべき文言（地点 × 天気コード、気温の全域、
 降水確率の全段階）を全列挙する。`build_sentences()` と同じ関数を通して文を組み立てるため、
 両者の文言がずれることはない。この網羅性は `tests/test_weather.py` の語彙網羅テストが
-機械的に検証している（**これが「天気だけ男性音声になる」ことを防ぐ唯一の担保**）。
+機械的に検証している（**これが「天気だけ無音になる」ことを防ぐ唯一の担保**）。
 
 `{weather}` は `provider="jma"` のときのみ `max_weather_chars`（既定 40 文字）で長さを確認し、
 超えていれば読点の位置で切り詰める（予期しない長文への保険。文の途中では切らない）。
@@ -563,7 +564,7 @@ WantedBy=multi-user.target
 | 生成 | 実行時に合成 | 同梱 | 同梱 | 実行時に合成＋キャッシュ |
 | 形式 | 44.1kHz / 16bit / ステレオ | 24kHz / 16bit / モノラル | MPEG-1 Layer3 128kbps / 44.1kHz | 48kHz / 16bit / モノラル |
 | フェード | 各トーンに 5ms | なし | フェードイン 2000ms | なし |
-| 権利 | 自作（合成） | VOICEVOX 利用規約に従いクレジット表記 | Public Domain | Open JTalk / HTS Voice |
+| 権利 | 自作（合成） | VOICEVOX 利用規約に従いクレジット表記 | Public Domain | VOICEVOX 利用規約に従いクレジット表記 |
 
 ---
 
@@ -630,14 +631,9 @@ python3 -m unittest discover -s tests -t . -v
 | `tests/test_app.py` | 常駐ループ、停止要求、例外時の継続 |
 | `tests/test_cli.py` | 引数解釈、終了コード、環境判定 |
 
-CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する。この `test` ジョブは意図的に `open_jtalk` 未導入のまま動かしており、音声合成（TTS）が全滅する環境でも時報本体（時報音・蛍の光）は成立することを回帰検出する。TTS が実際に機能する経路は別ジョブ（`tts`）で `open-jtalk` 一式を導入した上で `--generate-assets` と `--test-hourly` の合成結果を検証する。手元で `test` ジョブと同じ状態を再現するには、`open_jtalk` を一時的に退避し `cache/tts/` を消してから実行する。
+CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`scripts/generate_voicevox.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
 
-```bash
-sudo mv /usr/bin/open_jtalk /usr/bin/open_jtalk.bak
-rm -rf cache/tts
-python3 -m unittest discover -s tests -t .
-sudo mv /usr/bin/open_jtalk.bak /usr/bin/open_jtalk   # 必ず戻す
-```
+手元で `prerecorded-only` ジョブと同じ検証をするには、`.github/workflows/ci.yml` のコマンドをそのまま実行する（`cache/tts/` を消してから実行すると、キャッシュ済みの合成結果に隠れず確実に検証できる）。
 
 ### 10.2 実機での確認
 

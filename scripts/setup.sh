@@ -40,9 +40,6 @@ if [ "${DO_APT}" -eq 1 ]; then
   sudo apt-get install -y \
     python3 \
     python3-pygame \
-    open-jtalk \
-    open-jtalk-mecab-naist-jdic \
-    hts-voice-nitech-jp-atr503-m001 \
     alsa-utils \
     mpg123 \
     git
@@ -66,16 +63,32 @@ log "現地設定ファイルの用意"
 if [ -f "${REPO_DIR}/config.json" ]; then
   echo "config.json は既にあります（上書きしません）。"
 else
-  cp "${REPO_DIR}/config.example.json" "${REPO_DIR}/config.json"
-  echo "config.example.json から config.json を作成しました。"
-  echo "地域や時刻を変える場合は config.json を編集してください（Git 管理外です）。"
+  # config.example.json を丸ごと複製しないこと。config.json は既定値へ
+  # deep merge される「差分」であり、全項目を書き写すと、その時点の既定値が
+  # 凍結されて以後の更新が届かなくなる。実際に、旧版で作られた config.json が
+  # 読み上げ文言を古いまま上書きし、作り置き音声と一致しなくなる不具合が
+  # 起きた（当時は Open JTalk が代わりに合成したため読み上げだけ男性音声に
+  # なった。v5.0.0 でその合成を廃したので、いまは読み上げが無音になる）。
+  cat > "${REPO_DIR}/config.json" <<'EOF'
+{
+  "_comment": "変えたい項目だけをここに書きます。書かなかった項目は既定値が使われ、更新のたびに最新の既定値が反映されます。設定できる項目の一覧は config.example.json を参照し、必要な行だけ写してください。このファイルは Git 管理外です。"
+}
+EOF
+  echo "config.json を作成しました（中身は空の上書きです）。"
+  echo "地域や時刻を変える場合は、config.example.json を見て必要な項目だけ config.json に書いてください。"
 fi
 
 log "時報音と定型文音声の生成"
 if ! python3 "${REPO_DIR}/campus_chime.py" --generate-assets; then
   warn "音声合成に失敗しました。時報音（ポ・ポ・ポ・ポーン）は鳴りますが、読み上げが出ません。"
-  warn "次を実行してから、もう一度 --generate-assets を試してください:"
-  warn "  sudo apt install -y open-jtalk open-jtalk-mecab-naist-jdic hts-voice-nitech-jp-atr503-m001"
+  warn "この文言の作り置き（assets/voice/）がありません。本機（Pi）では音声合成を行わないため、"
+  warn "VOICEVOX を動かせる PC 側で作り直す必要があります。"
+  warn "  1. PC で VOICEVOX ENGINE を起動する"
+  warn "  2. PC 上のリポジトリで次を実行する:"
+  warn "       python3 scripts/generate_voicevox.py --include-quotes --prune"
+  warn "  3. 生成された assets/voice/ を commit・push する"
+  warn "  4. この Pi で git pull してから、もう一度 --generate-assets を試す"
+  warn "詳しい手順は docs/SETUP.md の 8 章を参照してください。"
 fi
 
 log "動作確認（音は鳴りません）"

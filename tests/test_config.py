@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import tempfile
 import unittest
 
 from chime.config import (DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, Config, ConfigError,
-                          deep_merge, load_config)
+                          deep_merge, load_config, redundant_keys)
 
 
 class DeepMergeTest(unittest.TestCase):
@@ -80,7 +81,7 @@ class DefaultConfigMisreadFixesTest(unittest.TestCase):
     """時報・天気予報の誤読対策に関わる既定値の回帰防止。"""
 
     def test_hour_readings_default_covers_the_four_misread_hours(self):
-        # Open JTalk が誤読する 4 つの時刻（詳細は chime/timesignal.py）。
+        # 読み上げエンジンが誤読する 4 つの時刻（詳細は chime/timesignal.py）。
         self.assertEqual(
             DEFAULT_CONFIG["time_signal"]["hour_readings"],
             {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"})
@@ -113,9 +114,9 @@ class PrerecordableWeatherTest(unittest.TestCase):
     """天気の読み上げを作り置きできる状態に保つための回帰確認。
 
     気象庁（jma）の予報文は自由文なので語彙が閉じず、事前生成できない。
-    事前生成が外れた文は実行時に Open JTalk が合成するため、天気だけ
-    別人の男性音声になる。既定を open_meteo（天気コードで語彙が 28 語に
-    閉じる）に保つことが、放送全体をずんだもんの声で揃える前提になっている。
+    v5.0.0 で実行時合成を廃したため、事前生成が外れた文は無音になる。
+    既定を open_meteo（天気コードで語彙が 28 語に閉じる）に保つことが、
+    放送全体をずんだもんの声で揃える前提になっている。
     """
 
     def test_provider_is_open_meteo_by_default(self):
@@ -141,8 +142,9 @@ class PrerecordableWeatherTest(unittest.TestCase):
 class ZundamonToneTest(unittest.TestCase):
     """読み上げの語尾をずんだもんの「のだ」調に揃えている回帰確認。
 
-    語尾を変えると作り置き音声の照合（文言の完全一致）が外れるため、
-    うっかり戻すと放送全体が Open JTalk の男性音声になる。
+    語尾を変えると作り置き音声の照合（文言の完全一致）が外れる。v5.0.0 で
+    実行時合成のフォールバックを廃したため、うっかり戻すと読み上げが
+    すべて無音になる。
     """
 
     def _templates(self):
@@ -215,6 +217,86 @@ class WeatherHoursTest(unittest.TestCase):
             self.assertIn(hour, scheduled, hour)
 
 
+class RedundantKeysTest(unittest.TestCase):
+    """既定値を丸ごと写した設定ファイルを検出する。
+
+    実機で「読み上げだけ男性音声になる」不具合が起きた。原因は、旧版の
+    scripts/setup.sh が config.example.json（＝既定値の完全なコピー）を
+    config.json として複製していたこと。そうして作られた設定はその時点の
+    既定値を凍結するため、更新しても新しい既定値が届かない。読み上げ文言が
+    古いまま上書きされ、事前生成した音声（文言との完全一致で引く）に当たらず、
+    当時あった Open JTalk のフォールバックが合成していた（v5.0.0 でその
+    フォールバックは削除したため、いま同じことが起きれば無音になる）。
+    """
+
+    def test_an_override_that_differs_is_not_redundant(self):
+        override = {"schedule": {"hourly": {"end_hour": 18}}}
+        self.assertEqual(redundant_keys(override), [])
+
+    def test_a_value_equal_to_the_default_is_redundant(self):
+        default_end = DEFAULT_CONFIG["schedule"]["hourly"]["end_hour"]
+        override = {"schedule": {"hourly": {"end_hour": default_end}}}
+        self.assertEqual(redundant_keys(override), ["schedule.hourly.end_hour"])
+
+    def test_unknown_keys_are_ignored(self):
+        self.assertEqual(redundant_keys({"存在しないキー": 1}), [])
+
+    def test_a_full_copy_of_the_defaults_is_all_redundant(self):
+        # config.example.json は DEFAULT_CONFIG の完全なコピー。これをそのまま
+        # config.json にすると全項目が冗長になり、以後の既定値の変更が届かない。
+        with open(EXAMPLE_CONFIG_PATH, encoding="utf-8") as handle:
+            example = json.load(handle)
+        redundant = redundant_keys(example)
+        self.assertGreater(len(redundant), 50, "完全コピーなら多数が冗長になるはず")
+
+    def test_an_empty_override_is_not_redundant(self):
+        # 新しい setup.sh が作る config.json（空の上書き）が警告を出さないこと。
+        self.assertEqual(redundant_keys({}), [])
+        self.assertEqual(redundant_keys({"_comment": "説明"}), [])
+
+    def _load_capturing_warnings(self, override):
+        """``override`` を config.json として読み込み、警告ログを集めて返す。
+
+        tests/__init__.py がテスト全体でログを抑制している
+        （``logging.disable(logging.CRITICAL)``）ため、assertLogs で拾えるよう
+        tests/test_weather.py と同じ手順でこの間だけ一時的に解除する。
+        ``assertLogs`` は 1 件も出ないと失敗するので、判定用のダミーを先に出す。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(override, handle)
+            logging.disable(logging.NOTSET)
+            try:
+                with self.assertLogs("chime.config", level="WARNING") as captured:
+                    logging.getLogger("chime.config").warning("dummy")
+                    load_config(explicit_path=path, base_dir=tmp)
+            finally:
+                logging.disable(logging.CRITICAL)
+        return [line for line in captured.output if not line.endswith("dummy")]
+
+    def test_a_full_copy_triggers_a_warning(self):
+        with open(EXAMPLE_CONFIG_PATH, encoding="utf-8") as handle:
+            example = json.load(handle)
+        warnings = self._load_capturing_warnings(example)
+        self.assertTrue(warnings, "既定値の丸ごとコピーなら警告が出るはず")
+        self.assertTrue(any("既定値" in line for line in warnings), warnings)
+
+    def test_a_small_override_does_not_warn(self):
+        warnings = self._load_capturing_warnings({"schedule": {"hourly": {"end_hour": 18}}})
+        self.assertEqual(warnings, [])
+
+    def test_an_empty_override_does_not_warn(self):
+        warnings = self._load_capturing_warnings({"_comment": "変えたい項目だけを書きます。"})
+        self.assertEqual(warnings, [])
+
+    def test_the_warning_survives_a_default_change(self):
+        """既定値を変えても検出が効き続けること（この仕組みの要）。"""
+        override = {"timezone": DEFAULT_CONFIG["timezone"]}
+        self.assertEqual(redundant_keys(override), ["timezone"])
+        self.assertEqual(redundant_keys({"timezone": "UTC"}), [])
+
+
 class LoadConfigTest(unittest.TestCase):
     def test_local_config_overrides_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -247,6 +329,26 @@ class LoadConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ConfigError):
                 load_config(os.path.join(tmp, "nope.json"), base_dir=tmp)
+
+
+class NoRuntimeSynthesisFallbackTest(unittest.TestCase):
+    """合成フォールバック（Open JTalk）を既定から締め出していることの回帰確認。
+
+    作り置きに無い文言を「別人の男性音声」で鳴らしてしまう事故が繰り返された
+    ため、v5.0.0 でエンジンごと削除した。既定に戻すと、壊れているのに音だけは
+    鳴る状態が復活する。
+    """
+
+    def test_default_engines_are_prerecorded_then_voicevox(self):
+        self.assertEqual(DEFAULT_CONFIG["tts"]["engines"],
+                         ["prerecorded", "voicevox"])
+
+    def test_defaults_carry_no_open_jtalk_settings(self):
+        self.assertNotIn("open_jtalk", DEFAULT_CONFIG["tts"])
+
+    def test_no_default_mentions_open_jtalk_anywhere(self):
+        self.assertNotIn("open_jtalk", json.dumps(DEFAULT_CONFIG,
+                                                  ensure_ascii=False))
 
 
 class ExampleConfigTest(unittest.TestCase):

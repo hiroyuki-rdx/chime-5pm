@@ -94,16 +94,26 @@ bash scripts/setup.sh --no-apt
 sudo systemctl restart campus_chime.service
 ```
 
-反映後は、読み上げが**すべてずんだもんの声**であることを耳で確認する。
+反映後は、読み上げが**途切れず（無音の文言が無く）**聞こえることを耳で確認する。
 
 ```bash
 python3 campus_chime.py --test-hourly 10
 ```
 
-**男性の声が混ざっていたら、その文言の作り置きが無い。** 読み上げ音声は文言との
+**無音になる文言があったら、その文言の作り置きが無い。** 読み上げ音声は文言との
 完全一致で引いているため、文言（語尾・ひとこと・天気の地点や読み上げ項目）を変えたのに
-PC 側で作り直していないと、変えた分だけ Open JTalk が合成する。`git pull` だけでは
+PC 側で作り直していないと、変えた分だけ無音になる（放送本体は止まらない）。`git pull` だけでは
 作り置きは増えない。作り直しの手順は `docs/SETUP.md` 9 章 B を参照。
+
+**それでも心当たりがない場合は `config.json` が古い可能性がある。** 旧版で作られた
+`config.json` は当時の既定値を丸ごと抱えたままで、新しい既定値をすべて握りつぶす。
+
+```bash
+grep -c "お知らせしました" config.json
+```
+
+1 以上なら古い文言が書かれている。**現地設定があれば退避してから**作り直す
+（手順・理由は `docs/SETUP.md` 10-7 を参照）。
 
 ### 3-4. 一時的に止める（休業日など）
 
@@ -178,16 +188,14 @@ groups pi                               # audio グループに入っている�
 
 ### 4-4. 読み上げだけ鳴らない（時報音は鳴る）
 
-音声合成が使えていません。時報音は合成不要なので鳴ります。
+読み上げに使えるエンジンが 1 つもありません。時報音は合成不要なので鳴ります。
 
 ```bash
-which open_jtalk
-ls /var/lib/mecab/dic/open-jtalk/naist-jdic
-ls /usr/share/hts-voice/*/*.htsvoice
-
-sudo apt install -y open-jtalk open-jtalk-mecab-naist-jdic hts-voice-nitech-jp-atr503-m001
-python3 campus_chime.py --generate-assets
+python3 campus_chime.py --test-hourly --log-level DEBUG   # ログの TTS: を確認
+ls assets/voice/*.wav | wc -l                              # 166 件あるか
 ```
+
+`prerecorded(利用不可)` なら `assets/voice/` が見つかっていません（`git pull` が届いているか確認）。Pi 上では VOICEVOX ENGINE を動かさない運用のため `voicevox(利用不可)` は正常です。一部の文言だけ無音の場合は「3-3. 更新を取り込む」または [SETUP.md 10-7](SETUP.md#10-7-読み上げが無音になる) を参照してください。
 
 ### 4-5. 時刻がずれている
 
@@ -287,3 +295,4 @@ sudo iw dev wlan0 set power_save off   # 省電力による切断を防ぐ（応
 | `docs/LEGACY_SYSTEM_SHUTDOWN.md` | `weather.py` の自動起動を止める手順書。OS を入れ替えるため不要になり削除 |
 | `~/steam5pm` という設置パス | v1.x のドキュメント表記。systemd ユニットと食い違い、導入失敗の原因だった。`/home/pi/campus-chime` に統一 |
 | 1 秒ごとの時刻ポーリング | 次イベントまでの分割待機に置き換え（CPU 負荷と時刻補正追従の両立） |
+| Open JTalk による実行時音声合成（フォールバック） | 作り置き・VOICEVOX のどちらにも無い文言を合成する最終手段だったが、**フォールバックがあるせいで、壊れていても「それらしく」鳴ってしまう**（作り置き不足・古い `config.json` の握りつぶしが、いずれも「別人の男性音声」としてしか発覚しなかった）。v5.0.0 でコードごと削除し、フォールバックが尽きた文言は無音にする方針に変えた（放送本体は止めない） |

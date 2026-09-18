@@ -16,7 +16,7 @@ import copy
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +100,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "noon_template": "正午をお知らせしたのだ。",
         "period_am": "午前",
         "period_pm": "午後",
-        # Open JTalk が誤読する時刻（12 時間表記の「時」）だけ、読みをかな書きで
-        # 上書きする。キーは文字列（JSON の都合上）。既定の 4 つ以外は正しく
-        # 読めるため、意図的に上書きしていない（詳細は chime/timesignal.py 参照）。
+        # 読み上げエンジンが誤読する時刻（12 時間表記の「時」）だけ、読みを
+        # かな書きで上書きする。キーは文字列（JSON の都合上）。既定の 4 つ以外は
+        # 正しく読めるため、意図的に上書きしていない。この文字列は作り置き音声を
+        # 引く照合キーそのものなので、変えると作り置きが外れる
+        # （詳細は chime/timesignal.py 参照）。
         "hour_readings": {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"},
     },
     "extra_segment": {
@@ -141,8 +143,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # "jma"（気象庁・キー不要）または "open_meteo"（キー不要）
         #
         # 既定が open_meteo なのは、読み上げ文を作り置きできるようにするため。
-        # 気象庁の予報文は自由文なので事前生成できず、実行時に Open JTalk が
-        # 合成することになり、天気だけ別人の男性音声になる。open_meteo は
+        # 気象庁の予報文は自由文なので事前生成できず、Pi には実行時の合成手段が
+        # 無いため、天気の文だけ無音になる。open_meteo は
         # 天気コード（WMO_CODES・28 語）で語彙が閉じるため、全パターンを
         # VOICEVOX で作り置きでき、放送全体をずんだもんの声で揃えられる。
         # jma に戻す場合はこの点を承知しておくこと（docs/SETUP.md 参照）。
@@ -201,7 +203,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sentence_pop": "",
         # 作り置きする語彙の範囲（scripts/generate_voicevox.py が参照する）。
         # ここを広げるほど生成するファイルが増える。範囲外の値が来た場合は
-        # その 1 文だけ作り置きが外れて Open JTalk が合成する（放送は止まらない）。
+        # その 1 文だけ作り置きが外れて無音になる（放送は止まらない）。
         "prerecord": {
             "temp_min": -5,
             "temp_max": 40,
@@ -216,20 +218,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_weather_chars": 40,
     },
     "tts": {
-        # 上から順に試し、失敗したら次のエンジンへフォールバックする
-        "engines": ["prerecorded", "voicevox", "open_jtalk"],
+        # 上から順に試し、失敗したら次のエンジンへフォールバックする。
+        # どのエンジンでも合成できない文言は「その 1 文だけ無音」になり、
+        # 放送そのものは続く（時報音・蛍の光・他の文は鳴る）。
+        "engines": ["prerecorded", "voicevox"],
         "cache_dir": "cache/tts",
         "prerecorded_dir": "assets/voice",
-        "open_jtalk": {
-            "binary": "open_jtalk",
-            # 空文字なら既知の場所から自動検出する
-            "dictionary": "",
-            "voice": "",
-            "sampling_frequency": 48000,
-            "speed": 1.0,
-            "additional_half_tone": 0.0,
-            "volume_gain_db": 0.0,
-        },
         "voicevox": {
             "base_url": "http://127.0.0.1:50021",
             # 3 = ずんだもん（ノーマル）
@@ -341,10 +335,70 @@ def load_config(explicit_path: Optional[str] = None, base_dir: str = BASE_DIR) -
         candidates.append(explicit_path)
 
     for candidate in candidates:
-        data = deep_merge(data, _read_json(candidate))
+        override = _read_json(candidate)
+        _warn_if_defaults_were_copied(candidate, override)
+        data = deep_merge(data, override)
         sources.append(candidate)
 
     return Config(data, base_dir=base_dir, sources=sources)
+
+
+#: 既定値と同じ値をこれ以上明示している設定ファイルは、差分ではなく
+#: 既定値の丸ごとコピーとみなして警告する。手書きの上書きファイルで
+#: 偶然これだけ一致することは考えにくい。
+_COPIED_DEFAULTS_THRESHOLD = 10
+
+
+def redundant_keys(override: Mapping[str, Any],
+                   default: Mapping[str, Any] = DEFAULT_CONFIG,
+                   prefix: str = "") -> List[str]:
+    """``override`` のうち、既定値と同じ値を明示しているキーの一覧を返す。
+
+    設定ファイルは既定値への「差分」であり、書かなかった項目は既定値が使われる。
+    既定値と同じ値をわざわざ書いても動作は変わらないが、**将来その既定値を
+    変更したときに、古い値で上書きし続けてしまう**。
+    """
+    found: List[str] = []
+    for key, value in override.items():
+        if key not in default:
+            continue
+        path = "{0}.{1}".format(prefix, key) if prefix else str(key)
+        base = default[key]
+        if isinstance(value, Mapping) and isinstance(base, Mapping):
+            found.extend(redundant_keys(value, base, path))
+        elif value == base:
+            found.append(path)
+    return found
+
+
+def _warn_if_defaults_were_copied(path: str, override: Mapping[str, Any]) -> None:
+    """既定値を丸ごと写した設定ファイルを検出して警告する。
+
+    ``scripts/setup.sh`` は以前 ``config.example.json``（＝既定値の完全な
+    コピー）を ``config.json`` として複製していた。そうして作られた設定は
+    その時点の既定値を凍結するため、更新しても新しい既定値が一切届かない。
+
+    実際に、旧版で作られた ``config.json`` が読み上げ文言を古いまま上書きし、
+    事前生成した音声（文言との完全一致で引く）に当たらず、当時あった
+    Open JTalk のフォールバックが合成する — つまり読み上げだけ別人の男性音声に
+    なる、という形で表面化した（v5.0.0 でそのフォールバックは削除したため、
+    いま同じことが起きれば読み上げは無音になる）。症状から原因に辿り着くのが
+    難しいため、起動時に気づけるようにする。
+
+    動作は変えない（警告のみ）。意図して既定値と同じ値を書いている利用者の
+    設定を、こちらの判断で無視するべきではないため。
+    """
+    redundant = redundant_keys(override)
+    if len(redundant) < _COPIED_DEFAULTS_THRESHOLD:
+        return
+    logger.warning(
+        "%s は既定値と同じ値を %d 項目書いています。既定値の丸ごとコピーの"
+        "可能性があります。この状態だと、更新しても新しい既定値が届きません"
+        "（読み上げ文言が古いままだと、作り置き音声に当たらず読み上げが"
+        "無音になります）。変えたい項目だけを残してください。詳しくは "
+        "docs/SETUP.md の「読み上げが無音になる」を参照。",
+        path, len(redundant))
+    logger.warning("  既定値と同じ項目の例: %s", "、".join(redundant[:5]))
 
 
 def _read_json(path: str) -> Dict[str, Any]:

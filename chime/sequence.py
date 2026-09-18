@@ -212,8 +212,8 @@ class SequenceBuilder:
         """天気予報を、地点の順に文ごと独立したセグメントとして積む。
 
         作り置き音声は文単位で用意されているため、複数文を 1 つの文字列に
-        連結してはならない（連結すると照合が外れ、Open JTalk への
-        フォールバックが発生する）。``describe_sentences()`` が返す各文を
+        連結してはならない（連結すると照合が外れ、その文が無音になる）。
+        ``describe_sentences()`` が返す各文を
         そのまま ``_append_speech`` に渡し、1 文 1 セグメントにする。
 
         ``fallback`` は ``extra_segment.mode == "choice"`` のときだけ効く

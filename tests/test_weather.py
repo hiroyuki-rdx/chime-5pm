@@ -45,8 +45,8 @@ JMA_SENTENCES = dict(
 
 
 class NormalizeTest(unittest.TestCase):
-    # 気象庁の全角スペースは形態素の境界を表す。単純に削除すると Open JTalk
-    # （MeCab）の形態素解析が崩れて読み上げが崩壊するため（実測で 23 秒・
+    # 気象庁の全角スペースは形態素の境界を表す。単純に削除すると読み上げ
+    # エンジンの形態素解析が崩れて読み上げが崩壊するため（実測で 23 秒・
     # 読み崩れを確認済み）、削除ではなく読点「、」に置き換えて区切りを保つ。
     def test_converts_full_width_spaces_to_touten(self):
         self.assertEqual(normalize_weather_text("くもり　時々　晴れ"), "くもり、時々、晴れ")
@@ -118,7 +118,7 @@ class ParseJmaTest(unittest.TestCase):
 
     def test_extracts_todays_forecast(self):
         # 「くもり　時々　晴れ」の全角スペースは読点に変換される
-        # （削除すると Open JTalk の形態素解析が崩れて読み上げが崩壊するため）。
+        # （削除すると形態素解析が崩れて読み上げが崩壊するため）。
         parts = parse_jma(self.payload, TOKYO_JMA, TODAY)
         self.assertEqual(parts["when"], "今日")
         self.assertEqual(parts["weather"], "くもり、時々、晴れ")
@@ -211,7 +211,7 @@ class ParseJmaShigaTest(unittest.TestCase):
         # jma は現況を持たないため、予報向けの言い回し（JMA_SENTENCES。
         # chime/config.py のコメント参照）で読み上げ文が意図どおり組み立つこと。
         # 「晴れ　時々　くもり」の全角スペースは読点に変換される（スペース削除
-        # だと Open JTalk の形態素解析が崩れて読み上げが崩壊するため）。
+        # だと形態素解析が崩れて読み上げが崩壊するため）。
         # sentence_weather / sentence_temp_max / sentence_pop の 3 文が
         # 連結される（temp_min は読み上げ対象に含まれない）。
         parts = parse_jma(self.payload, WEATHER["jma"], TODAY)
@@ -587,7 +587,7 @@ class VocabularyCoverageTest(unittest.TestCase):
     既定設定（sentence_weather + sentence_temp が有効、sentence_temp_max /
     sentence_pop は空文字列で無効）で実際に組み立てられる全パターン
     （地点(2) x whens(1) x WMO_CODES(28) x 現況気温の全値(46) = 2576 通り）を
-    検証する。天気・気温の読み上げが Open JTalk（男性声）へ落ちないことの
+    検証する。天気・気温の読み上げが作り置きから外れて無音にならないことの
     機械的な担保になる。sentence_temp の作り置きが 1 つ欠けると、この
     テストは落ちる（実際に確認済み）。
     """

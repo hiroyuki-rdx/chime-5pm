@@ -45,8 +45,8 @@ jobs:
       - name: shellcheck
         run: shellcheck scripts/setup.sh
 
-  tts:
-    name: 音声合成あり（open_jtalk）
+  prerecorded-only:
+    name: 作り置きだけで全文言を賄えること（音声合成エンジンなし）
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,18 +55,35 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: open_jtalk を導入
+      # このランナーには VOICEVOX ENGINE も open_jtalk も無く、何も追加導入
+      # しない。つまり「合成エンジンが一つも使えない」状態がそのまま再現できる。
+      # v5.0.0 で実行時合成へのフォールバック（旧 open_jtalk）を廃したため、
+      # この状態で 1 文でも作り置き（assets/voice/）に無いと、その文だけ
+      # 無音になり、chime.sequence._append_speech が警告を出す
+      # （「◯◯を合成できませんでした: …」）。全文言が作り置きで賄えている
+      # ことを、この警告が 1 件も出ないことで確認する。
+      - name: 全文言（時刻アナウンス・ひとこと・天気）が作り置きだけで合成できること
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            open-jtalk \
-            open-jtalk-mecab-naist-jdic \
-            hts-voice-nitech-jp-atr503-m001
+          python -c "
+          import sys
+          from chime.config import load_config
+          sys.path.insert(0, 'scripts')
+          from generate_voicevox import collect_phrases
+          config = load_config()
+          for phrase in collect_phrases(config, include_quotes=True):
+              print(phrase)
+          " > /tmp/phrases.txt
+          echo "検証する文言数: $(wc -l < /tmp/phrases.txt)"
 
-      - name: 時報の定型文を実際に合成できること
-        run: python campus_chime.py --generate-assets
+          : > /tmp/tts_output.log
+          while IFS= read -r phrase; do
+            python campus_chime.py --say "$phrase" --dry-run --backend mock \
+              >> /tmp/tts_output.log 2>&1
+          done < /tmp/phrases.txt
 
-      - name: 合成結果が時刻アナウンスに反映されること
-        run: |
-          python campus_chime.py --test-hourly 12 --dry-run --backend mock \
-            | grep -F "正午をお知らせしたのだ。"
+          if grep -q "を合成できませんでした" /tmp/tts_output.log; then
+            echo "作り置きだけでは合成できない文言がありました:"
+            grep -B2 "を合成できませんでした" /tmp/tts_output.log
+            exit 1
+          fi
+          echo "全 $(wc -l < /tmp/phrases.txt) 件の文言が作り置きだけで合成できました。"

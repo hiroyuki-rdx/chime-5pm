@@ -15,7 +15,7 @@ MIXER = DEFAULT_CONFIG["audio"]["mixer"]
 
 
 class AnnounceTextTest(unittest.TestCase):
-    # Open JTalk は「4時」を「よんじ」、「7時」を「ななじ」、「9時」を
+    # 読み上げエンジンは「4時」を「よんじ」、「7時」を「ななじ」、「9時」を
     # 「きゅうじ」、「0時」を「ぜろじ」と誤読する（正しくは よじ／しちじ／
     # くじ／れいじ）。既定の hour_readings はこの 4 つだけをかな書きに
     # 上書きしており、以下のテストはその読みが文言に反映されることを確認する。
