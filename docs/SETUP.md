@@ -269,6 +269,8 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 
 > `config.json` は Git 管理外です。`git pull` で更新しても、現地の設定は消えません。
 
+> **`config.json` には変えたい項目だけを書いてください。** 全項目を丸ごと書き写すと、その時点の既定値が固定され、以後の既定値の変更が届かなくなります（10 章「10-7. 読み上げが男性音声になる」で解説する不具合の原因そのものです）。全項目を見渡したいときは `config.example.json` を参照し、そこから必要な行だけ `config.json` に写してください。
+
 ### よくある変更
 
 **時報の時間帯を変える（例: 9 時〜17 時）**
@@ -760,6 +762,61 @@ WSL2 上で実際に音を出して確認したい場合は、`--backend pygame`
 python3 campus_chime.py --test-hourly 16 --backend pygame
 python3 campus_chime.py --test-all --backend pygame
 ```
+
+### 10-7. 読み上げが男性音声になる
+
+時報音（ポ・ポ・ポ・ポーン）は鳴るのに、読み上げ（時刻アナウンス・天気・ひとこと）だけ**男性の機械音声**になることがあります。
+
+読み上げ音声は文言と 1 対 1 で作り置きしてあり、**文字列の完全一致**で引いています。一致しない文言は実行時に Open JTalk が合成するため、そこだけ別人の声になります。
+
+**切り分け 1: 作り置きがあるか**
+
+```bash
+ls assets/voice/*.wav | wc -l
+```
+
+**166 件**あるか確認してください。少なければ `git pull` が届いていないか、作り置きを作り直していません（9 章 B 参照）。
+
+**切り分け 2: `config.json` が古くないか（今回の原因）**
+
+起動時のログに次の警告が出ていれば該当します。**これが一番確実な判定です**（文言以外が古い場合も拾えます）。
+
+```bash
+journalctl -u campus_chime.service -n 50 | grep 既定値
+```
+
+```
+WARNING ... config.json は既定値と同じ値を 76 項目書いています。既定値の丸ごとコピーの
+        可能性があります。この状態だと、更新しても新しい既定値が届きません…
+```
+
+読み上げの文言が古いかどうかだけを見るなら、次でも分かります。
+
+```bash
+grep -c "お知らせしました" config.json
+```
+
+いずれかに当てはまれば、以下で作り直してください。**現地で変更した設定があれば、`config.json.old` から書き戻すこと。**
+
+```bash
+mv config.json config.json.old
+```
+
+```bash
+cp config.example.json config.json
+```
+
+```bash
+sudo systemctl restart campus_chime.service
+```
+
+そのうえで確認します。
+
+```bash
+python3 campus_chime.py --test-hourly 10
+```
+
+**なぜ起きるのか。** 古いバージョンで作られた `config.json` は、当時の既定値を丸ごと複製したものです。設定は既定値 → `config.json` の順に deep merge されるため、この古い `config.json` が新しい既定値をすべて握りつぶします。現在の `scripts/setup.sh` は、新規に作る `config.json` の内容を空の上書き（`{}`）にするようになったため、ここで作り直せば以後は起きません。
 
 ---
 

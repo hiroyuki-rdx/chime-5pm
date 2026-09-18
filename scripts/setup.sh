@@ -66,9 +66,18 @@ log "現地設定ファイルの用意"
 if [ -f "${REPO_DIR}/config.json" ]; then
   echo "config.json は既にあります（上書きしません）。"
 else
-  cp "${REPO_DIR}/config.example.json" "${REPO_DIR}/config.json"
-  echo "config.example.json から config.json を作成しました。"
-  echo "地域や時刻を変える場合は config.json を編集してください（Git 管理外です）。"
+  # config.example.json を丸ごと複製しないこと。config.json は既定値へ
+  # deep merge される「差分」であり、全項目を書き写すと、その時点の既定値が
+  # 凍結されて以後の更新が届かなくなる。実際に、旧版で作られた config.json が
+  # 読み上げ文言を古いまま上書きし、作り置き音声と一致せず Open JTalk が
+  # 合成する（＝読み上げだけ男性音声になる）不具合が起きた。
+  cat > "${REPO_DIR}/config.json" <<'EOF'
+{
+  "_comment": "変えたい項目だけをここに書きます。書かなかった項目は既定値が使われ、更新のたびに最新の既定値が反映されます。設定できる項目の一覧は config.example.json を参照し、必要な行だけ写してください。このファイルは Git 管理外です。"
+}
+EOF
+  echo "config.json を作成しました（中身は空の上書きです）。"
+  echo "地域や時刻を変える場合は、config.example.json を見て必要な項目だけ config.json に書いてください。"
 fi
 
 log "時報音と定型文音声の生成"

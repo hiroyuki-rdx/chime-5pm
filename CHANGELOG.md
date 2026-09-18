@@ -3,6 +3,52 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [4.0.1] - 2026-09-18
+
+### 修正
+
+- **`config.json` が既定値の変更を握りつぶす問題を直した**
+
+  実機で v4.0.0 へ更新したところ、読み上げが男性音声になった。音声ファイル
+  （`assets/voice/` の 166 件）は正しく入っており、原因は `config.json` だった。
+
+  `scripts/setup.sh` は初回に `config.example.json` を `config.json` として
+  **丸ごと複製**していた。`config.example.json` は既定値の完全なコピーなので、
+  作られた時点の既定値がそのまま凍結される。設定は `既定値 → config.json` の順に
+  マージされるため、**古い `config.json` が新しい既定値をすべて握りつぶす**。
+
+  読み上げ音声は文言との完全一致で引いている。文言が古いまま上書きされると
+  166 件のどれにも当たらず、実行時に Open JTalk が合成する ——
+  つまり読み上げだけ別人の男性音声になる。天気が流れなかったのも同じ原因
+  （`weather.enabled` が古い `false` のままだった）。
+
+  - `scripts/setup.sh` が作る `config.json` を、丸ごとコピーではなく
+    **空の上書き**（`{}` と説明コメント）に変更した。`config.json` は既定値への
+    差分であり、書かなかった項目は既定値が使われる。これにより以後の既定値の
+    変更がそのまま届く
+  - 既に `config.json` がある場合に上書きしない挙動は**変えていない**
+    （現地設定を壊さないため）
+  - `chime/config.py` に、既定値と同じ値を多数書いている `config.json` を
+    検出して**警告する**処理を追加した。動作は変えない（意図した上書きを
+    こちらの判断で無視しないため）。症状から原因に辿り着くのが難しいため、
+    起動時に気づけるようにした
+
+### 移行（v4.0.0 以前から更新した機体で必要）
+
+`config.json` が既定値の丸ごとコピーになっている場合、作り直しが要る。
+起動時のログに「既定値と同じ値を N 項目書いています」という警告が出ていれば該当する。
+
+```bash
+cd /home/pi/campus-chime
+mv config.json config.json.old
+cp config.example.json config.json
+sudo systemctl restart campus_chime.service
+```
+
+`config.example.json` は全項目を見渡すための参照なので、**そこから変更したい行だけを
+`config.json` に写す**のが本来の使い方。現地で変えていた設定は `config.json.old` から
+必要な分だけ書き戻すこと。
+
 ## [4.0.0] - 2026-09-17
 
 読み上げをずんだもんの声と「なのだ」調に統一し、天気予報を「今日の予報」から
@@ -161,5 +207,6 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[4.0.1]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v4.0.1
 [4.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v4.0.0
 [3.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v3.0.0

@@ -16,7 +16,7 @@ import copy
 import json
 import logging
 import os
-from typing import Any, Dict, Iterable, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -341,10 +341,68 @@ def load_config(explicit_path: Optional[str] = None, base_dir: str = BASE_DIR) -
         candidates.append(explicit_path)
 
     for candidate in candidates:
-        data = deep_merge(data, _read_json(candidate))
+        override = _read_json(candidate)
+        _warn_if_defaults_were_copied(candidate, override)
+        data = deep_merge(data, override)
         sources.append(candidate)
 
     return Config(data, base_dir=base_dir, sources=sources)
+
+
+#: 既定値と同じ値をこれ以上明示している設定ファイルは、差分ではなく
+#: 既定値の丸ごとコピーとみなして警告する。手書きの上書きファイルで
+#: 偶然これだけ一致することは考えにくい。
+_COPIED_DEFAULTS_THRESHOLD = 10
+
+
+def redundant_keys(override: Mapping[str, Any],
+                   default: Mapping[str, Any] = DEFAULT_CONFIG,
+                   prefix: str = "") -> List[str]:
+    """``override`` のうち、既定値と同じ値を明示しているキーの一覧を返す。
+
+    設定ファイルは既定値への「差分」であり、書かなかった項目は既定値が使われる。
+    既定値と同じ値をわざわざ書いても動作は変わらないが、**将来その既定値を
+    変更したときに、古い値で上書きし続けてしまう**。
+    """
+    found: List[str] = []
+    for key, value in override.items():
+        if key not in default:
+            continue
+        path = "{0}.{1}".format(prefix, key) if prefix else str(key)
+        base = default[key]
+        if isinstance(value, Mapping) and isinstance(base, Mapping):
+            found.extend(redundant_keys(value, base, path))
+        elif value == base:
+            found.append(path)
+    return found
+
+
+def _warn_if_defaults_were_copied(path: str, override: Mapping[str, Any]) -> None:
+    """既定値を丸ごと写した設定ファイルを検出して警告する。
+
+    ``scripts/setup.sh`` は以前 ``config.example.json``（＝既定値の完全な
+    コピー）を ``config.json`` として複製していた。そうして作られた設定は
+    その時点の既定値を凍結するため、更新しても新しい既定値が一切届かない。
+
+    実際に、旧版で作られた ``config.json`` が読み上げ文言を古いまま上書きし、
+    事前生成した音声（文言との完全一致で引く）に当たらず Open JTalk が
+    合成する — つまり読み上げだけ別人の男性音声になる、という形で表面化した。
+    症状から原因に辿り着くのが難しいため、起動時に気づけるようにする。
+
+    動作は変えない（警告のみ）。意図して既定値と同じ値を書いている利用者の
+    設定を、こちらの判断で無視するべきではないため。
+    """
+    redundant = redundant_keys(override)
+    if len(redundant) < _COPIED_DEFAULTS_THRESHOLD:
+        return
+    logger.warning(
+        "%s は既定値と同じ値を %d 項目書いています。既定値の丸ごとコピーの"
+        "可能性があります。この状態だと、更新しても新しい既定値が届きません"
+        "（読み上げ文言が古いままだと、作り置き音声に当たらず男性音声に"
+        "なります）。変えたい項目だけを残してください。詳しくは "
+        "docs/SETUP.md の「読み上げが男性音声になる」を参照。",
+        path, len(redundant))
+    logger.warning("  既定値と同じ項目の例: %s", "、".join(redundant[:5]))
 
 
 def _read_json(path: str) -> Dict[str, Any]:
