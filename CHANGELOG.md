@@ -3,6 +3,54 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [Unreleased]
+
+プログラムの変更は無い（ドキュメントのみ）ため、版は上げていない。
+
+### 修正
+
+- **`config.json` の作り直し手順が誤っていたのを直した**
+
+  v4.0.1 の移行手順（本ファイル・`docs/SETUP.md` 10-7）と `README.md` 8 章で、
+  `config.json` を退避したあとに `cp config.example.json config.json` を実行するよう
+  書いていた。これは v4.0.1 で直した問題そのものを再発させる。`config.example.json` は
+  全項目の一覧なので、写すと既定値がまた固定され、次の更新で新しい既定値が届かなくなる
+  （写した直後から「既定値と同じ値を 84 項目書いています」という警告が出る）。
+
+  正しくは退避（`mv`）だけでよい。`config.json` は無くても動き、無ければ全項目が
+  最新の既定値になる。
+
+- **天気のトラブル対応の記述を現在の仕様に合わせた**
+
+  実機で天気が流れない件を調べる途中で、「天気が流れない」ときに読む箇所が v3 時代の
+  ままだと分かった。どれも読んだ人を誤った結論に導く。
+
+  - `docs/SETUP.md` 10-5: 取得先を気象庁としていた（v4.0.0 から Open-Meteo）。
+    `ping www.jma.go.jp` で確認させていた。失敗すると「ひとことへ切り替わる」と
+    書いていた（実際は天気を黙って飛ばし、ひとことは毎回流れる）。最有力の原因である
+    古い `config.json` に触れていなかった
+  - `docs/KNOWLEDGE_BASE.md`: 天気予報を「既定では無効の任意機能」としていた
+    （v4.0.0 から既定で有効）。ログに「天気予報を取得できませんでした」と出たときの
+    意味も「正常動作」と説明していた。これでは天気が流れなくても正常だと判断してしまう
+  - `README.md` の「うまくいかないとき」: 「天気だけ流れない」の対処がネットワークの
+    確認だけだった
+
+  あわせて、**時刻の読み上げが聞こえるかどうか**で原因を切り分ける表を加えた。
+  古い `config.json` が原因のときは、天気だけでなく時刻の読み上げも無音になる
+  （古い文言「午前10時をお知らせしました。」が作り置き音声に無いため）ので、耳で区別できる。
+
+### 移行
+
+**以前の手順どおり `cp config.example.json config.json` まで実行した機体は、
+作り直しておくこと。** 今は動いていても、次に既定値が変わったときに同じ問題が再発する。
+起動ログに「既定値と同じ値を N 項目書いています」という警告が出ていれば該当する。
+
+```bash
+cd /home/pi/campus-chime
+mv config.json config.json.old
+sudo systemctl restart campus_chime.service
+```
+
 ## [5.0.0] - 2026-09-18
 
 ### 削除
@@ -97,13 +145,16 @@ VOICEVOX を起動していれば従来どおり使える）。
 ```bash
 cd /home/pi/campus-chime
 mv config.json config.json.old
-cp config.example.json config.json
 sudo systemctl restart campus_chime.service
 ```
 
-`config.example.json` は全項目を見渡すための参照なので、**そこから変更したい行だけを
-`config.json` に写す**のが本来の使い方。現地で変えていた設定は `config.json.old` から
-必要な分だけ書き戻すこと。
+`config.json` は無くても動き、無ければ全項目が最新の既定値になる。現地で変えていた
+設定は、**その項目だけを書いた新しい `config.json`** を作って戻すこと（書き方は
+`docs/SETUP.md` 7 章）。`config.json.old` は全項目入りなので、そのまま戻したり
+丸ごと写したりしないこと。
+
+（この手順は当初 `cp config.example.json config.json` を含んでいたが、誤りだったため
+訂正した。[Unreleased] を参照）
 
 ## [4.0.0] - 2026-09-17
 
@@ -263,6 +314,7 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[Unreleased]: https://github.com/hiroyuki-rdx/chime-5pm/compare/v5.0.0...HEAD
 [5.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.0.0
 [4.0.1]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v4.0.1
 [4.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v4.0.0

@@ -180,8 +180,9 @@ journalctl -u campus_chime.service -f
 
 時刻・曜日・読み上げ文言・天気の地域などは `config.json` で変更できます（**コードの書き換えは不要**）。
 
+`config.json` には変えたい項目だけを書いてください。`config.example.json` を丸ごと写さないでください。書き方の例は [docs/SETUP.md](docs/SETUP.md) 7 章を参照してください。
+
 ```bash
-cp config.example.json config.json   # 初回のみ（setup.sh が実行済み）
 nano config.json
 sudo systemctl restart campus_chime.service
 ```
@@ -252,7 +253,7 @@ sudo systemctl is-enabled campus_chime.service
 |---|---|
 | **読み上げが無音になる（文言が聞こえない）** | 作り置きが無い（言葉を変えた場合は PC 側での作業が要る。下記）か、`config.json` が古い可能性があります。[SETUP.md](docs/SETUP.md) の「10-7. 読み上げが無音になる」を参照 |
 | 11・13・15 時に天気が流れない | **仕様です。** 天気は 2 時間おき（10/12/14/16 時） |
-| 天気だけ流れない | ネットワークを確認。取れないときは黙って飛ばす設計で、時報とひとことは鳴ります |
+| 天気だけ流れない | 時刻の読み上げも聞こえない場合は `config.json` が古い可能性大。[SETUP.md](docs/SETUP.md) の「10-7. 読み上げが無音になる」を参照。時刻の読み上げが聞こえる場合はネットワークか時刻のずれ。[SETUP.md](docs/SETUP.md) の「10-5. 天気予報だけ流れない」を参照 |
 | 音が鳴らない | [docs/SETUP.md](docs/SETUP.md) 10 章 |
 | サービスが動いていない | `journalctl -u campus_chime.service -n 50` でログを見る |
 
