@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import contextlib
+import http.client
+import json
 import logging
 import os
 import random
 import tempfile
 import unittest
 from datetime import date
+from unittest import mock
 
-from tests.support import REPO_ROOT  # noqa: F401
+from tests.support import REPO_ROOT, load_fixture  # noqa: F401
 
 from chime.config import DEFAULT_CONFIG, Config
 from chime.quotes import QuotePicker
 from chime.sequence import EXTRA_QUOTE, EXTRA_WEATHER, SequenceBuilder, choose_extra
 from chime.state import State
 from chime.tts import TTSError
-from chime.weather import WeatherError
+from chime.weather import WeatherError, WeatherService
 
 EXTRA = DEFAULT_CONFIG["extra_segment"]
 
@@ -391,16 +395,39 @@ class BuildHourlyTest(BuilderTestCase):
         self.assertIn("時報音", plan.segments[0].label)
         self.assertTrue(plan.warnings)
 
-    def test_used_quote_is_remembered(self):
-        plan = self.make_builder().build_hourly(11)
-        self.assertEqual(self.state.recent_quotes(), [plan.quote])
+    def test_used_quote_is_recorded_in_the_plan_not_in_the_state(self):
+        # 組み立ての段階では state を書かない（再生できたかどうかは、まだ
+        # 分からないため）。選んだ文は plan.quote に残し、記録は再生後に
+        # ChimeApp.run_event が行う。
+        with mock.patch.object(self.state, "remember_quote") as remember:
+            plan = self.make_builder().build_hourly(11)
+        self.assertIsNotNone(plan.quote)
+        remember.assert_not_called()
+        self.assertEqual(self.state.recent_quotes(), [])
+
+    def test_building_does_not_write_the_state_file(self):
+        self.make_builder().build_hourly(11)
+        self.assertFalse(os.path.exists(self.state.path))
 
     def test_recent_quotes_are_not_repeated(self):
         # mode="both"（既定）でも、天気とは独立に「ひとこと」が毎回別のものに
-        # なること。
+        # なること。記録は build の外（再生後）で行うので、ここでは
+        # remember_quote を自分で呼ぶ。
         builder = self.make_builder(rng=FixedRandom(0.99))
-        picked = {builder.build_hourly(11).quote for _ in range(5)}
+        picked = set()
+        for _ in range(5):
+            quote = builder.build_hourly(11).quote
+            picked.add(quote)
+            self.state.remember_quote(quote)
         self.assertEqual(len(picked), 5, "直近のひとことが繰り返し選ばれている")
+
+    def test_recent_quotes_in_the_state_are_still_read(self):
+        # 記録済みの文は、build が state から読んで避けること。
+        builder = self.make_builder(rng=FixedRandom(0.99))
+        first = builder.build_hourly(11).quote
+        self.state.remember_quote(first)
+        for _ in range(5):
+            self.assertNotEqual(builder.build_hourly(11).quote, first)
 
 
 class BuildClosingTest(BuilderTestCase):
@@ -436,6 +463,461 @@ class BuildClosingTest(BuilderTestCase):
         self.assertEqual(weather.calls, 0, "閉館放送で WeatherService を呼んではいけない")
 
 
+@contextlib.contextmanager
+def logs_enabled(logger_name, level):
+    """tests/__init__.py が止めているログを、このブロックの間だけ拾えるようにする。"""
+    logging.disable(logging.NOTSET)
+    try:
+        with unittest.TestCase().assertLogs(logger_name, level=level) as captured:
+            yield captured
+    finally:
+        logging.disable(logging.CRITICAL)
+
+
+class ExplodingTTS(StubTTS):
+    """TTSError ではない想定外の例外を出す音声合成。"""
+
+    def synthesize(self, text):
+        self.texts.append(text)
+        raise RuntimeError("想定外の合成エラー")
+
+
+class ExplodingWeather(StubWeather):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def describe_sentences(self, today=None, use_cache=True):
+        self.calls += 1
+        raise self.error
+
+
+class ExplodingQuotes:
+    def __init__(self, error):
+        self.error = error
+        self.calls = 0
+
+    def pick(self, hour, recent):
+        self.calls += 1
+        raise self.error
+
+
+def open_meteo_response(body=None, read_error=None):
+    """``urlopen`` が返す応答のモック（``with`` で使え、``read()`` が本文か例外を返す）。"""
+    response = mock.MagicMock()
+    response.__enter__.return_value = response
+    if read_error is not None:
+        response.read.side_effect = read_error
+    else:
+        response.read.return_value = json.dumps(body).encode("utf-8")
+    return response
+
+
+class DegradeHourlyTest(BuilderTestCase):
+    """時報の一部品が壊れても、残りの部品は必ず鳴ること。"""
+
+    def assert_time_signal_first(self, plan):
+        self.assertIn("時報音", self.labels(plan)[0])
+
+    def quote_labels(self, plan):
+        return [label for label in self.labels(plan) if "ひとこと" in label]
+
+    # -- 天気 ---------------------------------------------------------------
+    def test_incomplete_read_from_the_real_weather_service_keeps_every_other_part(self):
+        # 実際の障害の再現: 12 時に天気 API の応答が途中で切れる
+        # （http.client.IncompleteRead は OSError ではない）。
+        # 本物の WeatherService と urlopen のモックで確かめる。
+        weather = WeatherService(self.config.section("weather"))
+        response = open_meteo_response(read_error=http.client.IncompleteRead(b"{\"cur", 300))
+        with mock.patch("chime.weather.urllib.request.urlopen", return_value=response):
+            plan = self.make_builder(weather=weather).build_hourly(12)
+
+        self.assert_time_signal_first(plan)
+        self.assertIn("正午をお知らせしたのだ。", plan.spoken)
+        self.assertIsNotNone(plan.quote)
+        self.assertEqual(len(self.quote_labels(plan)), 1)
+        self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
+        self.assertTrue(any("天気予報を取得できませんでした" in w for w in plan.warnings))
+
+    def test_bad_status_line_from_the_real_weather_service_keeps_every_other_part(self):
+        weather = WeatherService(self.config.section("weather"))
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        side_effect=http.client.BadStatusLine("")):
+            plan = self.make_builder(weather=weather).build_hourly(12)
+        self.assertEqual(len(plan.segments), 3)
+        self.assertIsNotNone(plan.quote)
+
+    def test_a_typo_in_a_weather_template_keeps_every_other_part(self):
+        # sentence_temp の書き間違い（未知の置換名）。天気だけが飛び、
+        # 時報音・時刻アナウンス・ひとことは残る。
+        self.config.data["weather"]["sentence_temp"] = "気温は{degrees}度なのだ。"
+        weather = WeatherService(self.config.section("weather"))
+        payload = load_fixture("open_meteo.json")
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        return_value=open_meteo_response(payload)):
+            plan = self.make_builder(weather=weather).build_hourly(12)
+        self.assertEqual(len(plan.segments), 3)
+        self.assertIsNotNone(plan.quote)
+        self.assertTrue(any("天気予報を取得できませんでした" in w for w in plan.warnings))
+
+    def test_unexpected_exception_in_weather_keeps_every_other_part(self):
+        # WeatherError ではない例外が漏れても、_guard が受けて他の部品を残す。
+        for error in (KeyError("temp"), RuntimeError("想定外"), TypeError("x")):
+            with self.subTest(error=type(error).__name__):
+                plan = self.make_builder(weather=ExplodingWeather(error)).build_hourly(12)
+                self.assert_time_signal_first(plan)
+                self.assertIn("正午をお知らせしたのだ。", plan.spoken)
+                self.assertIsNotNone(plan.quote)
+                self.assertEqual(len(plan.segments), 3)
+                self.assertTrue(any(
+                    "天気予報の組み立てに失敗しました（この部分だけ飛ばします）: {0}: ".format(
+                        type(error).__name__) in w for w in plan.warnings))
+
+    def test_a_failure_in_the_middle_of_the_weather_sentences_keeps_the_earlier_ones(self):
+        # 3 文目の合成で想定外の例外が出ても、それまでの文と、他の部品は残る。
+        class FailsOnThird(StubTTS):
+            def synthesize(inner, text):
+                if len(inner.texts) == 2:
+                    inner.texts.append(text)
+                    raise RuntimeError("3 文目で失敗")
+                return super().synthesize(text)
+
+        plan = self.make_builder(tts=FailsOnThird(self.tmp.name)).build_hourly(12)
+        self.assert_time_signal_first(plan)
+        self.assertIn(self.weather.sentences[0], plan.spoken)
+        self.assertNotIn(self.weather.sentences[1], plan.spoken)
+        self.assertTrue(plan.warnings)
+
+    def test_unexpected_exception_in_weather_hours_setting_skips_only_the_weather(self):
+        # weather_hours が配列でない（設定ミス）。天気だけ飛び、ひとことは残る。
+        self.config.data["extra_segment"]["weather_hours"] = 12
+        plan = self.make_builder().build_hourly(12)
+        self.assertEqual(self.weather.calls, 0)
+        self.assertEqual(len(plan.segments), 3)
+        self.assertIsNotNone(plan.quote)
+        self.assertTrue(plan.warnings)
+
+    # -- ひとこと -------------------------------------------------------------
+    def test_unexpected_exception_in_quote_selection_keeps_every_other_part(self):
+        for error in (IndexError("empty"), ValueError("x"), RuntimeError("想定外")):
+            with self.subTest(error=type(error).__name__):
+                quotes = ExplodingQuotes(error)
+                builder = self.make_builder()
+                builder.quotes = quotes
+                plan = builder.build_hourly(12)
+                self.assertEqual(quotes.calls, 1)
+                self.assert_time_signal_first(plan)
+                self.assertIn("正午をお知らせしたのだ。", plan.spoken)
+                for sentence in self.weather.sentences:
+                    self.assertIn(sentence, plan.spoken)
+                self.assertIsNone(plan.quote)
+                self.assertEqual(self.quote_labels(plan), [])
+                self.assertTrue(any(
+                    "ひとこと" in w and "この部分だけ飛ばします" in w for w in plan.warnings))
+
+    def test_unexpected_exception_in_choice_mode_keeps_the_other_parts(self):
+        # mode="choice"（次の版で削除予定）の分岐も、部品ごとに守られていること。
+        self.config.data["extra_segment"]["mode"] = "choice"
+        builder = self.make_builder(rng=FixedRandom(0.99))
+        builder.quotes = ExplodingQuotes(RuntimeError("想定外"))
+        plan = builder.build_hourly(11)
+        self.assert_time_signal_first(plan)
+        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+        self.assertEqual(len(plan.segments), 2)
+        self.assertTrue(plan.warnings)
+
+    def test_unexpected_exception_in_extra_selection_keeps_the_other_parts(self):
+        # weather_probability が数値でない（設定ミス）と choose_extra が ValueError。
+        self.config.data["extra_segment"]["mode"] = "choice"
+        self.config.data["extra_segment"]["weather_probability"] = "たくさん"
+        plan = self.make_builder().build_hourly(11)
+        self.assert_time_signal_first(plan)
+        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+        self.assertEqual(len(plan.segments), 2)
+        self.assertTrue(plan.warnings)
+
+    def test_guarded_failures_are_logged_with_a_traceback(self):
+        builder = self.make_builder(weather=ExplodingWeather(RuntimeError("想定外")))
+        with logs_enabled("chime.sequence", "ERROR") as captured:
+            builder.build_hourly(12)
+        self.assertTrue(any("天気予報" in line for line in captured.output))
+        self.assertTrue(any("RuntimeError" in line for line in captured.output))
+
+    def test_keyboard_interrupt_is_not_swallowed(self):
+        # SIGINT（Ctrl-C）・停止要求は握りつぶさない（Exception の子ではない）。
+        builder = self.make_builder(weather=ExplodingWeather(KeyboardInterrupt()))
+        with self.assertRaises(KeyboardInterrupt):
+            builder.build_hourly(12)
+        builder = self.make_builder(weather=ExplodingWeather(SystemExit(0)))
+        with self.assertRaises(SystemExit):
+            builder.build_hourly(12)
+
+    # -- 時刻アナウンス ---------------------------------------------------------
+    def test_a_typo_in_announce_template_falls_back_to_the_default_wording(self):
+        # {hours} は存在しない置換名（正しくは {hour} / {hour_reading}）。
+        self.config.data["time_signal"]["announce_template"] = "{period}{hours}をお知らせしました。"
+        with logs_enabled("chime.sequence", "ERROR") as captured:
+            plan = self.make_builder().build_hourly(11)
+        self.assert_time_signal_first(plan)
+        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+        self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
+        self.assertIsNotNone(plan.quote)
+        self.assertTrue(any("announce_template" in w or "時刻アナウンス" in w
+                            for w in plan.warnings))
+        self.assertTrue(any("KeyError" in line for line in captured.output))
+
+    def test_announce_template_errors_of_every_kind_fall_back(self):
+        broken = {
+            "KeyError": "{period}{hours}をお知らせしました。",
+            "IndexError": "{0}をお知らせしました。",
+            "ValueError": "{period}{hour_reading をお知らせしました。",
+        }
+        for kind, template in broken.items():
+            with self.subTest(kind=kind):
+                self.config.data["time_signal"]["announce_template"] = template
+                plan = self.make_builder().build_hourly(11)
+                self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+                self.assertTrue(any(kind in w for w in plan.warnings))
+
+    def test_a_typo_in_noon_template_falls_back_to_the_default_wording(self):
+        self.config.data["time_signal"]["noon_template"] = "{noon}をお知らせしました。"
+        plan = self.make_builder().build_hourly(12)
+        self.assertIn("正午をお知らせしたのだ。", plan.spoken)
+        self.assertTrue(plan.warnings)
+
+    def test_the_fallback_wording_is_read_with_the_default_hour_readings(self):
+        # 既定の設定で作り直すので、4 時は「よじ」など既定の読みになる。
+        self.config.data["time_signal"]["announce_template"] = "{oops}"
+        self.config.data["time_signal"]["hour_readings"] = {"4": "誤読"}
+        plan = self.make_builder().build_hourly(16)
+        self.assertIn("午後よじをお知らせしたのだ。", plan.spoken)
+
+    def test_a_valid_custom_announce_template_is_still_used(self):
+        # フォールバックは書き間違いのときだけ。正しい独自文言はそのまま使う。
+        self.config.data["time_signal"]["announce_template"] = "{period}{hour}時なのだ。"
+        plan = self.make_builder().build_hourly(11)
+        self.assertIn("午前11時なのだ。", plan.spoken)
+        self.assertEqual(plan.warnings, [])
+
+    def test_announce_failure_other_than_template_keeps_the_other_parts(self):
+        # 合成が想定外の例外を出しても、時報音と（別の部品の）天気・ひとこと
+        # の組み立ては続く。ここでは全部が同じ合成を通るので、時報音だけが残る。
+        plan = self.make_builder(tts=ExplodingTTS(self.tmp.name)).build_hourly(11)
+        self.assertEqual(len(plan.segments), 1)
+        self.assert_time_signal_first(plan)
+        self.assertTrue(plan.warnings)
+
+    # -- 時報音 -------------------------------------------------------------
+    def test_failed_generation_uses_the_existing_time_signal_file(self):
+        os.makedirs(os.path.dirname(self.time_signal), exist_ok=True)
+        with open(self.time_signal, "wb") as handle:
+            handle.write(b"RIFF")
+        with mock.patch("chime.timesignal.ensure_time_signal",
+                        side_effect=OSError("ディスクがいっぱい")):
+            with logs_enabled("chime.sequence", "ERROR"):
+                plan = self.make_builder().build_hourly(11)
+        self.assert_time_signal_first(plan)
+        self.assertEqual(plan.segments[0].path, self.time_signal)
+        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+        self.assertEqual(len(plan.segments), 3)
+
+    def test_failed_generation_without_a_file_still_speaks(self):
+        # 時報音のファイルが無いまま必須セグメントを積むと、再生時に
+        # PlaybackError になって放送全体が消える。積まずに、読み上げだけ鳴らす。
+        self.assertFalse(os.path.exists(self.time_signal))
+        with mock.patch("chime.timesignal.ensure_time_signal",
+                        side_effect=OSError("書き込めません")):
+            with logs_enabled("chime.sequence", "ERROR") as captured:
+                plan = self.make_builder().build_hourly(11)
+        self.assertFalse(any("時報音" in label for label in self.labels(plan)))
+        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+        self.assertIsNotNone(plan.quote)
+        self.assertEqual(len(plan.segments), 2)
+        self.assertTrue(any("音源ファイルが見つかりません: {0}".format(self.time_signal) in line
+                            for line in captured.output))
+        self.assertTrue(any("音源ファイルが見つかりません" in w for w in plan.warnings))
+
+    def test_a_missing_time_signal_is_not_a_required_segment(self):
+        # 上のプランが実際に PlaybackError にならず再生できること。
+        from chime.audio import Player
+
+        played = []
+
+        class Recorder(Player):
+            name = "recorder"
+
+            def play_one(self, segment):
+                played.append(segment.path)
+
+        with mock.patch("chime.timesignal.ensure_time_signal", side_effect=OSError("x")):
+            plan = self.make_builder().build_hourly(11)
+        self.assertEqual(Recorder({}).play(plan.segments), 2)
+        self.assertEqual(len(played), 2)
+
+    def test_time_signal_generation_failure_is_logged_as_an_error(self):
+        with mock.patch("chime.timesignal.ensure_time_signal",
+                        side_effect=OSError("書き込めません")):
+            with logs_enabled("chime.sequence", "ERROR") as captured:
+                self.make_builder().build_hourly(11)
+        self.assertTrue(any("書き込めません" in line for line in captured.output))
+
+
+class DegradeClosingTest(BuilderTestCase):
+    def announce_path(self):
+        return self.config.path("closing.announce_file")
+
+    def music_path(self):
+        return self.config.path("closing.music_file")
+
+    def test_music_still_plays_when_the_announcement_is_missing(self):
+        os.remove(self.announce_path())
+        with logs_enabled("chime.sequence", "ERROR") as captured:
+            plan = self.make_builder().build_closing()
+        self.assertEqual(len(plan.segments), 1)
+        self.assertIn("蛍の光", plan.segments[0].label)
+        self.assertEqual(plan.segments[0].fade_in_ms, 2000)
+        self.assertTrue(any("音源ファイルが見つかりません: {0}".format(self.announce_path())
+                            in line for line in captured.output))
+        self.assertTrue(any("音源ファイルが見つかりません" in w for w in plan.warnings))
+
+    def test_announcement_still_plays_when_the_music_is_missing(self):
+        os.remove(self.music_path())
+        with logs_enabled("chime.sequence", "ERROR") as captured:
+            plan = self.make_builder().build_closing()
+        self.assertEqual(len(plan.segments), 1)
+        self.assertIn("閉館アナウンス", plan.segments[0].label)
+        self.assertTrue(any("音源ファイルが見つかりません: {0}".format(self.music_path())
+                            in line for line in captured.output))
+
+    def test_both_missing_gives_an_empty_plan_without_raising(self):
+        os.remove(self.announce_path())
+        os.remove(self.music_path())
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.segments, [])
+        self.assertEqual(len(plan.warnings), 2)
+
+    def test_an_unset_file_is_skipped_silently_as_before(self):
+        # 空文字列は「設定しない」の意味。ファイルが無いのとは違い、警告しない。
+        self.config.data["closing"]["announce_file"] = ""
+        plan = self.make_builder().build_closing()
+        self.assertEqual(len(plan.segments), 1)
+        self.assertEqual(plan.warnings, [])
+
+    def test_a_missing_file_does_not_hide_the_extra_text(self):
+        os.remove(self.announce_path())
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        plan = self.make_builder().build_closing()
+        self.assertEqual(len(plan.segments), 2)
+        self.assertIn("本日もご利用ありがとうございました。", plan.spoken)
+
+    def test_a_broken_extra_text_keeps_the_announcement_and_the_music(self):
+        self.config.data["closing"]["extra_text"] = "追加のお知らせなのだ。"
+        plan = self.make_builder(tts=ExplodingTTS(self.tmp.name)).build_closing()
+        self.assertEqual(len(plan.segments), 2)
+        self.assertIn("閉館アナウンス", plan.segments[0].label)
+        self.assertIn("蛍の光", plan.segments[1].label)
+        self.assertTrue(any("追加アナウンス" in w and "この部分だけ飛ばします" in w
+                            for w in plan.warnings))
+
+    def test_a_broken_fade_in_setting_still_plays_the_music(self):
+        for value in ("ゆっくり", [2000]):
+            with self.subTest(value=value):
+                self.config.data["audio"]["fade_in_ms"] = value
+                plan = self.make_builder().build_closing()
+                self.assertEqual(len(plan.segments), 2)
+                self.assertIn("蛍の光", plan.segments[1].label)
+                self.assertEqual(plan.segments[1].fade_in_ms, 0)
+                self.assertTrue(any("フェードイン" in w for w in plan.warnings))
+
+    def test_the_normal_closing_plan_has_no_warnings(self):
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.warnings, [])
+
+
+class BuildMinimalTest(BuilderTestCase):
+    """組み立て全体が失敗したときの、最小のプラン。"""
+
+    def event(self, kind):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        from chime.scheduler import Event
+
+        moment = datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        key = "hourly:12" if kind == "hourly" else "closing"
+        return Event(key=key, kind=kind, hour=12, minute=0,
+                     at=moment, play_at=moment, prepare_at=moment)
+
+    def test_hourly_is_the_time_signal_only(self):
+        weather = StubWeather()
+        plan = self.make_builder(weather=weather).build_minimal(self.event("hourly"))
+        self.assertEqual(len(plan.segments), 1)
+        self.assertIn("時報音", plan.segments[0].label)
+        self.assertEqual(plan.segments[0].path, self.time_signal)
+        self.assertEqual(plan.spoken, [])
+        self.assertIsNone(plan.quote)
+        self.assertEqual(weather.calls, 0)
+        self.assertEqual(self.tts.texts, [])
+
+    def test_hourly_ignores_a_broken_announce_template(self):
+        self.config.data["time_signal"]["announce_template"] = "{hours}"
+        plan = self.make_builder().build_minimal(self.event("hourly"))
+        self.assertEqual(len(plan.segments), 1)
+        self.assertEqual(plan.warnings, [])
+
+    def test_hourly_generates_the_time_signal_if_needed(self):
+        self.assertFalse(os.path.exists(self.time_signal))
+        self.make_builder().build_minimal(self.event("hourly"))
+        self.assertTrue(os.path.exists(self.time_signal))
+
+    def test_hourly_without_any_time_signal_is_an_empty_plan(self):
+        with mock.patch("chime.timesignal.ensure_time_signal", side_effect=OSError("x")):
+            plan = self.make_builder().build_minimal(self.event("hourly"))
+        self.assertEqual(plan.segments, [])
+        self.assertTrue(plan.warnings)
+
+    def test_closing_is_the_announcement_and_the_music_only(self):
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        plan = self.make_builder().build_minimal(self.event("closing"))
+        self.assertEqual(len(plan.segments), 2)
+        self.assertIn("閉館アナウンス", plan.segments[0].label)
+        self.assertIn("蛍の光", plan.segments[1].label)
+        self.assertEqual(plan.spoken, [])
+        self.assertEqual(self.tts.texts, [])
+        self.assertEqual(self.weather.calls, 0)
+
+    def test_closing_skips_only_the_missing_file(self):
+        os.remove(self.config.path("closing.announce_file"))
+        plan = self.make_builder().build_minimal(self.event("closing"))
+        self.assertEqual(len(plan.segments), 1)
+        self.assertIn("蛍の光", plan.segments[0].label)
+
+    def test_closing_plays_the_music_even_with_a_broken_fade_in(self):
+        self.config.data["audio"]["fade_in_ms"] = "ゆっくり"
+        plan = self.make_builder().build_minimal(self.event("closing"))
+        self.assertEqual(len(plan.segments), 2)
+        self.assertEqual(plan.segments[1].fade_in_ms, 0)
+
+    def test_the_event_is_kept_on_the_plan(self):
+        event = self.event("hourly")
+        self.assertIs(self.make_builder().build_minimal(event).event, event)
+
+    def test_never_touches_the_state_or_the_quotes(self):
+        builder = self.make_builder()
+        builder.quotes = ExplodingQuotes(RuntimeError("呼ばれてはいけない"))
+        with mock.patch.object(self.state, "remember_quote") as remember:
+            builder.build_minimal(self.event("hourly"))
+            builder.build_minimal(self.event("closing"))
+        remember.assert_not_called()
+        self.assertEqual(builder.quotes.calls, 0)
+
+    def test_an_unknown_kind_is_an_empty_plan(self):
+        event = self.event("hourly")
+        event = event.__class__(**dict(event.__dict__, kind="mystery"))
+        plan = self.make_builder().build_minimal(event)
+        self.assertEqual(plan.segments, [])
+
+
 class BuildTextTest(BuilderTestCase):
     def test_single_segment(self):
         plan = self.make_builder().build_text("テストです。")
@@ -445,6 +927,13 @@ class BuildTextTest(BuilderTestCase):
     def test_describe_includes_warnings(self):
         plan = self.make_builder(tts=StubTTS(self.tmp.name, fail=True)).build_text("だめ")
         self.assertIn("警告", plan.describe())
+
+    def test_warning_names_the_silent_phrase(self):
+        # どの文が無音になったかがログだけで分かること（TTSError の文言には
+        # 文そのものが入らないため）。
+        plan = self.make_builder(tts=StubTTS(self.tmp.name, fail=True)).build_text("だめなのだ。")
+        self.assertEqual(len(plan.warnings), 1)
+        self.assertIn("を合成できませんでした（「だめなのだ。」）", plan.warnings[0])
 
 
 class BuildDispatchTest(BuilderTestCase):

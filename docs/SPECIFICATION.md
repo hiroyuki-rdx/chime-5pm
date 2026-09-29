@@ -1,8 +1,8 @@
 # キャンパス時報システム 仕様書
 
 **プロジェクト名:** Campus Chime System
-**バージョン:** 5.2.0
-**対応要件定義:** `docs/REQUIREMENTS.md` v5.2.0
+**バージョン:** 5.3.0
+**対応要件定義:** `docs/REQUIREMENTS.md` v5.3.0
 **作成日:** 2026/08/26
 
 ---
@@ -437,6 +437,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
     沈黙せず、ここでひとことへ切り替えるとひとことが 2 つ流れてしまう
   - `mode="choice"` → 警告を記録し、`fallback_to_quote` ならひとことへ
 - 音声合成失敗 → 当該セグメントを落として続行（**時報音そのものは必ず鳴る**）
+- 組み立て中の想定外の例外（通信の途中切断、読み上げ文のテンプレートの書き間違いなど）→ 部品ごとに縮退し、**時報音は必ず鳴る**。時刻アナウンスのテンプレートを書き間違えたときは既定の文言で読む（8 章）
 
 ### 4.10 `chime/app.py`（責務: 全体の組み立てと常駐ループ）
 
@@ -460,7 +461,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 [state.json に再生済みを記録] ─────────┘
 ```
 
-- `SIGTERM` / `SIGINT` で `stop_event` を立て、待機を打ち切って正常終了する（`systemctl stop` に即応）
+- `SIGTERM` / `SIGINT` で `stop_event` を立てる。**待機中は待機を打ち切って正常終了する**（`systemctl stop` に即応）。**再生中は止まらず**、再生が終わってから終了する。閉館放送の蛍の光の途中で停止・再起動すると、systemd が約 90 秒後（`TimeoutStopSec` の既定値。ユニットでは変更していない）に強制終了する（今後の版で改善予定）
 - イベント処理中の例外は捕捉し、当該回を再生済みとして記録したうえで常駐を継続する（無限リトライを避ける）
 - 再生バックエンドは初回参照時に決定する（`--schedule` 等で不要な警告を出さないため）
 
@@ -473,17 +474,19 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 | `--test-hourly [HOUR]` | 時報を即時再生（省略時は現在時刻） |
 | `--test` | 閉館放送を即時再生 |
 | `--test-all` | 時報 → 閉館放送 |
-| `--say TEXT` | 任意文言の読み上げ |
+| `--say TEXT` | 任意文言の読み上げ。作り置きに無い文言は「作り置きにありません。Pi では無音」と近い文言の候補を表示する |
 | `--weather` | 天気予報の URL と読み上げ文を表示（`--dry-run` でなければ読み上げも） |
 | `--generate-assets` | 時報音を生成し、時刻アナウンスの音声を用意できるか確認 |
 | `--print-config` | 適用中の設定を JSON で表示 |
 | `--config PATH` | 設定ファイルの明示指定 |
 | `--backend {auto,pygame,command,mock}` | 再生バックエンドの強制 |
-| `--dry-run` | 音を出さず内容のみ表示 |
+| `--dry-run` | 音を出さず内容のみ表示（`cache/state.json` は書き換えない） |
 | `--log-level LEVEL` | ログレベル |
 | `--version` | バージョン表示 |
 
-終了コード: `0` 正常 / `1` 実行時エラー（`--weather` での天気取得失敗、`--generate-assets` で時刻アナウンスの音声を用意できなかった場合、`--say`・`--test-hourly`・`--test`・`--test-all` で実行した再生がすべて失敗した場合。ここでいう失敗とは、再生対象のセグメントを 1 つも用意できなかった場合と、音源ファイルの欠落など再生時のエラーにより 1 つも鳴らせなかった場合の両方を指す（`ChimeApp.play()` の戻り値で判定する）。`--test-hourly`・`--test-all` は時報と閉館放送を続けて再生するため、どちらか一方でも鳴れば `0`（時報音は合成不要のため必ず鳴り、おまけの読み上げのみが失敗した場合も `0` のまま）。`--dry-run` 指定時は実際の再生を行わず常に成功として扱うため、この判定の対象にならない。おまけの天気予報の取得に失敗しても、他のセグメントが鳴っていればエラー扱いしない）/ `2` 引数・設定エラー（`--say` に空文字列や空白のみを渡した場合を含む）。
+終了コード: `0` 正常 / `1` 実行時エラー（`--weather` での天気取得失敗、`--generate-assets` で時刻アナウンスの音声を用意できなかった場合、`--say`・`--test-hourly`・`--test`・`--test-all` で実行した再生がすべて失敗した場合。ここでいう失敗とは、再生対象のセグメントを 1 つも用意できなかった場合と、音源ファイルの欠落など再生時のエラーにより 1 つも鳴らせなかった場合の両方を指す（`ChimeApp.play()` の戻り値で判定する）。`--test-hourly`・`--test-all` は時報と閉館放送を続けて再生するため、どちらか一方でも鳴れば `0`（時報音は合成不要のため必ず鳴り、おまけの読み上げのみが失敗した場合も `0` のまま）。`--dry-run` 指定時は実際の再生を行わず常に成功として扱うため、この判定の対象にならない。おまけの天気予報の取得に失敗しても、他のセグメントが鳴っていればエラー扱いしない）/ `2` 引数・設定エラー（`--say` に空文字列や空白のみを渡した場合、UTF-8 以外で保存された `config.json` を含む。8 章）。
+
+`--dry-run` や `--test-hourly` などの試し鳴らしは、`cache/state.json` を書き換えない（ひとこと履歴が進まない）。
 
 ログのタイムスタンプは `timezone` 設定に合わせて表示する（ハンドラのフォーマッタに変換関数を差し替える）。
 
@@ -578,6 +581,11 @@ WantedBy=multi-user.target
 | 音源ファイル欠落（必須） | `PlaybackError`。ERROR ログを出し、当該回をスキップ（プロセスは継続）。`--say`/`--test-hourly`/`--test`/`--test-all` から実行した場合は、この失敗が `ChimeApp.play()` の戻り値に反映され、終了コードにも影響する（4.11 章） |
 | 音源ファイル欠落（任意） | WARNING ログを出し、そのセグメントのみスキップ |
 | 音声合成の全エンジン失敗 | ERROR ログ。当該セグメントを落として残りを再生（**時報音は鳴る**） |
+| 組み立て中の想定外の例外（通信の途中切断、読み上げ文のテンプレートの書き間違いなど） | ERROR ログ。**部品ごとに縮退**する。失敗した部品（時刻アナウンス・天気・ひとことなど）だけを落として残りを組み立て、**時報音は必ず鳴る**。時刻アナウンスのテンプレートを書き間違えたときは、既定の文言で読む |
+| 組み立て全体の失敗 | 最小構成で再生する（時報音は鳴る） |
+| 閉館放送の一方の欠落（アナウンスか蛍の光のどちらかを用意できない） | ログに記録し、欠けた側だけを落として、残りは鳴らす |
+| `config.json` の文字コード不正（UTF-8 以外。Shift_JIS など） | 「UTF-8 で保存し直して」と日本語で案内し、**終了コード 2** で終了する（常駐は systemd が 10 秒ごとに再起動を繰り返すが、journal に原因が出る。以前は Python のトレースバックだけだった）。BOM 付き UTF-8 は読める。`python3 campus_chime.py --print-config` で確認できる |
+| 廃止予定の設定キー（`extra_segment.mode` / `weather_probability` / `always_weather_hours` / `always_quote_hours` / `fallback_to_quote`、`weather.provider` / `jma` / `max_weather_chars`） | 起動時に WARNING ログ（「v6.0.0 で廃止予定」）。動作は変えない |
 | 天気取得失敗 | WARNING ログ。既定（`mode="both"`）は天気だけ飛ばす（ひとことは元から流れる）。`mode="choice"` のときだけ `fallback_to_quote` に従いひとことへ切り替え |
 | ひとこと定義ファイル欠落・破損 | WARNING ログ。内蔵の予備文言を使用 |
 | 状態ファイル破損 | WARNING ログ。初期状態として扱う |
@@ -599,12 +607,15 @@ WantedBy=multi-user.target
 | WARNING | 追いかけ再生、天気取得失敗、任意音源の欠落、予定なし |
 | ERROR | 依存欠落、必須音源の欠落、音声合成失敗、再生例外 |
 
+systemd 配下で動かしているときは、ログの各行に重大度の接頭辞が付き、`journalctl -p` で重大度による絞り込みができる（v5.3.0 から。それ以前は全行が同じ重大度で、`-p err` は常に空だった）。
+
 参照方法:
 
 ```bash
-journalctl -u campus_chime.service -f            # 追尾
-journalctl -u campus_chime.service --since today # 本日分
-journalctl -u campus_chime.service -p err        # エラーのみ
+journalctl -u campus_chime.service -f               # 追尾
+journalctl -u campus_chime.service --since today    # 本日分
+journalctl -u campus_chime.service -p err           # エラーのみ（v5.3.0 から有効。それ以前は常に空だった）
+journalctl -u campus_chime.service -p warning       # 警告も見るなら（警告以上）
 ```
 
 ---
@@ -632,8 +643,12 @@ python3 -m unittest discover -s tests -t . -v
 | `tests/test_audio.py` | 再生順序、デバイス解放、バックエンド選択 |
 | `tests/test_app.py` | 常駐ループ、停止要求、例外時の継続 |
 | `tests/test_cli.py` | 引数解釈、終了コード、環境判定 |
+| `tests/test_jsonfile.py` | JSON の読み書き（BOM 付き UTF-8、UTF-8 以外の案内、構文エラーの行・桁とヒント、一時ファイル経由の書き込み） |
+| `tests/test_logsetup.py` | journal への重大度の接頭辞（`JOURNAL_STREAM` が一致するときだけ全行に付く）、ハンドラの重複防止 |
+| `tests/test_generate_voicevox.py` | 作り置き生成スクリプト（`--config` の文言と既定の文言の和集合、`--prune` で残す文言、合成に失敗した文言を manifest に書かないこと） |
+| `tests/test_docs.py` | 文書の記載と実装の一致（文書中の `--say` の例が作り置きにあること、README・要求定義書・仕様書の版が `chime/__init__.py` の `__version__` と一致すること） |
 
-CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`scripts/generate_voicevox.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
+CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ。「CLI が起動すること」の `--test-hourly 12` は、実際の通信をしないよう `--config tests/fixtures/offline_config.json`（天気を無効にした設定）を渡す）。別ジョブ（`lint`。Python 3.11 のみ）で `pyflakes`（版を固定してインストールする）を `python -m pyflakes chime scripts tests campus_chime.py` で実行する。ワークフロー全体の権限は `contents: read` だけで、同じ ref の古い実行は新しい実行が始まると止める（`concurrency`）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`scripts/generate_voicevox.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
 
 手元で `prerecorded-only` ジョブと同じ検証をするには、`.github/workflows/ci.yml` のコマンドをそのまま実行する（`cache/tts/` を消してから実行すると、キャッシュ済みの合成結果に隠れず確実に検証できる）。
 
@@ -671,6 +686,8 @@ CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自�
 | 一時停止 | `sudo systemctl stop campus_chime.service` |
 | 自動起動解除 | `sudo systemctl disable campus_chime.service` |
 | 時報音の再生成（時報音の設定を変えたとき） | `python3 campus_chime.py --generate-assets` |
+
+> **運用上の注意:** **16:55〜17:02（閉館放送の前後）は、更新・再起動・停止をしない。** 待機中は停止要求にすぐ応じるが、再生中は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了する（4.10 章。今後の版で改善予定）。
 
 ---
 

@@ -6,18 +6,22 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import unittest
+import urllib.error
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta
 from unittest import mock
+from urllib.parse import urlparse
 
 from tests.support import REPO_ROOT  # noqa: F401
 
 from chime import env
 from chime.audio import Segment
-from chime.cli import build_parser, run
+from chime.cli import EPILOG, build_parser, run
 from chime.sequence import PlaybackPlan
+from chime.tts import TTSError
 from chime.weather import WeatherError
 
 
@@ -43,6 +47,28 @@ def call(argv):
         root.removeHandler(handler)
         root.setLevel(previous_level)
     return code, buffer.getvalue()
+
+
+def call_split(argv):
+    """CLI を実行し、(終了コード, 標準出力, 標準エラー出力) を返す。
+
+    ``call`` と違い、ログのハンドラを足さない。``run`` が自分でログを設定する
+    ところ（出力先は、そのときの標準出力）まで含めて確かめたいときに使う。
+    ルートロガーの状態は実行のあとで元に戻す。
+    """
+    out, err = io.StringIO(), io.StringIO()
+    root = logging.getLogger()
+    handlers, previous_level = root.handlers[:], root.level
+    root.handlers[:] = []
+    logging.disable(logging.NOTSET)
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            code = run(argv)
+    finally:
+        logging.disable(logging.CRITICAL)
+        root.handlers[:] = handlers
+        root.setLevel(previous_level)
+    return code, out.getvalue(), err.getvalue()
 
 
 class ParserTest(unittest.TestCase):
@@ -335,6 +361,136 @@ class RunTest(unittest.TestCase):
             code, output = call(["--config", path, "--test-hourly", "10", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("合成できませんでした", output)
+
+
+    # -- 設定エラー ------------------------------------------------------
+    def test_shift_jis_config_returns_2_with_utf8_guidance(self):
+        """メモ帳で Shift_JIS のまま保存した config.json は、生の例外ではなく
+        「UTF-8 で保存し直す」案内を標準エラー出力へ出して 2 を返すこと。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "wb") as handle:
+                handle.write('{"_comment": "設定"}'.encode("shift_jis"))
+            code, stdout, stderr = call_split(["--config", path, "--schedule"])
+        self.assertEqual(code, 2)
+        self.assertIn("設定エラー", stderr)
+        self.assertIn("UTF-8", stderr)
+        self.assertNotIn("Traceback", stderr)
+        self.assertEqual(stdout, "")
+
+    def test_config_warnings_have_timestamp_and_level(self):
+        """設定を読み込むときの警告（廃止予定のキーなど）にも、時刻とレベルが付くこと。
+
+        ログ設定は設定を読んだあとに確定するため、読み込み中の警告は
+        仮の設定（既定値）で出す。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"extra_segment": {"mode": "both"}}, handle)
+            code, stdout, stderr = call_split(["--config", path, "--schedule", "1"])
+        self.assertEqual(code, 0)
+        lines = [line for line in stdout.splitlines() if "廃止予定" in line]
+        self.assertEqual(len(lines), 1, stdout)
+        self.assertRegex(lines[0], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.* - WARNING - ")
+
+    def test_print_config_keeps_stdout_pure_json_even_with_warnings(self):
+        """``--print-config`` の出力をファイルへ保存しても JSON のままであること
+        （設定を読むときの警告は標準エラー出力へ出す）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"extra_segment": {"mode": "both"}}, handle)
+            code, stdout, stderr = call_split(["--config", path, "--print-config"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(stdout)["extra_segment"]["mode"], "both")
+        self.assertIn("廃止予定", stderr)
+
+    def test_log_level_option_applies_to_config_warnings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"extra_segment": {"mode": "both"}}, handle)
+            code, stdout, stderr = call_split(["--config", path, "--schedule", "1",
+                                               "--log-level", "ERROR"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("廃止予定", stdout + stderr)
+
+    # -- --say の案内 ----------------------------------------------------
+    def test_epilog_say_example_is_prerecorded(self):
+        """ヘルプの ``--say`` の例は、そのまま試して鳴らせる文言（作り置きにある文）であること。"""
+        example = re.search(r"--say (\S+)", EPILOG).group(1)
+        manifest = os.path.join(REPO_ROOT, "assets", "voice", "manifest.json")
+        with open(manifest, encoding="utf-8") as handle:
+            phrases = json.load(handle)
+        self.assertEqual(example, "正午をお知らせしたのだ。")
+        self.assertIn(example, phrases)
+
+    def test_say_prerecorded_phrase_has_no_warning(self):
+        code, output = call(["--say", "正午をお知らせしたのだ。", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("作り置き（assets/voice/）にこの文言がありません", output)
+
+    def test_say_unknown_phrase_shows_candidates_and_guidance(self):
+        """作り置きに無い文言は、Pi では無音になることと、近い文言・作り直しの案内を出す。
+        そのうえで従来どおり再生を試みる（PC で VOICEVOX が動いていれば鳴る）。"""
+        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, stdout, stderr = call_split(
+                ["--say", "正午をお知らせしますのだ。", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("作り置き（assets/voice/）にこの文言がありません。Pi では無音になります。", stderr)
+        candidates = [line for line in stderr.splitlines() if "近い文言" in line]
+        self.assertEqual(len(candidates), 1, stderr)
+        self.assertIn("正午をお知らせしたのだ。", candidates[0])
+        self.assertIn("docs/SETUP.md 8 章", stderr)
+        # 従来どおり再生（この場合は dry-run の表示）まで進む
+        self.assertIn("dry-run", stdout)
+
+    def test_say_unknown_phrase_without_close_match_omits_candidates(self):
+        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, stdout, stderr = call_split(["--say", "Qwerty", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("作り置き（assets/voice/）にこの文言がありません", stderr)
+        self.assertNotIn("近い文言", stderr)
+        self.assertIn("docs/SETUP.md 8 章", stderr)
+
+    def test_say_unknown_phrase_keeps_exit_code_when_synthesis_fails(self):
+        """案内を出しても終了コードの決まり方は変わらない（合成も再生もできなければ 1）。"""
+        with mock.patch("chime.tts.TTSService.synthesize", side_effect=TTSError("失敗")):
+            code, stdout, stderr = call_split(
+                ["--say", "正午をお知らせしますのだ。", "--backend", "mock"])
+        self.assertEqual(code, 1)
+        self.assertIn("この文言がありません", stderr)
+        self.assertIn("合成できませんでした", stdout)
+
+    # -- CI と同じ引数 ---------------------------------------------------
+    def test_ci_hourly_command_does_not_call_the_weather_api(self):
+        """CI の「CLI が起動すること」と同じ引数（天気を無効にした設定を渡す）では、
+        12 時の時報でも天気 API へ通信しないこと。天気を無効にし忘れると、CI が
+        Open-Meteo の障害や遅延の影響を受けてしまう。
+
+        ``--test-hourly`` は起動時に VOICEVOX ENGINE の有無を同じ PC 内
+        （127.0.0.1）へ問い合わせる。それは想定内なので、動いていないものとして
+        失敗を返し、それ以外の通信が一切ないことを確かめる。
+        """
+        offline = os.path.join(REPO_ROOT, "tests", "fixtures", "offline_config.json")
+        urls = []
+
+        def fake_urlopen(request, *args, **kwargs):
+            url = request if isinstance(request, str) else request.full_url
+            urls.append(url)
+            if urlparse(url).hostname in ("127.0.0.1", "localhost"):
+                raise urllib.error.URLError("VOICEVOX ENGINE は動いていません")
+            raise AssertionError("外部へ通信しようとした: {0}".format(url))
+
+        with mock.patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            code, output = call(["--test-hourly", "12", "--dry-run", "--backend", "mock",
+                                 "--config", offline])
+        self.assertEqual(code, 0, output)
+        external = [url for url in urls if urlparse(url).hostname not in ("127.0.0.1", "localhost")]
+        self.assertEqual(external, [])
 
 
 class EnvironmentTest(unittest.TestCase):

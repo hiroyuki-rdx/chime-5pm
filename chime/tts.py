@@ -19,7 +19,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import os
 import threading
@@ -27,6 +26,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Mapping, Optional
+
+from .jsonfile import JsonFileError, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -82,14 +83,14 @@ class PrerecordedEngine(TTSEngine):
         if self._manifest is None:
             path = os.path.join(self.directory, "manifest.json")
             data: Dict[str, str] = {}
-            if os.path.exists(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as handle:
-                        loaded = json.load(handle)
-                    if isinstance(loaded, dict):
-                        data = {str(k): str(v) for k, v in loaded.items()}
-                except (json.JSONDecodeError, OSError) as exc:
-                    logger.warning("assets/voice/manifest.json を読めません: %s", exc)
+            try:
+                loaded = read_json(path)
+            except JsonFileError as exc:
+                if exc.kind != "missing":
+                    logger.warning("作り置きの目録を読めません（空として扱います）: %s", exc)
+            else:
+                if isinstance(loaded, dict):
+                    data = {str(k): str(v) for k, v in loaded.items()}
             self._manifest = data
         return self._manifest
 
@@ -200,6 +201,32 @@ class TTSService:
             parts.append("{0}({1})".format(engine.name, state))
         return ", ".join(parts) or "（エンジンなし）"
 
+    def _prerecorded_engine(self) -> Optional[PrerecordedEngine]:
+        for engine in self.engines:
+            if isinstance(engine, PrerecordedEngine):
+                return engine
+        return None
+
+    def prerecorded_lookup(self, text: str) -> Optional[str]:
+        """作り置きにある文言なら、その WAV のパスを返す（無ければ ``None``）。
+
+        prerecorded エンジンの照合だけで引く。VOICEVOX には問い合わせない
+        ため、エンジンが動いていなくても（Pi 上でも）使える。放送で無音に
+        なる文言かどうかを事前に確かめる用途。
+        """
+        engine = self._prerecorded_engine()
+        text = (text or "").strip()
+        if engine is None or not text:
+            return None
+        return engine.lookup(text)
+
+    def known_phrases(self) -> List[str]:
+        """作り置きの目録（manifest.json）に載っている文言の一覧を返す。"""
+        engine = self._prerecorded_engine()
+        if engine is None:
+            return []
+        return list(engine.manifest())
+
     def synthesize(self, text: str) -> str:
         """文言を読み上げた WAV のパスを返す。全エンジン失敗時は :class:`TTSError`。"""
         text = (text or "").strip()
@@ -207,10 +234,12 @@ class TTSService:
             raise TTSError("読み上げる文言が空です。")
 
         errors: List[str] = []
+        unavailable: List[str] = []
         for engine in self.engines:
             try:
                 if not engine.available():
                     errors.append(engine.name + ": 利用不可")
+                    unavailable.append(engine.name)
                     continue
 
                 existing = engine.lookup(text)
@@ -246,7 +275,15 @@ class TTSService:
             except Exception as exc:  # pragma: no cover - 想定外は次のエンジンへ
                 errors.append("{0}: 予期しないエラー: {1}".format(engine.name, exc))
 
-        raise TTSError("音声合成に失敗しました（" + " / ".join(errors) + "）")
+        detail = " / ".join(errors)
+        if self._prerecorded_engine() is None:
+            raise TTSError("音声合成に失敗しました（" + detail + "）")
+        # 主な原因は「作り置きに無い」こと。Pi では VOICEVOX ENGINE が動いて
+        # いないのが正常なので、そちらは補足に留める。
+        summary = "作り置き（assets/voice/）にこの文言がありません"
+        if "voicevox" in unavailable:
+            summary += "（VOICEVOX ENGINE も使えません。Pi ではこれが正常）"
+        raise TTSError("{0}。エンジンごとの詳細: {1}".format(summary, detail))
 
     def _cache_path(self, engine: TTSEngine, text: str) -> str:
         return os.path.join(self.cache_dir, _digest(engine.voice_id(), text) + ".wav")

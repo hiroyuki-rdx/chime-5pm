@@ -16,6 +16,7 @@ VOICEVOX ENGINE は Raspberry Pi 3B 上で常時動かすには重いため、
     python3 scripts/generate_voicevox.py
     python3 scripts/generate_voicevox.py --base-url http://192.168.1.10:50021
     python3 scripts/generate_voicevox.py --speaker 3 --include-quotes
+    python3 scripts/generate_voicevox.py --config pi-config.json --include-quotes --prune
 
 Docker で VOICEVOX ENGINE を起動した直後はモデル読み込みのため
 ``/version`` がしばらく応答しないことがある。既定では起動を最大 90 秒
@@ -28,6 +29,18 @@ WAV を削除する（``--include-quotes`` の有無に関わらず、ひとこ�
 として残す）。既定は off で、誤って消さないよう明示的に指定した場合のみ動く::
 
     python3 scripts/generate_voicevox.py --include-quotes --prune
+
+Pi の ``config.json`` で文言を足している（地点を増やした、ひとことのファイルを
+差し替えたなど）場合は、その ``config.json`` を PC に持ってきて ``--config`` で
+渡す。生成する文言は「``--config`` の設定の文言」に「既定設定の文言」を足した
+もの（和集合）になる。``config.json`` の配列は既定値を丸ごと置き換えるため
+（例: 地点に京都だけを書くと既定の大津が外れる）、既定設定の文言は常に含めて、
+同梱の作り置きを崩さないようにしている。``--prune`` で残す文言も同じ和集合で
+判定する。``--config`` なしで ``--prune`` を付けると、Pi の ``config.json`` で
+足した文言の作り置きは消える（警告を出す）::
+
+    scp pi@<Pi のホスト名>:/home/pi/campus-chime/config.json ./pi-config.json
+    python3 scripts/generate_voicevox.py --config pi-config.json --include-quotes --prune
 
 生成後は ``assets/voice/`` を git add してコミットし、Pi 側で git pull する。
 """
@@ -43,7 +56,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from chime import timesignal, weather  # noqa: E402
-from chime.config import load_config  # noqa: E402
+from chime.config import BASE_DIR, DEFAULT_CONFIG, Config, ConfigError, load_config  # noqa: E402
 from chime.quotes import load_quotes  # noqa: E402
 from chime.tts import TTSError, VoicevoxEngine, _digest  # noqa: E402
 
@@ -77,6 +90,16 @@ def wait_for_engine(engine: VoicevoxEngine, wait_seconds: float) -> bool:
             return True
 
 
+def _unique(phrases) -> list:
+    """空でない文言を、最初に現れた順のまま重複なしで返す。"""
+    seen, unique = set(), []
+    for phrase in phrases:
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            unique.append(phrase)
+    return unique
+
+
 def collect_phrases(config, include_quotes: bool) -> list:
     """事前生成する文言を集める。
 
@@ -106,13 +129,7 @@ def collect_phrases(config, include_quotes: bool) -> list:
             phrases.extend(values)
 
     phrases.extend(weather.prerecord_phrases(config.section("weather")))
-
-    seen, unique = set(), []
-    for phrase in phrases:
-        if phrase and phrase not in seen:
-            seen.add(phrase)
-            unique.append(phrase)
-    return unique
+    return _unique(phrases)
 
 
 def phrases_in_use(config) -> list:
@@ -125,6 +142,28 @@ def phrases_in_use(config) -> list:
     return collect_phrases(config, include_quotes=True)
 
 
+def default_config() -> Config:
+    """既定設定だけの :class:`Config`（現地の ``config.json`` は読まない）。"""
+    return Config(DEFAULT_CONFIG, base_dir=BASE_DIR)
+
+
+def phrases_to_generate(config, include_quotes: bool) -> list:
+    """生成する文言。``config`` の文言に、既定設定の文言を足したもの（和集合）。
+
+    ``config.json`` の配列は既定値を丸ごと置き換える（地点に京都だけを書くと
+    既定の大津が外れる）。``--config`` で渡した設定の文言だけを作ると、
+    同梱の作り置きにある文言が抜けてしまうため、既定設定の文言は常に含める。
+    順序は ``config`` の文言が先で、重複は除く。
+    """
+    return _unique(collect_phrases(config, include_quotes)
+                   + collect_phrases(default_config(), include_quotes))
+
+
+def phrases_to_keep(config) -> list:
+    """``--prune`` で残す文言。``config`` の使用中の文言に、既定設定の分を足したもの。"""
+    return _unique(phrases_in_use(config) + phrases_in_use(default_config()))
+
+
 def find_stale_entries(manifest: dict, keep_phrases) -> list:
     """``manifest`` のうち、``keep_phrases`` に含まれないエントリを列挙する。
 
@@ -135,12 +174,26 @@ def find_stale_entries(manifest: dict, keep_phrases) -> list:
     return [(phrase, filename) for phrase, filename in manifest.items() if phrase not in keep]
 
 
-def main() -> int:
-    config = load_config()
+def main(argv=None) -> int:
+    # --config だけ先に読み、その設定から他のオプションの既定値を決める
+    # （それ以外のオプションは、ここでは読み飛ばす）。
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config")
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    try:
+        config = load_config(pre_args.config)
+    except ConfigError as exc:
+        print("設定エラー: {0}".format(exc), file=sys.stderr)
+        return 2
     voicevox = config.section("tts.voicevox")
 
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", metavar="PATH", default=pre_args.config,
+                        help="設定ファイル（Pi の config.json を PC に持ってきて指定する。"
+                             "その設定の文言に既定設定の文言を足して生成する。"
+                             "既定: リポジトリ直下の config.json があれば読み込む）")
     parser.add_argument("--base-url", default=voicevox.get("base_url", "http://127.0.0.1:50021"),
                         help="VOICEVOX ENGINE の URL")
     parser.add_argument("--speaker", type=int, default=int(voicevox.get("speaker", 3)),
@@ -159,7 +212,7 @@ def main() -> int:
                              "対応する WAV を削除する（--include-quotes の有無に"
                              "関わらず、ひとことは残す。既定 off。誤って消さないよう"
                              "明示的に指定した場合のみ動く）")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     engine = VoicevoxEngine({
         "base_url": args.base_url,
@@ -190,11 +243,15 @@ def main() -> int:
         with open(manifest_path, "r", encoding="utf-8") as handle:
             manifest = json.load(handle)
 
-    phrases = collect_phrases(config, args.include_quotes)
+    phrases = phrases_to_generate(config, args.include_quotes)
     print("{0} 件の文言を生成します（話者 {1}）。".format(len(phrases), args.speaker))
 
-    stale = find_stale_entries(manifest, phrases_in_use(config))
+    stale = find_stale_entries(manifest, phrases_to_keep(config))
     if args.prune:
+        if not args.config:
+            print("警告: --config なしで --prune を指定しています。"
+                  "Pi の config.json で足した文言（地点など）は、"
+                  "--config を付けないと消えます。", file=sys.stderr)
         for phrase, filename in stale:
             path = os.path.join(args.out, filename)
             if os.path.exists(path):
@@ -212,16 +269,19 @@ def main() -> int:
     for phrase in phrases:
         filename = "{0}.wav".format(_digest(phrase))
         path = os.path.join(args.out, filename)
-        manifest[phrase] = filename
         if os.path.exists(path) and not args.force:
+            manifest[phrase] = filename
             print("  skip {0}".format(phrase))
             continue
         try:
             engine.synthesize(phrase, path)
         except TTSError as exc:
+            # 合成できなかった文言は manifest に書かない（WAV が無いのに
+            # エントリだけが manifest に残ってしまうため）。
             print("  NG   {0}: {1}".format(phrase, exc), file=sys.stderr)
             failures += 1
             continue
+        manifest[phrase] = filename
         print("  OK   {0} -> {1}".format(phrase, filename))
 
     with open(manifest_path, "w", encoding="utf-8") as handle:

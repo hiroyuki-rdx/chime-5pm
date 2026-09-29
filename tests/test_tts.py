@@ -7,7 +7,10 @@ import logging
 import os
 import tempfile
 import unittest
+import urllib.error
 from unittest import mock
+
+from tests.support import REPO_ROOT
 
 from chime.tts import (PrerecordedEngine, TTSEngine, TTSError,
                        TTSService, VoicevoxEngine, _digest)
@@ -125,6 +128,58 @@ class ServiceTest(unittest.TestCase):
         leftovers = [name for name in os.listdir(self.cache) if name.endswith(".tmp")]
         self.assertEqual(leftovers, [], "失敗したエンジンの一時ファイルが残っている")
 
+    def _prerecorded_dir(self):
+        """空の作り置きディレクトリ（目録なし）を作って返す。"""
+        directory = os.path.join(self.tmp.name, "voice")
+        os.makedirs(directory)
+        return directory
+
+    def test_error_leads_with_the_missing_prerecorded_phrase(self):
+        # Pi では VOICEVOX ENGINE が動いていないのが正常。「作り置きに無い」が
+        # 主な原因なので、それを先頭に置く。
+        service = TTSService({"engines": ["prerecorded", "voicevox"]}, "/tmp",
+                             self.cache, self._prerecorded_dir())
+        with mock.patch("chime.tts.urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("接続できない")):
+            with self.assertRaises(TTSError) as caught:
+                service.synthesize("これはどこにも作り置きの無い文言です")
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("作り置き（assets/voice/）にこの文言がありません"),
+                        message)
+        self.assertIn("（VOICEVOX ENGINE も使えません。Pi ではこれが正常）", message)
+
+    def test_error_keeps_the_details_of_each_engine(self):
+        service = TTSService({"engines": ["prerecorded", "voicevox"]}, "/tmp",
+                             self.cache, self._prerecorded_dir())
+        with mock.patch("chime.tts.urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("接続できない")):
+            with self.assertRaises(TTSError) as caught:
+                service.synthesize("これはどこにも作り置きの無い文言です")
+        message = str(caught.exception)
+        self.assertIn("prerecorded:", message)
+        self.assertIn("voicevox: 利用不可", message)
+
+    def test_error_does_not_say_voicevox_is_down_when_it_was_up(self):
+        # VOICEVOX が動いていて合成に失敗した場合は「も使えません」と言わない
+        # （原因は別にあるので、エンジンごとの詳細を読んでもらう）。
+        service = make_service([PrerecordedEngine({}, "/tmp", self._prerecorded_dir()),
+                                FakeEngine("voicevox", fail=True)], self.cache)
+        with self.assertRaises(TTSError) as caught:
+            service.synthesize("これはどこにも作り置きの無い文言です")
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("作り置き（assets/voice/）にこの文言がありません"),
+                        message)
+        self.assertNotIn("も使えません", message)
+        self.assertIn("voicevox: わざと失敗", message)
+
+    def test_error_without_prerecorded_engine_does_not_blame_the_recordings(self):
+        service = make_service([FakeEngine("voicevox", available=False)], self.cache)
+        with self.assertRaises(TTSError) as caught:
+            service.synthesize("こんにちは")
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("音声合成に失敗しました"), message)
+        self.assertNotIn("作り置き", message)
+
     def test_describe_lists_engines(self):
         service = make_service([FakeEngine("a"), FakeEngine("b", available=False)], self.cache)
         described = service.describe()
@@ -162,8 +217,11 @@ class ServiceTest(unittest.TestCase):
         # （放送そのものは chime.sequence 側でこの文言だけ落として続く）。
         service = TTSService({"engines": ["prerecorded", "voicevox"]},
                              "/tmp", self.cache, os.path.join(self.cache, "voice"))
-        with self.assertRaises(TTSError):
-            service.synthesize("これはどこにも作り置きの無い文言です")
+        with mock.patch("chime.tts.urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("接続できない")):
+            with self.assertRaises(TTSError) as caught:
+                service.synthesize("これはどこにも作り置きの無い文言です")
+        self.assertIn("作り置き（assets/voice/）にこの文言がありません", str(caught.exception))
 
 
 class PrerecordedEngineTest(unittest.TestCase):
@@ -197,6 +255,75 @@ class PrerecordedEngineTest(unittest.TestCase):
         engine = PrerecordedEngine({}, "/tmp", self.directory)
         self.assertIsNone(engine.lookup("ありません"))
 
+    def test_non_utf8_manifest_does_not_crash(self):
+        # manifest.json が UTF-8 として読めなくても、放送を止めない。
+        # 目録が空扱いになるだけで、ダイジェスト名のファイルは引ける。
+        text = "こんにちは"
+        expected = self._touch(_digest(text) + ".wav")
+        with open(os.path.join(self.directory, "manifest.json"), "wb") as handle:
+            handle.write(json.dumps({"あいさつ": "greeting.wav"},
+                                    ensure_ascii=False).encode("shift_jis"))
+        engine = PrerecordedEngine({}, "/tmp", self.directory)
+        self.assertEqual(engine.manifest(), {})
+        self.assertEqual(engine.lookup(text), expected)
+        self.assertIsNone(engine.lookup("あいさつ"))
+
+    def _load_manifest_capturing_logs(self, engine):
+        """``manifest()`` を呼び、WARNING 以上のログを集めて返す。
+
+        tests/__init__.py がログを抑制しているため、tests/test_sequence.py と
+        同じ手順でこの間だけ一時的に解除する。``assertLogs`` は 1 件も出ないと
+        失敗するので、判定用のダミーを先に出す。
+        """
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs("chime.tts", level="WARNING") as captured:
+                logging.getLogger("chime.tts").warning("dummy")
+                manifest = engine.manifest()
+        finally:
+            logging.disable(logging.CRITICAL)
+        return manifest, [record.getMessage() for record in captured.records
+                          if record.getMessage() != "dummy"]
+
+    def test_non_utf8_manifest_is_a_warning_with_guidance(self):
+        manifest_path = os.path.join(self.directory, "manifest.json")
+        with open(manifest_path, "wb") as handle:
+            handle.write("{\"あいさつ\": \"greeting.wav\"}".encode("shift_jis"))
+        manifest, messages = self._load_manifest_capturing_logs(
+            PrerecordedEngine({}, "/tmp", self.directory))
+        self.assertEqual(manifest, {})
+        self.assertEqual(len(messages), 1)
+        self.assertIn(manifest_path, messages[0])
+        self.assertIn("UTF-8", messages[0])
+
+    def test_broken_manifest_is_treated_as_empty_with_a_warning(self):
+        with open(os.path.join(self.directory, "manifest.json"), "w", encoding="utf-8") as handle:
+            handle.write("{ not json")
+        manifest, messages = self._load_manifest_capturing_logs(
+            PrerecordedEngine({}, "/tmp", self.directory))
+        self.assertEqual(manifest, {})
+        self.assertEqual(len(messages), 1)
+        self.assertIn("1 行", messages[0])
+
+    def test_missing_manifest_is_not_a_warning(self):
+        manifest, messages = self._load_manifest_capturing_logs(
+            PrerecordedEngine({}, "/tmp", self.directory))
+        self.assertEqual(manifest, {})
+        self.assertEqual(messages, [])
+
+    def test_manifest_that_is_not_an_object_is_treated_as_empty(self):
+        with open(os.path.join(self.directory, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(["配列は想定外"], handle, ensure_ascii=False)
+        self.assertEqual(PrerecordedEngine({}, "/tmp", self.directory).manifest(), {})
+
+    def test_utf8_bom_manifest_is_readable(self):
+        path = self._touch("greeting.wav")
+        with open(os.path.join(self.directory, "manifest.json"), "wb") as handle:
+            handle.write(b"\xef\xbb\xbf" + json.dumps(
+                {"こんにちは": "greeting.wav"}, ensure_ascii=False).encode("utf-8"))
+        engine = PrerecordedEngine({}, "/tmp", self.directory)
+        self.assertEqual(engine.lookup("こんにちは"), path)
+
     def test_synthesize_always_raises(self):
         engine = PrerecordedEngine({}, "/tmp", self.directory)
         with self.assertRaises(TTSError):
@@ -209,6 +336,132 @@ class PrerecordedEngineTest(unittest.TestCase):
         service = TTSService({"engines": ["prerecorded"]}, "/tmp",
                              os.path.join(self.directory, "cache"), self.directory)
         self.assertEqual(service.synthesize("こんにちは"), path)
+
+
+class PrerecordedLookupTest(unittest.TestCase):
+    """``TTSService.prerecorded_lookup`` / ``known_phrases``。
+
+    作り置きだけを引き、VOICEVOX には触れない（Pi 上でも、エンジンが
+    動いていなくても、放送で無音になる文言を調べられるようにするため）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.voice = os.path.join(self.tmp.name, "voice")
+        self.cache = os.path.join(self.tmp.name, "cache")
+        os.makedirs(self.voice)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _touch(self, name):
+        path = os.path.join(self.voice, name)
+        with open(path, "wb") as handle:
+            handle.write(b"RIFF")
+        return path
+
+    def _write_manifest(self, manifest):
+        with open(os.path.join(self.voice, "manifest.json"), "w", encoding="utf-8") as handle:
+            json.dump(manifest, handle, ensure_ascii=False)
+
+    def _service(self, engines=("prerecorded", "voicevox")):
+        return TTSService({"engines": list(engines)}, "/tmp", self.cache, self.voice)
+
+    def test_returns_the_path_of_a_phrase_in_the_manifest(self):
+        path = self._touch("greeting.wav")
+        self._write_manifest({"こんにちは": "greeting.wav"})
+        self.assertEqual(self._service().prerecorded_lookup("こんにちは"), path)
+
+    def test_returns_the_path_of_a_digest_named_file(self):
+        path = self._touch(_digest("こんにちは") + ".wav")
+        self.assertEqual(self._service().prerecorded_lookup("こんにちは"), path)
+
+    def test_returns_none_for_an_unknown_phrase(self):
+        self._write_manifest({})
+        self.assertIsNone(self._service().prerecorded_lookup("ありません"))
+
+    def test_returns_none_when_the_listed_file_is_gone(self):
+        self._write_manifest({"こんにちは": "greeting.wav"})
+        self.assertIsNone(self._service().prerecorded_lookup("こんにちは"))
+
+    def test_does_not_use_voicevox(self):
+        self._write_manifest({})
+        service = self._service()
+        with mock.patch("chime.tts.urllib.request.urlopen") as urlopen, \
+                mock.patch.object(VoicevoxEngine, "available") as available, \
+                mock.patch.object(VoicevoxEngine, "synthesize") as synthesize:
+            self.assertIsNone(service.prerecorded_lookup("作り置きに無い文言"))
+        urlopen.assert_not_called()
+        available.assert_not_called()
+        synthesize.assert_not_called()
+
+    def test_does_not_use_any_other_engine(self):
+        self._touch(_digest("こんにちは") + ".wav")
+        other = FakeEngine("voicevox")
+        service = self._service()
+        service.engines.append(other)
+        service.prerecorded_lookup("こんにちは")
+        service.prerecorded_lookup("作り置きに無い文言")
+        self.assertEqual(other.calls, [])
+
+    def test_does_not_create_the_cache_directory(self):
+        self._service().prerecorded_lookup("作り置きに無い文言")
+        self.assertFalse(os.path.exists(self.cache))
+
+    def test_returns_none_without_a_prerecorded_engine(self):
+        self._touch(_digest("こんにちは") + ".wav")
+        self.assertIsNone(self._service(engines=["voicevox"]).prerecorded_lookup("こんにちは"))
+
+    def test_returns_none_when_the_directory_is_missing(self):
+        service = TTSService({"engines": ["prerecorded"]}, "/tmp", self.cache,
+                             os.path.join(self.tmp.name, "nothing"))
+        self.assertIsNone(service.prerecorded_lookup("こんにちは"))
+
+    def test_ignores_surrounding_whitespace_like_synthesize(self):
+        # synthesize は前後の空白を落としてから引く。放送で鳴るかどうかを
+        # 事前に調べる用途なので、同じ扱いにする。
+        path = self._touch(_digest("こんにちは") + ".wav")
+        service = self._service()
+        self.assertEqual(service.prerecorded_lookup("  こんにちは\n"), path)
+        self.assertEqual(service.prerecorded_lookup("  こんにちは\n"),
+                         service.synthesize("  こんにちは\n"))
+
+    def test_empty_text_returns_none(self):
+        service = self._service()
+        self.assertIsNone(service.prerecorded_lookup(""))
+        self.assertIsNone(service.prerecorded_lookup("   "))
+        self.assertIsNone(service.prerecorded_lookup(None))
+
+    def test_known_phrases_lists_the_manifest_in_file_order(self):
+        self._write_manifest({"ふたつめ": "b.wav", "ひとつめ": "a.wav", "みっつめ": "c.wav"})
+        self.assertEqual(self._service().known_phrases(),
+                         ["ふたつめ", "ひとつめ", "みっつめ"])
+
+    def test_known_phrases_returns_a_copy(self):
+        self._write_manifest({"ひとつめ": "a.wav"})
+        service = self._service()
+        service.known_phrases().append("書き換え")
+        self.assertEqual(service.known_phrases(), ["ひとつめ"])
+
+    def test_known_phrases_is_empty_without_a_manifest(self):
+        self.assertEqual(self._service().known_phrases(), [])
+
+    def test_known_phrases_is_empty_without_a_prerecorded_engine(self):
+        self._write_manifest({"ひとつめ": "a.wav"})
+        self.assertEqual(self._service(engines=["voicevox"]).known_phrases(), [])
+
+    def test_known_phrases_survives_an_unreadable_manifest(self):
+        with open(os.path.join(self.voice, "manifest.json"), "wb") as handle:
+            handle.write("{\"あ\": \"a.wav\"}".encode("shift_jis"))
+        self.assertEqual(self._service().known_phrases(), [])
+
+    def test_shipped_manifest_knows_the_broadcast_phrases(self):
+        service = TTSService({"engines": ["prerecorded"]}, REPO_ROOT, self.cache,
+                             os.path.join(REPO_ROOT, "assets", "voice"))
+        phrases = service.known_phrases()
+        self.assertIn("正午をお知らせしたのだ。", phrases)
+        self.assertEqual(len(phrases), len(set(phrases)))
+        self.assertIsNotNone(service.prerecorded_lookup("正午をお知らせしたのだ。"))
 
 
 class EngineConfigurationTest(unittest.TestCase):

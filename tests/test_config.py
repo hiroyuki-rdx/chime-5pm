@@ -8,8 +8,8 @@ import os
 import tempfile
 import unittest
 
-from chime.config import (DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, Config, ConfigError,
-                          deep_merge, load_config, redundant_keys)
+from chime.config import (DEFAULT_CONFIG, DEPRECATED_KEYS, EXAMPLE_CONFIG_PATH, Config,
+                          ConfigError, deep_merge, load_config, redundant_keys)
 
 
 class DeepMergeTest(unittest.TestCase):
@@ -297,6 +297,131 @@ class RedundantKeysTest(unittest.TestCase):
         self.assertEqual(redundant_keys({"timezone": "UTC"}), [])
 
 
+class DeprecatedKeysTest(unittest.TestCase):
+    """v6.0.0 で廃止予定の設定キーを、設定ファイルに書いていれば警告する。
+
+    警告だけで動作は変えない（v6.0.0 までは書かれていればこれまでどおり効く）。
+    """
+
+    EXPECTED_KEYS = {
+        "extra_segment.mode",
+        "extra_segment.weather_probability",
+        "extra_segment.always_weather_hours",
+        "extra_segment.always_quote_hours",
+        "extra_segment.fallback_to_quote",
+        "weather.provider",
+        "weather.jma",
+        "weather.max_weather_chars",
+    }
+
+    @staticmethod
+    def _nested(path, value):
+        """``"a.b"`` と値から ``{"a": {"b": 値}}`` を作る。"""
+        result = value
+        for part in reversed(path.split(".")):
+            result = {part: result}
+        return result
+
+    def _load_capturing_warnings(self, local=None, explicit=None):
+        """``local``（config.json）・``explicit``（--config）を読み込み、警告ログを返す。
+
+        tests/__init__.py がテスト全体でログを抑制しているため、tests/test_weather.py
+        と同じ手順でこの間だけ解除する。``assertLogs`` は 1 件も出ないと失敗するので、
+        判定用のダミーを先に出す。戻り値は ``(警告の行, 一時ディレクトリ, 設定)``。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            explicit_path = None
+            for name, override in (("config.json", local), ("other.json", explicit)):
+                if override is None:
+                    continue
+                path = os.path.join(tmp, name)
+                with open(path, "w", encoding="utf-8") as handle:
+                    json.dump(override, handle)
+                if name == "other.json":
+                    explicit_path = path
+            logging.disable(logging.NOTSET)
+            try:
+                with self.assertLogs("chime.config", level="WARNING") as captured:
+                    logging.getLogger("chime.config").warning("dummy")
+                    config = load_config(explicit_path, base_dir=tmp)
+            finally:
+                logging.disable(logging.CRITICAL)
+        lines = [line for line in captured.output if not line.endswith("dummy")]
+        return lines, tmp, config
+
+    def test_the_deprecated_keys_are_the_planned_ones(self):
+        self.assertEqual(set(DEPRECATED_KEYS), self.EXPECTED_KEYS)
+
+    def test_every_deprecated_key_still_exists_in_the_defaults(self):
+        # 廃止予定でも v6.0.0 までは既定値に残っている。キーの綴りを間違えると
+        # 警告が永久に出ないので、既定値との突き合わせで防ぐ。
+        missing = object()
+        config = Config(DEFAULT_CONFIG)
+        for key in DEPRECATED_KEYS:
+            self.assertIsNot(config.get(key, missing), missing, key)
+
+    def test_choice_keys_point_to_weather_hours(self):
+        for key, guidance in DEPRECATED_KEYS.items():
+            if key.startswith("extra_segment."):
+                self.assertEqual(guidance, "天気を流す時刻は extra_segment.weather_hours で指定", key)
+
+    def test_jma_keys_point_to_open_meteo(self):
+        for key, guidance in DEPRECATED_KEYS.items():
+            if key.startswith("weather."):
+                self.assertEqual(guidance, "天気は Open-Meteo（weather.open_meteo）に一本化", key)
+
+    def test_each_deprecated_key_warns_once_with_guidance(self):
+        for key, guidance in DEPRECATED_KEYS.items():
+            with self.subTest(key=key):
+                lines, tmp, _ = self._load_capturing_warnings(local=self._nested(key, 1))
+                self.assertEqual(len(lines), 1, lines)
+                path = os.path.join(tmp, "config.json")
+                self.assertIn(
+                    "{0} の {1} は v6.0.0 で廃止予定です（{2}）。この行を消してください。".format(
+                        path, key, guidance), lines[0])
+
+    def test_the_warning_does_not_change_the_behaviour(self):
+        lines, _, config = self._load_capturing_warnings(
+            local={"extra_segment": {"mode": "choice", "weather_probability": 0.5}})
+        self.assertEqual(len(lines), 2, lines)
+        self.assertEqual(config.get("extra_segment.mode"), "choice")
+        self.assertEqual(config.get("extra_segment.weather_probability"), 0.5)
+
+    def test_one_warning_per_key_and_nothing_for_the_keys_under_it(self):
+        lines, _, _ = self._load_capturing_warnings(
+            local={"weather": {"jma": {"area_code": "260000", "area_name": "南部"}}})
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("weather.jma は", lines[0])
+
+    def test_a_key_set_to_null_still_counts_as_written(self):
+        lines, _, _ = self._load_capturing_warnings(local={"weather": {"provider": None}})
+        self.assertEqual(len(lines), 1, lines)
+
+    def test_current_keys_do_not_warn(self):
+        lines, _, _ = self._load_capturing_warnings(local={
+            "extra_segment": {"weather_hours": [10, 12]},
+            "weather": {"enabled": False, "open_meteo": {"locations": []}},
+        })
+        self.assertEqual(lines, [])
+
+    def test_the_defaults_alone_do_not_warn(self):
+        # 既定値にも廃止予定のキーは含まれるが、警告の対象は設定ファイルだけ。
+        lines, _, _ = self._load_capturing_warnings()
+        self.assertEqual(lines, [])
+
+    def test_a_non_object_on_the_way_does_not_break_the_check(self):
+        lines, _, _ = self._load_capturing_warnings(local={"weather": "オブジェクトではない"})
+        self.assertEqual(lines, [])
+
+    def test_each_file_is_reported_under_its_own_name(self):
+        lines, tmp, _ = self._load_capturing_warnings(
+            local={"weather": {"provider": "jma"}},
+            explicit={"extra_segment": {"mode": "choice"}})
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn(os.path.join(tmp, "config.json") + " の weather.provider", lines[0])
+        self.assertIn(os.path.join(tmp, "other.json") + " の extra_segment.mode", lines[1])
+
+
 class LoadConfigTest(unittest.TestCase):
     def test_local_config_overrides_defaults(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -329,6 +454,67 @@ class LoadConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ConfigError):
                 load_config(os.path.join(tmp, "nope.json"), base_dir=tmp)
+
+    def test_shift_jis_config_raises_config_error_with_guidance(self):
+        # Windows のメモ帳の既定（ANSI＝Shift_JIS）で保存された config.json。
+        # UnicodeDecodeError の生のトレースバックではなく、直し方が分かる案内に
+        # なること。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "wb") as handle:
+                handle.write('{"quotes": {"file": "ひとこと.json"}}'.encode("shift_jis"))
+            with self.assertRaises(ConfigError) as caught:
+                load_config(path, base_dir=tmp)
+        message = str(caught.exception)
+        self.assertIn("UTF-8", message)
+        self.assertIn("Shift_JIS", message)
+        self.assertIn(path, message)
+
+    def test_utf8_bom_config_is_accepted(self):
+        # メモ帳の「UTF-8（BOM 付き）」で保存された config.json も読める。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "wb") as handle:
+                handle.write(b"\xef\xbb\xbf" + json.dumps(
+                    {"quotes": {"avoid_recent": 3}}, ensure_ascii=False).encode("utf-8"))
+            config = load_config(path, base_dir=tmp)
+        self.assertEqual(config.get("quotes.avoid_recent"), 3)
+
+    def test_syntax_error_reports_line_and_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{\n  "timezone": "UTC"\n  "logging": {}\n}')
+            with self.assertRaises(ConfigError) as caught:
+                load_config(path, base_dir=tmp)
+        message = str(caught.exception)
+        self.assertIn(path, message)
+        self.assertIn("3 行 3 文字目", message)
+
+    def test_fullwidth_quotes_get_a_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{\n  “timezone”: “UTC”\n}')
+            with self.assertRaises(ConfigError) as caught:
+                load_config(path, base_dir=tmp)
+        self.assertIn("全角の記号が混ざっていませんか", str(caught.exception))
+
+    def test_top_level_must_be_an_object(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('["配列は想定外"]')
+            with self.assertRaises(ConfigError) as caught:
+                load_config(path, base_dir=tmp)
+        self.assertIn("トップレベルはオブジェクト", str(caught.exception))
+
+    def test_missing_config_message_names_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "nope.json")
+            with self.assertRaises(ConfigError) as caught:
+                load_config(path, base_dir=tmp)
+        self.assertEqual(str(caught.exception), "設定ファイルが見つかりません: " + path)
 
 
 class NoRuntimeSynthesisFallbackTest(unittest.TestCase):

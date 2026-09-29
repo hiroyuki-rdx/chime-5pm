@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import random
 import tempfile
@@ -33,6 +34,79 @@ class LoadQuotesTest(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as handle:
                 handle.write("{{{")
             self.assertEqual(load_quotes(path)["general"], FALLBACK_QUOTES)
+
+    def test_shift_jis_file_falls_back(self):
+        # メモ帳の既定（ANSI＝Shift_JIS）で保存し直された quotes.json。
+        # 放送は止めず、内蔵の予備に切り替わること。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "quotes.json")
+            with open(path, "wb") as handle:
+                handle.write(json.dumps({"general": ["おつかれさま"]},
+                                        ensure_ascii=False).encode("shift_jis"))
+            self.assertEqual(load_quotes(path)["general"], FALLBACK_QUOTES)
+
+    def test_utf8_bom_file_is_readable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "quotes.json")
+            with open(path, "wb") as handle:
+                handle.write(b"\xef\xbb\xbf" + json.dumps(
+                    {"general": ["おつかれさま"]}, ensure_ascii=False).encode("utf-8"))
+            self.assertEqual(load_quotes(path)["general"], ["おつかれさま"])
+
+    def _load_capturing_logs(self, path, level):
+        """``load_quotes`` を呼び、``level`` 以上のログを集めて返す。
+
+        tests/__init__.py がログを抑制しているため、tests/test_sequence.py と
+        同じ手順でこの間だけ一時的に解除する。
+        """
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs("chime.quotes", level=level) as captured:
+                data = load_quotes(path)
+        finally:
+            logging.disable(logging.CRITICAL)
+        return data, captured.records
+
+    def test_shift_jis_file_is_an_error_with_guidance(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "quotes.json")
+            with open(path, "wb") as handle:
+                handle.write(json.dumps({"general": ["おつかれさま"]},
+                                        ensure_ascii=False).encode("shift_jis"))
+            data, records = self._load_capturing_logs(path, "ERROR")
+        self.assertEqual(data["general"], FALLBACK_QUOTES)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].levelno, logging.ERROR)
+        message = records[0].getMessage()
+        self.assertIn(path, message)
+        self.assertIn("UTF-8", message)
+        self.assertIn("内蔵の予備", message)
+
+    def test_broken_json_is_an_error_with_a_hint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "quotes.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write('{\n  "general": [\n    "A",\n  ]\n}')
+            data, records = self._load_capturing_logs(path, "ERROR")
+        self.assertEqual(data["general"], FALLBACK_QUOTES)
+        message = records[0].getMessage()
+        self.assertIn(path, message)
+        self.assertIn("最後の項目のあとにカンマは付けられません", message)
+
+    def test_missing_file_stays_a_warning(self):
+        data, records = self._load_capturing_logs("/nonexistent/quotes.json", "WARNING")
+        self.assertEqual(data["general"], FALLBACK_QUOTES)
+        self.assertEqual([record.levelno for record in records], [logging.WARNING])
+        self.assertIn("内蔵の予備", records[0].getMessage())
+
+    def test_picker_keeps_working_on_a_shift_jis_file(self):
+        # 放送は止めない。予備のひとことから選べる。
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "quotes.json")
+            with open(path, "wb") as handle:
+                handle.write("{\"general\": [\"おつかれさま\"]}".encode("shift_jis"))
+            picker = QuotePicker(path, rng=random.Random(0))
+            self.assertIn(picker.pick(10), FALLBACK_QUOTES)
 
     def test_plain_list_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:

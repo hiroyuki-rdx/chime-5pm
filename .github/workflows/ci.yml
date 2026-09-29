@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+# 同じ ref で新しい実行が始まったら、古い実行は止める。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     name: Python ${{ matrix.python-version }}
@@ -29,11 +37,32 @@ jobs:
       - name: ユニットテスト
         run: python -m unittest discover -s tests -t . -v
 
+      # 12 時の時報は天気（Open-Meteo）を取りに行くため、実際の通信をしない
+      # よう、天気を無効にした設定を渡す。
       - name: CLI が起動すること
         run: |
           python campus_chime.py --version
           python campus_chime.py --schedule 3
-          python campus_chime.py --test-hourly 12 --dry-run --backend mock
+          python campus_chime.py --test-hourly 12 --dry-run --backend mock \
+            --config tests/fixtures/offline_config.json
+
+  lint:
+    name: pyflakes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 版を固定するのは、pyflakes の更新で新しい指摘が増え、関係のない変更の
+      # CI が突然赤くなるのを防ぐため。上げるときは手元でも同じ版で確認する。
+      - name: pyflakes をインストール
+        run: python -m pip install pyflakes==4.0.0
+
+      - name: 未使用の import や未定義の名前がないこと
+        run: python -m pyflakes chime scripts tests campus_chime.py
 
   shell:
     name: シェルスクリプト
