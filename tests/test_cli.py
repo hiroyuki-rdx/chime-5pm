@@ -148,9 +148,9 @@ class RunTest(unittest.TestCase):
         with mock.patch("chime.weather.fetch_json", return_value=payload):
             code, output = call(["--weather", "--dry-run"])
         self.assertEqual(code, 0)
-        # 既定は 2 地点 × 2 文。地点ごとに現在の天気・気温が出る。
+        # 既定は大津の 1 地点 × 2 文。現在の天気・気温が出る。
         lines = [line for line in output.splitlines() if line.startswith("読み上げ文 ")]
-        self.assertEqual(len(lines), 4, output)
+        self.assertEqual(len(lines), 2, output)
         self.assertTrue(all(line.endswith("なのだ。") for line in lines), lines)
 
     def test_config_file_is_applied(self):

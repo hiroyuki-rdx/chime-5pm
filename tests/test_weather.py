@@ -29,6 +29,17 @@ TOKYO_JMA = {
     "label": "東京",
 }
 
+# 既定の地点は大津の 1 か所だけ（v5.1.0 までは大津・京都の 2 か所）。複数地点を
+# 読み上げる仕組み（地点ごとの取得・キャッシュ・片方失敗時の続行・作り置きの
+# 列挙）のテストは、既定値に頼らず 2 地点を明示した設定で確かめる。
+WEATHER_TWO_LOCATIONS = dict(
+    WEATHER,
+    open_meteo=dict(WEATHER["open_meteo"], locations=[
+        {"label": "大津", "latitude": 35.0045, "longitude": 135.8686},
+        {"label": "京都", "latitude": 35.0116, "longitude": 135.7681},
+    ]),
+)
+
 # jma は現況（current）を持たないため、既定の sentence_weather（「今の…」・
 # {when} を使わない現況向けの文言）とは噛み合わない。jma 由来の parts を
 # build_text / build_sentences に渡すテストでは、chime/config.py のコメントが
@@ -518,14 +529,22 @@ class PrerecordPhrasesTest(unittest.TestCase):
     """作り置きすべき文言を全列挙する prerecord_phrases() のテスト。"""
 
     def test_enumerates_expected_totals(self):
-        # 天気: 地点数(2) x whens(1) x WMO_CODES(28) = 56
+        # 天気: 地点数(1) x whens(1) x WMO_CODES(28) = 28
         # 気温（現況）: temp_min(-5) 〜 temp_max(40) の 46 通り
         # 既定では sentence_temp_max / sentence_pop が空文字列のため、
         # 最高気温・降水確率は列挙されない。
         phrases = prerecord_phrases(WEATHER)
-        self.assertEqual(len(phrases), 56 + 46)
+        self.assertEqual(len(phrases), 28 + 46)
         # 重複が無いこと
         self.assertEqual(len(set(phrases)), len(phrases))
+
+    def test_enumerates_every_location_when_several_are_configured(self):
+        # 天気: 地点数(2) x whens(1) x WMO_CODES(28) = 56。気温は地点によらず 46 通りのまま。
+        phrases = prerecord_phrases(WEATHER_TWO_LOCATIONS)
+        self.assertEqual(len(phrases), 56 + 46)
+        self.assertEqual(len(set(phrases)), len(phrases))
+        self.assertIn("今の大津の天気はくもりなのだ。", phrases)
+        self.assertIn("今の京都の天気はくもりなのだ。", phrases)
 
     def test_covers_every_location_and_weather_code(self):
         phrases = set(prerecord_phrases(WEATHER))
@@ -559,7 +578,7 @@ class PrerecordPhrasesTest(unittest.TestCase):
         settings = dict(WEATHER, sentence_temp="")
         phrases = prerecord_phrases(settings)
         self.assertFalse(any("気温は" in p for p in phrases))
-        self.assertEqual(len(phrases), 56)
+        self.assertEqual(len(phrases), 28)
 
     def test_non_positive_pop_step_yields_no_pop_phrases(self):
         settings = dict(WEATHER, sentence_pop="降水確率は{pop}パーセントなのだ。",
@@ -574,8 +593,8 @@ class PrerecordPhrasesTest(unittest.TestCase):
                         sentence_temp_max="最高気温は{temp_max}度なのだ。",
                         sentence_pop="降水確率は{pop}パーセントなのだ。")
         phrases = prerecord_phrases(settings)
-        # 天気56 + 気温(現況)46 + 最高気温46 + 降水確率11
-        self.assertEqual(len(phrases), 56 + 46 + 46 + 11)
+        # 天気28 + 気温(現況)46 + 最高気温46 + 降水確率11
+        self.assertEqual(len(phrases), 28 + 46 + 46 + 11)
         self.assertTrue(any("最高気温" in p for p in phrases))
         self.assertTrue(any("パーセント" in p for p in phrases))
 
@@ -586,7 +605,7 @@ class VocabularyCoverageTest(unittest.TestCase):
 
     既定設定（sentence_weather + sentence_temp が有効、sentence_temp_max /
     sentence_pop は空文字列で無効）で実際に組み立てられる全パターン
-    （地点(2) x whens(1) x WMO_CODES(28) x 現況気温の全値(46) = 2576 通り）を
+    （地点(1) x whens(1) x WMO_CODES(28) x 現況気温の全値(46) = 1288 通り）を
     検証する。天気・気温の読み上げが作り置きから外れて無音にならないことの
     機械的な担保になる。sentence_temp の作り置きが 1 つ欠けると、この
     テストは落ちる（実際に確認済み）。
@@ -614,7 +633,7 @@ class VocabularyCoverageTest(unittest.TestCase):
 
         expected = len(locations) * len(whens) * len(WMO_CODES) * len(temps)
         self.assertEqual(combinations, expected)
-        self.assertEqual(combinations, 2576)
+        self.assertEqual(combinations, 1288)
 
 
 class ServiceTest(unittest.TestCase):
@@ -633,8 +652,8 @@ class ServiceTest(unittest.TestCase):
         self.assertIn("timezone=Asia%2FTokyo", url)
 
     def test_open_meteo_url_accepts_an_explicit_location(self):
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
-        kyoto = WEATHER["open_meteo"]["locations"][1]
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
+        kyoto = WEATHER_TWO_LOCATIONS["open_meteo"]["locations"][1]
         url = service.url(kyoto)
         self.assertIn("latitude=35.0116", url)
         self.assertIn("longitude=135.7681", url)
@@ -691,7 +710,7 @@ class ServiceTest(unittest.TestCase):
 
     def test_cache_is_per_location(self):
         # 大津のキャッシュが京都に流用されないこと。
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
         service._cache["大津"] = (float("inf"), TODAY, ["大津のキャッシュ文なのだ。"])
         kyoto_payload = load_fixture("open_meteo_kyoto.json")
         with mock.patch("chime.weather.fetch_json", return_value=kyoto_payload) as mocked:
@@ -709,9 +728,9 @@ class DescribeSentencesMultiLocationTest(unittest.TestCase):
         self.kyoto_payload = load_fixture("open_meteo_kyoto.json")
 
     def test_returns_four_sentences_in_otsu_then_kyoto_order(self):
-        # 既定設定（sentence_weather + sentence_temp のみ有効）では、
+        # 2 地点を設定し、sentence_weather + sentence_temp のみ有効（既定）なら、
         # 1 地点あたり 2 文（天気・気温）× 2 地点 = 4 文になる。
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
         with mock.patch("chime.weather.fetch_json",
                         side_effect=[self.otsu_payload, self.kyoto_payload]):
             sentences = service.describe_sentences(today=TODAY)
@@ -725,7 +744,7 @@ class DescribeSentencesMultiLocationTest(unittest.TestCase):
         ])
 
     def test_describe_joins_all_locations_into_one_string(self):
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
         with mock.patch("chime.weather.fetch_json",
                         side_effect=[self.otsu_payload, self.kyoto_payload]):
             text = service.describe(today=TODAY)
@@ -738,7 +757,7 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
         self.kyoto_payload = load_fixture("open_meteo_kyoto.json")
 
     def test_one_location_failing_still_returns_the_other(self):
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
         # tests/__init__.py がテスト全体でログを抑制している（logging.disable
         # (logging.CRITICAL)）ため、assertLogs で拾えるよう tests/test_sequence.py
         # と同じ手順でこのテストの間だけ一時的に解除する。
@@ -758,7 +777,7 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
         # current が欠けた地点だけ飛ばされ、もう一方の地点の文は返ること。
         otsu_payload_without_current = json.loads(json.dumps(load_fixture("open_meteo.json")))
         del otsu_payload_without_current["current"]
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
         logging.disable(logging.NOTSET)
         try:
             with mock.patch("chime.weather.fetch_json",
@@ -773,7 +792,7 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
 
     def test_the_other_order_also_returns_the_succeeding_location(self):
         otsu_payload = load_fixture("open_meteo.json")
-        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
         with mock.patch("chime.weather.fetch_json",
                         side_effect=[otsu_payload, WeatherError("圏外")]):
             sentences = service.describe_sentences(today=TODAY)

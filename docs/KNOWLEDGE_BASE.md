@@ -31,8 +31,6 @@
 「正午をお知らせしたのだ。」
 大津の天気
 気温
-京都の天気
-気温
 ひとこと
 ```
 
@@ -63,7 +61,7 @@ python3 campus_chime.py --test-hourly      # 時報（現在時刻）
 python3 campus_chime.py --test-hourly 12   # 12 時の時報
 python3 campus_chime.py --test             # 閉館放送
 python3 campus_chime.py --test-all         # 両方
-python3 campus_chime.py --weather          # 天気予報の読み上げ文を確認（大津・京都の現況）
+python3 campus_chime.py --weather          # 天気予報の読み上げ文を確認（大津の現況）
 python3 campus_chime.py --say "テストです"
 
 # 音を出さずに内容だけ見る
@@ -224,7 +222,7 @@ groups pi                               # audio グループに入っている�
 
 ```bash
 python3 campus_chime.py --test-hourly --log-level DEBUG   # ログの TTS: を確認
-ls assets/voice/*.wav | wc -l                              # 166 件あるか
+ls assets/voice/*.wav | wc -l                              # 138 件あるか
 ```
 
 `prerecorded(利用不可)` なら `assets/voice/` が見つかっていません（`git pull` が届いているか確認）。Pi 上では VOICEVOX ENGINE を動かさない運用のため `voicevox(利用不可)` は正常です。一部の文言だけ無音の場合は「3-3. 更新を取り込む」または [SETUP.md 10-7](SETUP.md#10-7-読み上げが無音になる) を参照してください。
