@@ -14,10 +14,12 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
+# 予備も読み上げ音声は作り置きから引く。assets/voice/ に作り置きのある文
+# （assets/quotes.json と同じ文）でなければ無音になる。
 FALLBACK_QUOTES: List[str] = [
-    "今日も一日、おつかれさまです。",
-    "こまめな休憩が、集中力の近道です。",
-    "水分補給を忘れずに。",
+    "今日も一日、おつかれさまなのだ。",
+    "こまめな休憩が、集中力への近道なのだ。",
+    "深呼吸をひとつ。肩の力を抜いてみるのだ。",
 ]
 
 

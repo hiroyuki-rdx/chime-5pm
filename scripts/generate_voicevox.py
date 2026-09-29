@@ -23,8 +23,9 @@ Docker で VOICEVOX ENGINE を起動した直後はモデル読み込みのた�
 
 文言（定型文の言い回しなど）を変更すると、古い文言の manifest エントリと
 WAV が ``assets/voice/`` に残り続ける（マージ書き込みのため）。
-``--prune`` を付けると、現在の文言集合に含まれない古いエントリと WAV を
-削除する（既定は off。誤って消さないよう、明示的に指定した場合のみ動く）::
+``--prune`` を付けると、ひとことを含む現在の全文言に無い古いエントリと
+WAV を削除する（``--include-quotes`` の有無に関わらず、ひとことは使用中
+として残す）。既定は off で、誤って消さないよう明示的に指定した場合のみ動く::
 
     python3 scripts/generate_voicevox.py --include-quotes --prune
 
@@ -114,6 +115,16 @@ def collect_phrases(config, include_quotes: bool) -> list:
     return unique
 
 
+def phrases_in_use(config) -> list:
+    """現在使われている全文言（ひとことを含む）を返す。
+
+    ``--prune`` の判定に使う。ひとことを今回作り直さない
+    （``--include-quotes`` を付けない）場合でも、ひとことは使われているので、
+    その音声を消してはならない。
+    """
+    return collect_phrases(config, include_quotes=True)
+
+
 def find_stale_entries(manifest: dict, keep_phrases) -> list:
     """``manifest`` のうち、``keep_phrases`` に含まれないエントリを列挙する。
 
@@ -144,8 +155,9 @@ def main() -> int:
                         help="VOICEVOX ENGINE が応答するまで待つ秒数"
                              "（既定 90 秒。0 なら待たずに即座に判定する）")
     parser.add_argument("--prune", action="store_true",
-                        help="現在の文言集合に含まれない古い manifest エントリと"
-                             "対応する WAV を削除する（既定 off。誤って消さないよう"
+                        help="ひとことを含む現在の全文言に無い古い manifest エントリと"
+                             "対応する WAV を削除する（--include-quotes の有無に"
+                             "関わらず、ひとことは残す。既定 off。誤って消さないよう"
                              "明示的に指定した場合のみ動く）")
     args = parser.parse_args()
 
@@ -181,7 +193,7 @@ def main() -> int:
     phrases = collect_phrases(config, args.include_quotes)
     print("{0} 件の文言を生成します（話者 {1}）。".format(len(phrases), args.speaker))
 
-    stale = find_stale_entries(manifest, phrases)
+    stale = find_stale_entries(manifest, phrases_in_use(config))
     if args.prune:
         for phrase, filename in stale:
             path = os.path.join(args.out, filename)

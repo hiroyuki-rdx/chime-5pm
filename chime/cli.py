@@ -27,7 +27,7 @@ EPILOG = """\
   campus_chime.py --test               閉館放送（アナウンス＋蛍の光）を再生する
   campus_chime.py --weather            天気予報の読み上げ文を確認する
   campus_chime.py --say こんにちは      任意の文言を読み上げる
-  campus_chime.py --generate-assets    時報音と定型文の音声を事前生成する
+  campus_chime.py --generate-assets    時報音を生成し、時刻アナウンスの音声を用意できるか確認する
 """
 
 
@@ -64,7 +64,8 @@ def build_parser() -> argparse.ArgumentParser:
     actions.add_argument("--schedule", nargs="?", const=10, type=int, metavar="N",
                          help="次回以降の予定を N 件表示して終了（既定 10 件）")
     actions.add_argument("--generate-assets", action="store_true",
-                         help="時報音と定型文の音声を事前生成して終了")
+                         help="時報音を生成し、時刻アナウンスの音声を用意できるか"
+                              "（作り置きがあるか）確認して終了。Pi では音声を新たに作らない")
     actions.add_argument("--print-config", action="store_true",
                          help="読み込んだ設定を表示して終了")
     return parser
@@ -164,7 +165,12 @@ def run(argv: Optional[List[str]] = None) -> int:
 
 
 def generate_assets(app: ChimeApp) -> int:
-    """時報音と、時報で使う定型文の音声を事前生成する。"""
+    """時報音を生成し、時刻アナウンスの音声を用意できるか（作り置きがあるか）確認する。
+
+    Pi では音声を新たに作らない（作り置き ``assets/voice/`` を引くだけ）。
+    VOICEVOX が動いている PC では、作り置きの欠けをその場で合成して埋めて
+    しまうため、PC での成功は作り置きが揃っている証拠にならない。
+    """
     settings = app.config.section("time_signal")
     path = timesignal.generate_time_signal(
         app.time_signal_path, settings, app.config.section("audio.mixer"))
@@ -184,7 +190,11 @@ def generate_assets(app: ChimeApp) -> int:
         print("  OK {0} -> {1}".format(text, generated))
 
     if failures:
-        print("{0} 件の音声を生成できませんでした。TTS の設定を確認してください。".format(failures),
+        print("{0} 件の時刻アナウンスの音声を用意できませんでした。".format(failures),
+              file=sys.stderr)
+        print("  - 作り置き（assets/voice/）に無い場合: PC で作り直す（docs/SETUP.md 9 章 B）",
+              file=sys.stderr)
+        print("  - config.json が古く文言を上書きしている場合: docs/SETUP.md 10-7",
               file=sys.stderr)
         return 1
     return 0
@@ -200,7 +210,7 @@ def show_weather(app: ChimeApp) -> int:
         print("天気予報を取得できませんでした: {0}".format(exc), file=sys.stderr)
         return 1
     # 1 文ずつ表示・再生する。放送でも 1 文ずつ別のセグメントとして鳴らして
-    # おり、連結すると作り置き音声との照合が外れて実行時合成に落ちるため、
+    # おり、連結すると照合が外れてその文が無音になるため、
     # ここでも同じ単位で扱って実際の放送と食い違わないようにする。
     for index, sentence in enumerate(sentences, start=1):
         print("読み上げ文 {0}/{1}: {2}".format(index, len(sentences), sentence))

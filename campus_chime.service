@@ -1,7 +1,8 @@
 [Unit]
 Description=Campus Chime System (hourly time signal and closing announcement)
 Documentation=https://github.com/hiroyuki-rdx/chime-5pm
-# 本機は RTC 非搭載のため、NTP 同期後に起動する（誤った時刻での判定を防ぐ）
+# 本機は RTC 非搭載。After=time-sync.target だけでは NTP 同期の完了までは待たないが、
+# スケジューラが 30 秒ごとに時刻を読み直すため、起動直後の NTP による時刻の飛びに追従できる
 Wants=time-sync.target
 After=time-sync.target sound.target network.target
 

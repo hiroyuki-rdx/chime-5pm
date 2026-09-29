@@ -90,10 +90,7 @@
     "enabled": true,
     "mode": "both",
     "weather_hours": [
-      10,
-      12,
-      14,
-      16
+      12
     ],
     "weather_probability": 0.0,
     "always_weather_hours": [],

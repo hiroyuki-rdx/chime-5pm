@@ -177,8 +177,8 @@ bash scripts/setup.sh
 2. 依存パッケージの導入
    （`python3-pygame` / `alsa-utils` / `mpg123`）
 3. タイムゾーンと NTP 同期の確認
-4. `config.example.json` から `config.json` を作成（既にあれば触りません）
-5. 時報音（`assets/generated/time_signal.wav`）と時刻アナウンス音声の生成
+4. 空の `config.json`（変えたい項目だけを書くための上書きファイル）を作成（既にあれば触りません）
+5. 時報音（`assets/generated/time_signal.wav`）の生成と、時刻アナウンスの音声（作り置き）の確認
 6. 予定表の表示
 7. systemd への登録・有効化・起動
 
@@ -196,7 +196,7 @@ cd /home/pi/campus-chime
 # 時報（ポ・ポ・ポ・ポーン → 時刻 → ひとこと）
 python3 campus_chime.py --test-hourly
 
-# 12 時の時報（「正午をお知らせしたのだ。」）
+# 12 時の時報（「正午をお知らせしたのだ。」のあと、天気も流れる）
 python3 campus_chime.py --test-hourly 12
 
 # 閉館放送（アナウンス → 蛍の光）
@@ -207,7 +207,7 @@ python3 campus_chime.py --test
 
 - [ ] 短音が 3 回、続いて長めの音が 1 回鳴る
 - [ ] 「午前◯時をお知らせしたのだ。」と読み上げられる
-- [ ] 10/12/14/16 時は、そのあと大津と京都の**現在の**天気と気温が流れる（11/13/15 時は流れない）
+- [ ] 12 時は、そのあと大津と京都の**現在の**天気と気温が流れる（それ以外の時刻は流れない）
 - [ ] そのあと「ひとこと」が流れる（天気の有無に関わらず毎回）
 - [ ] **すべての文言が聞こえる**（無音になる文言があれば、その文言の作り置きが外れている。8 章参照）
 - [ ] 蛍の光がだんだん大きくなる（2 秒フェードイン）
@@ -287,6 +287,8 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 { "schedule": { "hourly": { "skip_hours": [12] } } }
 ```
 
+天気予報は既定で 12 時だけなので、**12 時を止めると天気予報も流れなくなります**。天気を残したい場合は、`weather_hours` を別の時刻にしてください（下の「天気予報の時刻を変える」参照）。
+
 **閉館放送の時刻を変える（例: 17:00）**
 
 ```json
@@ -324,7 +326,13 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 
 **天気予報の時刻を変える**
 
-既定では **10 / 12 / 14 / 16 時**（2 時間おき）に、大津と京都の**現在の**天気と気温を読み上げます。ここに無い時刻（11 / 13 / 15 時）は時報と「ひとこと」だけになり、天気 API も呼びません。
+既定では **12 時の 1 回だけ**、大津と京都の**現在の**天気と気温を読み上げます。ここに無い時刻（12 時以外）は時報と「ひとこと」だけになり、天気 API も呼びません。
+
+以前のように 2 時間おき（10 / 12 / 14 / 16 時）に戻す場合:
+
+```json
+{ "extra_segment": { "weather_hours": [10, 12, 14, 16] } }
+```
 
 毎正時に流したい場合:
 
@@ -337,6 +345,8 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 ```json
 { "extra_segment": { "weather_hours": [] } }
 ```
+
+**時刻を変えても音声の作り直しは不要です**（天気の読み上げ文は流す時刻と関係なく同じです。作り直しが要るのは、地点や読み上げ文を変えたときです）。
 
 **閉館放送（16:57）には、ここに何を書いても天気は付きません。** 閉館放送は時報とは別の経路で組み立てられるためです。
 
@@ -425,14 +435,20 @@ python3 campus_chime.py --weather
 
 `assets/quotes.json` を編集します。`general` は全時刻共通、`by_hour` は指定時刻のみ候補に加わります。
 
+編集は Pi ではなく PC 側で行い、commit・push してから Pi で取り込みます（Pi で直接編集すると、次の `git pull` が衝突します）。
+
+- **追加・変更したとき**は、足した文の作り置きが無いと無音になるため、PC で読み上げ音声を作り直します（9 章 B）
+- **削除だけ**なら、音声の作り直しは要りません
+
+Pi では 9 章 A の手順で取り込み、**必ず再起動**します。常駐プロセスは `assets/quotes.json` を起動時に 1 回しか読みません。`--test-hourly` は別のプロセスで動くため、再起動を忘れていても確認だけは通ってしまいます。
+
 ```bash
-nano assets/quotes.json
 python3 campus_chime.py --test-hourly 15   # 確認
 ```
 
 ---
 
-## 8. 声を変える（任意）
+## 8. 読み上げ音声を作り直す（文言を変えたとき）
 
 読み上げる文言はすべて VOICEVOX:ずんだもんの声で作り置きしてリポジトリに同梱してあり、Pi 上では再生するだけです（VOICEVOX ENGINE は Pi 3B 上で常時動かすには重すぎるため）。
 
@@ -485,7 +501,7 @@ python3 scripts/generate_voicevox.py --include-quotes --prune
 Docker Desktop（Windows）で VOICEVOX ENGINE を動かしている場合、WSL2 側から `127.0.0.1` では届かないことがあります。その場合は `--base-url` で Windows ホスト側の IP を指定してください。
 
 ```bash
-python3 scripts/generate_voicevox.py --include-quotes --base-url http://<ホストのIP>:50021
+python3 scripts/generate_voicevox.py --include-quotes --prune --base-url http://<ホストのIP>:50021
 ```
 
 生成した音声を WSL2 側でその場で試聴する場合は、既定では音が鳴りません。`--backend pygame` を明示してください（詳しくは「10-6. WSL2 で試すと音が鳴らない」参照）。
@@ -502,7 +518,11 @@ python3 campus_chime.py --test-hourly
 
 事前生成された文言はそのまま使われます。**作り置きに無い文言だけ無音になります**（時報音・蛍の光・他の文言は鳴ります）。
 
-天気予報も既定の設定（`provider: "open_meteo"`）であれば全パターンが作り置きされるため、**Pi 上では音声合成が一切発生しません**。読み上げが無音になったら、文言を変えたあとに作り置きを作り直していないか、`provider` を `jma` に変えたかのどちらかです（7 章「気象庁（jma）に切り替える場合の注意」参照）。
+天気予報も既定の設定（`provider: "open_meteo"`）であれば全パターンが作り置きされるため、**Pi 上では音声合成が一切発生しません**。読み上げが無音になったら、次のいずれかです。
+
+1. 文言を変えたあとに作り置きを作り直していない
+2. `provider` を `jma` に変えた（7 章「気象庁（jma）に切り替える場合の注意」参照）
+3. 古い `config.json` が文言を上書きしている（10 章「10-7. 読み上げが無音になる」参照）
 
 ---
 
@@ -547,7 +567,7 @@ bash scripts/setup.sh --no-apt
 sudo systemctl restart campus_chime.service
 ```
 
-`scripts/setup.sh --no-apt` は、設定の追加分の反映と時報音の生成を行います（apt は実行しません）。
+`scripts/setup.sh --no-apt` は、時報音の生成、時刻アナウンスの音声の確認、サービスの登録し直しと再起動を行います（apt は実行しません）。
 何度実行しても安全で、`config.json` は上書きしません。
 
 反映されたか確認します。
@@ -557,12 +577,12 @@ sudo systemctl status campus_chime.service
 ```
 
 ```bash
-python3 campus_chime.py --test-hourly 10
+python3 campus_chime.py --test-hourly 12
 ```
 
 - [ ] `Active: active (running)` になっている
-- [ ] **読み上げがすべて聞こえる**（無音になっている文言があれば B が済んでいません）
-- [ ] 天気が流れる時刻（既定 10/12/14/16 時）で天気が読み上げられる
+- [ ] **読み上げがすべて聞こえる**（無音になっている文言があれば、B が済んでいないか、`config.json` が古い（10-7）のどちらかです）
+- [ ] 12 時の時報で天気が読み上げられる
 
 ```bash
 python3 campus_chime.py --schedule
@@ -621,11 +641,13 @@ ls assets/voice/*.wav | wc -l
 ```
 
 ```bash
-python3 campus_chime.py --test-hourly 10 --backend pygame
+python3 campus_chime.py --test-hourly 12 --backend pygame
 ```
 
 WSL2 では `--backend pygame` が必須です（付けないとログだけ流れて音が鳴りません。10-6 参照）。
-**読み上げがすべてずんだもんの声**であることを耳で確認してください。
+**すべての読み上げが聞こえる**ことを耳で確認してください。
+
+ただし、PC で VOICEVOX ENGINE が動いていると、作り置きの欠けをその場で合成して埋めてしまうため、PC で聞いても欠けは分かりません。push 後に GitHub の CI「作り置きだけで全文言を賄えること（音声合成エンジンなし）」が緑になれば、Pi でも全文言が鳴ります。
 
 問題なければコミットして push します。
 
@@ -743,13 +765,13 @@ ls assets/voice/*.wav | wc -l
 | 時刻の読み上げ | 天気 | 原因 |
 |---|---|---|
 | 聞こえない（ポーンのあと、いきなりひとこと） | 流れない | 古い `config.json` |
-| 聞こえる | 流れない（10/12/14/16 時） | ネットワーク／時刻のずれ |
-| 聞こえる | 流れない（11/13/15 時） | 仕様どおり |
+| 聞こえる | 流れない（12 時） | ネットワーク／時刻のずれ |
+| 聞こえる | 流れない（12 時以外） | 仕様どおり |
 
 次のコマンドで詳しく確認できます（音は鳴りません）。
 
 ```bash
-python3 campus_chime.py --test-hourly 10 --dry-run
+python3 campus_chime.py --test-hourly 12 --dry-run
 ```
 
 警告の文言ごとの意味は次のとおりです。
@@ -765,7 +787,7 @@ python3 campus_chime.py --print-config | python3 -c "import json,sys; print(json
 
 `False` の場合は `config.json` が古い可能性が高いです。「10-7. 読み上げが無音になる」を参照してください。
 
-なお 11 / 13 / 15 時に天気が流れないのは**異常ではありません**。既定では 10 / 12 / 14 / 16 時の 2 時間おきに流す設定です（7 章「天気予報の時刻を変える」参照）。
+なお 12 時以外に天気が流れないのは**異常ではありません**。既定は 12 時の 1 回だけです（7 章「天気予報の時刻を変える」参照）。
 
 通信に失敗しても放送そのものは止まりません。時報音・時刻の読み上げ・ひとことは鳴ります（黙って飛ばされるのは天気予報だけです）。
 
@@ -774,7 +796,7 @@ python3 campus_chime.py --print-config | python3 -c "import json,sys; print(json
 ```
 再生内容:
   - 時報音（ポ・ポ・ポ・ポーン）
-  - 時刻アナウンス「午前10時をお知らせしたのだ。」
+  - 時刻アナウンス「正午をお知らせしたのだ。」
   - 天気予報（1/4）「今の大津の天気はくもりなのだ。」
   - 天気予報（2/4）「気温は28度なのだ。」
   - 天気予報（3/4）「今の京都の天気は弱い雨なのだ。」
@@ -807,16 +829,18 @@ python3 campus_chime.py --test-all --backend pygame
 
 **気づき方（無音は男性音声より気づきにくい）**
 
-耳だけで気づくのは難しいため、次でも検出できます。`--test-hourly` を `--dry-run` で実行すると、一致しなかった文言が再生内容のログに `警告:` として残ります（本来あるはずの「時刻アナウンス「…」」のような行が無くなっている点にも注目してください）。
+耳だけで気づくのは難しいため、次でも検出できます。`--test-hourly` を `--dry-run` で実行すると、一致しなかった文言が再生内容のログに `警告:` として残ります（本来あるはずの「時刻アナウンス「…」」のような行が無くなっている点にも注目してください）。次は古い `config.json` の場合の例です（天気予報の警告も並びます）。
 
 ```bash
-python3 campus_chime.py --test-hourly --dry-run
+python3 campus_chime.py --test-hourly 12 --dry-run
 ```
 
 ```
 再生内容:
   - 時報音（ポ・ポ・ポ・ポーン）
+  - ひとこと「…」
   警告: 時刻アナウンスを合成できませんでした: 音声合成に失敗しました（prerecorded: 事前生成済み音声にこの文言はありません。 / voicevox: 利用不可）
+  警告: 天気予報を取得できませんでした: 天気予報機能が無効化されています。
 ```
 
 サービス運用中は journalctl の ERROR ログでも同じ内容が確認できます。
@@ -865,10 +889,10 @@ sudo systemctl restart campus_chime.service
 そのうえで確認します。
 
 ```bash
-python3 campus_chime.py --test-hourly 10
+python3 campus_chime.py --test-hourly 12
 ```
 
-**なぜ起きるのか。** 古いバージョンで作られた `config.json` は、当時の既定値を丸ごと複製したものです。設定は既定値 → `config.json` の順に deep merge されるため、この古い `config.json` が新しい既定値をすべて握りつぶします。現在の `scripts/setup.sh` は、新規に作る `config.json` の内容を空の上書き（`{}`）にするようになったため、ここで作り直せば以後は起きません。
+**なぜ起きるのか。** 古いバージョンで作られた `config.json` は、当時の既定値を丸ごと複製したものです。設定は既定値 → `config.json` の順に deep merge されるため、この古い `config.json` が新しい既定値をすべて握りつぶします。現在の `scripts/setup.sh` は、新規に作る `config.json` の内容を、説明書き（`_comment`）だけの空の上書きにするようになったため、ここで作り直せば以後は起きません。
 
 ---
 
