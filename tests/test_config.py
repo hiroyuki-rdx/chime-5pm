@@ -122,10 +122,11 @@ class PrerecordableWeatherTest(unittest.TestCase):
     def test_provider_is_open_meteo_by_default(self):
         self.assertEqual(DEFAULT_CONFIG["weather"]["provider"], "open_meteo")
 
-    def test_locations_are_otsu_and_kyoto(self):
+    def test_location_is_otsu_only(self):
+        # v5.1.0 までは大津・京都の 2 地点。京都の読み上げ音声は v5.2.0 で削除した。
         labels = [str(item.get("label"))
                   for item in DEFAULT_CONFIG["weather"]["open_meteo"]["locations"]]
-        self.assertEqual(labels, ["大津", "京都"])
+        self.assertEqual(labels, ["大津"])
 
     def test_every_location_has_coordinates(self):
         for item in DEFAULT_CONFIG["weather"]["open_meteo"]["locations"]:

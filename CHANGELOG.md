@@ -3,6 +3,44 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [5.2.0] - 2026-09-29
+
+### 変更
+
+- **天気予報を大津だけにした**（`weather.open_meteo.locations` の既定を大津・京都の
+  2 地点 → 大津の 1 地点）
+
+  12 時の放送は「正午をお知らせしたのだ。」→ 大津の天気・気温 → ひとこと となり、
+  約 6 秒短くなる。天気 API の呼び出しも 1 日 1 回になる。
+
+  地点を複数読む仕組みはそのまま残してあり、`config.json` に地点を並べれば上から順に
+  読む（配列は丸ごと置き換わるので、大津も含めて全地点を書く）。複数地点の動作を確かめる
+  テストは、既定値に頼らず 2 地点を明示した設定で残した。
+
+### 削除
+
+- **京都の天気の読み上げ音声 28 件**（「今の京都の天気は◯◯なのだ。」）を
+  `assets/voice/` と manifest から削除した。作り置きは 166 件 → 138 件（時刻アナウンス 7 ＋
+  ひとこと 57 ＋ 天気 74）。使わない音声を残すと、PC で `--prune` した時点で消えるうえ、
+  「作り置き ＝ 使用中の全文言」を確かめるテストとも食い違うため。京都を戻す場合は、
+  地点を足したうえで PC で読み上げ音声を作り直す（`docs/SETUP.md` 7 章・8 章）
+
+### 移行
+
+実機では `git pull` と再起動だけで反映される（systemd ユニットの設定は変わらない）。
+
+```bash
+cd /home/pi/campus-chime
+git pull
+sudo systemctl restart campus_chime.service
+python3 campus_chime.py --test-hourly 12 --dry-run
+```
+
+天気予報が（1/2）（2/2）の大津の 2 文だけになっていれば反映されている。
+
+`config.json` に `weather.open_meteo.locations` を書いている場合はそちらが優先されるので、
+その行を消すこと。京都を含めたまま残すと、**京都の文だけ無音になる**（音声を削除したため）。
+
 ## [5.1.0] - 2026-09-29
 
 ### 変更
@@ -405,6 +443,7 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[5.2.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.2.0
 [5.1.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.1.0
 [5.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.0.0
 [4.0.1]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v4.0.1

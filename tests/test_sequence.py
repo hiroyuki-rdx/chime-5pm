@@ -20,8 +20,9 @@ from chime.weather import WeatherError
 
 EXTRA = DEFAULT_CONFIG["extra_segment"]
 
-#: StubWeather の既定の読み上げ文。2 地点（大津・京都）× 2 文
-#: （現在の天気／気温）を模した、実運用のパターン数と揃えた 4 要素。
+#: StubWeather の既定の読み上げ文。複数地点（大津・京都）を設定した場合を模した
+#: 4 要素（2 地点 × 2 文（現在の天気／気温））。既定（大津の 1 地点）では 2 文。
+#: 番号付け（1/4〜4/4）など複数文の扱いを確かめるために 4 文のまま使う。
 DEFAULT_WEATHER_SENTENCES = [
     "今の大津の天気は晴れなのだ。",
     "気温は28度なのだ。",
