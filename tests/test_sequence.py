@@ -183,14 +183,14 @@ class BuildHourlyTest(BuilderTestCase):
 
     def test_weather_hours_get_weather_then_quote(self):
         """既定設定（config.json を作らない場合、mode="both"）では、
-        ``extra_segment.weather_hours``（既定 10/12/14/16 時）に含まれる
+        ``extra_segment.weather_hours``（既定は 12 時だけ）に含まれる
         時刻だけ、時報のあとに天気予報（複数文）→ ひとこと の順に両方流れる
-        こと（2 時間おきに天気を流す、という新方針を回帰確認する）。
+        こと（天気は 12 時の 1 回だけ、という v5.1.0 の方針を回帰確認する）。
 
         スタブが 4 文返す場合、セグメントは
         時報音 1 + 時刻 1 + 天気 4 + ひとこと 1 = 7 個になる。
         """
-        for hour in (10, 12, 14, 16):
+        for hour in (12,):
             with self.subTest(hour=hour):
                 weather = StubWeather()
                 builder = self.make_builder(weather=weather)
@@ -202,12 +202,12 @@ class BuildHourlyTest(BuilderTestCase):
                     self.assertIn(sentence, plan.spoken)
 
     def test_non_weather_hours_get_quote_only_and_never_call_weather(self):
-        """``weather_hours`` に無い時刻（既定では 11/13/15 時）は、天気を
+        """``weather_hours`` に無い時刻（既定では 10/11/13/14/15/16 時）は、天気を
         まったく流さず「時報音 + 時刻 + ひとこと」の 3 個だけになること。
         また、その時刻では ``WeatherService`` を一度も呼ばないこと
         （呼ぶと毎正時に無駄な HTTP リクエストが発生してしまう）。
         """
-        for hour in (11, 13, 15):
+        for hour in (10, 11, 13, 14, 15, 16):
             with self.subTest(hour=hour):
                 weather = StubWeather()
                 builder = self.make_builder(weather=weather)
@@ -266,8 +266,8 @@ class BuildHourlyTest(BuilderTestCase):
         # 天気の各文が 1 つの文字列に連結されず、文ごとに独立したセグメント
         # として積まれること（作り置き音声は文単位のため、連結すると
         # 照合が外れてその文が無音になってしまう）。
-        # 10 時は既定の weather_hours に含まれる時刻。
-        plan = self.make_builder().build_hourly(10)
+        # 12 時は既定の weather_hours に含まれる時刻。
+        plan = self.make_builder().build_hourly(12)
 
         weather_start = 1  # plan.spoken[0] は時刻アナウンス
         weather_spoken = plan.spoken[weather_start:weather_start + len(self.weather.sentences)]
@@ -287,9 +287,9 @@ class BuildHourlyTest(BuilderTestCase):
         # 天気が全滅（WeatherError）しても、ひとことは必ず流れること。
         # かつ、ひとことが 2 つ流れないこと（mode="both" では
         # _append_weather(fallback=False) のため、ここでの失敗はひとことへ
-        # 二重に落とさない）。10 時は既定の weather_hours に含まれる時刻。
+        # 二重に落とさない）。12 時は既定の weather_hours に含まれる時刻。
         builder = self.make_builder(weather=StubWeather(fail=True))
-        plan = builder.build_hourly(10)
+        plan = builder.build_hourly(12)
 
         self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
         self.assertIsNotNone(plan.quote)
@@ -306,8 +306,8 @@ class BuildHourlyTest(BuilderTestCase):
         logging.disable(logging.NOTSET)
         try:
             with self.assertLogs("chime.sequence", level="WARNING") as cm:
-                # 10 時は既定の weather_hours に含まれる時刻。
-                plan = self.make_builder().build_hourly(10)
+                # 12 時は既定の weather_hours に含まれる時刻。
+                plan = self.make_builder().build_hourly(12)
         finally:
             logging.disable(logging.CRITICAL)
         self.assertTrue(any("mode" in message for message in cm.output))

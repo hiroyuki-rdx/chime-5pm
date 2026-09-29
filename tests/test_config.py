@@ -198,11 +198,10 @@ class WeatherIsCurrentConditionsTest(unittest.TestCase):
 
 
 class WeatherHoursTest(unittest.TestCase):
-    """天気予報は 2 時間おき（10/12/14/16 時）に流す。"""
+    """天気予報は 12 時の 1 回だけ流す（v5.0.0 までは 10/12/14/16 時の 2 時間おき）。"""
 
-    def test_weather_hours_are_every_two_hours(self):
-        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_hours"],
-                         [10, 12, 14, 16])
+    def test_weather_is_only_at_noon(self):
+        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["weather_hours"], [12])
 
     def test_weather_hours_are_within_the_hourly_schedule(self):
         """時報が鳴らない時刻を指定しても天気は流れない。

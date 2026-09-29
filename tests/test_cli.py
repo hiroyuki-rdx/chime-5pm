@@ -18,6 +18,7 @@ from chime import env
 from chime.audio import Segment
 from chime.cli import build_parser, run
 from chime.sequence import PlaybackPlan
+from chime.weather import WeatherError
 
 
 def call(argv):
@@ -115,8 +116,8 @@ class RunTest(unittest.TestCase):
         self.assertIn("0〜23", output)
 
     def test_weather_failure_returns_error_code(self):
-        # 天気予報は既定で無効なので、fetch_json の失敗を検証するこのテストでは
-        # 明示的に有効化する。
+        # 天気予報は既定で有効だが、fetch_json の失敗を検証するというこのテストの
+        # 前提を明示するために、あえて有効化しておく。
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
@@ -239,35 +240,38 @@ class RunTest(unittest.TestCase):
             code, output = call(["--test-hourly", "10", "--backend", "mock"])
         self.assertEqual(code, 1)
 
-    def test_test_hourly_weather_failure_with_quote_fallback_is_not_an_error(self):
-        """天気取得に失敗しても「ひとこと」への切り替えが成功していればエラーではない。
+    def test_test_hourly_weather_failure_is_not_an_error(self):
+        """天気取得に失敗しても、天気だけ飛ばして他のセグメントは鳴るのでエラーではない。
 
-        天気予報は既定で無効・出現確率も 0 なので、この 10 時だけは
-        必ず天気予報になるよう明示的に設定して、失敗経路を再現する。
+        既定（mode="both"）では 12 時に天気予報が流れる。その取得に失敗しても
+        時報音・時刻アナウンス・ひとことは鳴るため、終了コードは 0 のまま。
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
-                json.dump({"weather": {"enabled": True},
-                          "extra_segment": {"always_weather_hours": [10]}}, handle)
+                json.dump({"weather": {"enabled": True}}, handle)
             with mock.patch("chime.weather.fetch_json",
                             side_effect=__import__("chime.weather", fromlist=["x"]).WeatherError("圏外")):
-                code, output = call(["--config", path, "--test-hourly", "10",
+                code, output = call(["--config", path, "--test-hourly", "12",
                                      "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("天気予報を取得できませんでした", output)
 
     def test_test_hourly_default_config_uses_weather_and_quote(self):
-        """既定設定では、時報のあとに天気予報と「ひとこと」の両方が流れること。
+        """既定設定では、12 時の時報のあとに天気予報と「ひとこと」の両方が流れること。
 
-        天気の取得はここでは失敗する（この環境からは外部に出られない）が、
-        取得できなくても「ひとこと」は必ず流れる、という設計の確認も兼ねる。
+        単体テストをネットワークに依存させないため、天気の取得は
+        ``fetch_json`` のモックで失敗に確定させている。そのうえで、
+        取得できなくても「ひとこと」は必ず流れる、という設計を確かめる。
         """
         wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
-        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
-            code, output = call(["--test-hourly", "10", "--dry-run", "--backend", "mock"])
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav), \
+                mock.patch("chime.weather.fetch_json",
+                           side_effect=WeatherError("圏外")):
+            code, output = call(["--test-hourly", "12", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("ひとこと", output)
+        self.assertIn("天気予報を取得できませんでした", output)
 
     # -- 不具合4: 音源ファイルが全て欠落していても --test 系が 0 を返していた --
     # （仕様書 4.11 章「再生可能なセグメントを 1 つも用意できなかった場合は 1」に

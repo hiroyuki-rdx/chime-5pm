@@ -78,10 +78,12 @@ EOF
   echo "地域や時刻を変える場合は、config.example.json を見て必要な項目だけ config.json に書いてください。"
 fi
 
-log "時報音と定型文音声の生成"
+log "時報音の生成と、時刻アナウンスの音声の確認"
 if ! python3 "${REPO_DIR}/campus_chime.py" --generate-assets; then
-  warn "音声合成に失敗しました。時報音（ポ・ポ・ポ・ポーン）は鳴りますが、読み上げが出ません。"
-  warn "この文言の作り置き（assets/voice/）がありません。本機（Pi）では音声合成を行わないため、"
+  warn "時刻アナウンスの音声を用意できませんでした。時報音（ポ・ポ・ポ・ポーン）は鳴りますが、読み上げが出ません。"
+  warn "config.json が古い場合もあります（起動時に「既定値と同じ値を N 項目」の警告が出るなら該当します。"
+  warn "その場合は PC で作り直しても直りません。docs/SETUP.md の 10-7 を参照）。"
+  warn "そうでなければ、この文言の作り置き（assets/voice/）がありません。本機（Pi）では音声合成を行わないため、"
   warn "VOICEVOX を動かせる PC 側で作り直す必要があります。"
   warn "  1. PC で VOICEVOX ENGINE を起動する"
   warn "  2. PC 上のリポジトリで次を実行する:"

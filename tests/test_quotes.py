@@ -157,5 +157,24 @@ class ShippedQuotesTest(unittest.TestCase):
             self.assertTrue(quote.strip())
 
 
+class FallbackQuotesTest(unittest.TestCase):
+    """内蔵の予備のひとこと（``FALLBACK_QUOTES``）の健全性。
+
+    予備も読み上げ音声は作り置きから引くため、作り置きの無い文だと
+    ``quotes.json`` が読めないときに無音になってしまう。
+    """
+
+    def test_every_fallback_quote_has_a_prerecorded_voice(self):
+        manifest_path = os.path.join(REPO_ROOT, "assets", "voice", "manifest.json")
+        with open(manifest_path, "r", encoding="utf-8") as handle:
+            manifest = json.load(handle)
+        for quote in FALLBACK_QUOTES:
+            self.assertIn(quote, manifest)
+
+    def test_fallback_quotes_end_with_the_zundamon_ending(self):
+        for quote in FALLBACK_QUOTES:
+            self.assertTrue(quote.endswith("のだ。"), quote)
+
+
 if __name__ == "__main__":
     unittest.main()
