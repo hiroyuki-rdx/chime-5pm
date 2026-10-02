@@ -18,6 +18,8 @@ import logging
 import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
+from .jsonfile import JsonFileError, read_json
+
 logger = logging.getLogger(__name__)
 
 #: リポジトリ（インストール先）のルート。
@@ -257,6 +259,23 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
+_CHOICE_GUIDANCE = "天気を流す時刻は extra_segment.weather_hours で指定"
+_JMA_GUIDANCE = "天気は Open-Meteo（weather.open_meteo）に一本化"
+
+#: v6.0.0 で廃止予定の設定キー（ドット区切りのパス → 代わりの案内）。
+#: 設定ファイルに書かれていれば起動時に警告する（動作は変えない）。
+DEPRECATED_KEYS: Dict[str, str] = {
+    "extra_segment.mode": _CHOICE_GUIDANCE,
+    "extra_segment.weather_probability": _CHOICE_GUIDANCE,
+    "extra_segment.always_weather_hours": _CHOICE_GUIDANCE,
+    "extra_segment.always_quote_hours": _CHOICE_GUIDANCE,
+    "extra_segment.fallback_to_quote": _CHOICE_GUIDANCE,
+    "weather.provider": _JMA_GUIDANCE,
+    "weather.jma": _JMA_GUIDANCE,
+    "weather.max_weather_chars": _JMA_GUIDANCE,
+}
+
+
 class ConfigError(RuntimeError):
     """設定ファイルが読めない・壊れている場合に送出する。"""
 
@@ -343,6 +362,7 @@ def load_config(explicit_path: Optional[str] = None, base_dir: str = BASE_DIR) -
     for candidate in candidates:
         override = _read_json(candidate)
         _warn_if_defaults_were_copied(candidate, override)
+        _warn_deprecated_keys(candidate, override)
         data = deep_merge(data, override)
         sources.append(candidate)
 
@@ -407,14 +427,36 @@ def _warn_if_defaults_were_copied(path: str, override: Mapping[str, Any]) -> Non
     logger.warning("  既定値と同じ項目の例: %s", "、".join(redundant[:5]))
 
 
+def _has_key_path(data: Mapping[str, Any], path: str) -> bool:
+    """``"weather.jma"`` のようなドット区切りのキーが ``data`` にあるかを返す。"""
+    node: Any = data
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _warn_deprecated_keys(path: str, override: Mapping[str, Any]) -> None:
+    """廃止予定のキーが設定ファイルに書かれていれば警告する。
+
+    動作は変えない（警告のみ）。v6.0.0 で廃止するまでは、書かれていれば
+    これまでどおり効く。
+    """
+    for key, guidance in DEPRECATED_KEYS.items():
+        if _has_key_path(override, key):
+            logger.warning(
+                "%s の %s は v6.0.0 で廃止予定です（%s）。この行を消してください。",
+                path, key, guidance)
+
+
 def _read_json(path: str) -> Dict[str, Any]:
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    except FileNotFoundError as exc:
-        raise ConfigError(f"設定ファイルが見つかりません: {path}") from exc
-    except json.JSONDecodeError as exc:
-        raise ConfigError(f"設定ファイルの JSON が不正です: {path}: {exc}") from exc
+        loaded = read_json(path)
+    except JsonFileError as exc:
+        if exc.kind == "missing":
+            raise ConfigError(f"設定ファイルが見つかりません: {path}") from exc
+        raise ConfigError(str(exc)) from exc
     if not isinstance(loaded, dict):
         raise ConfigError(f"設定ファイルのトップレベルはオブジェクトである必要があります: {path}")
     return loaded

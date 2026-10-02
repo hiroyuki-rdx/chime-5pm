@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import re
@@ -52,15 +53,22 @@ class WeatherError(RuntimeError):
 
 
 def fetch_json(url: str, timeout: float) -> Any:
-    """JSON を取得する。失敗は :class:`WeatherError` に正規化する。"""
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    """JSON を取得する。失敗は :class:`WeatherError` に正規化する。
+
+    ``http.client.IncompleteRead``・``BadStatusLine`` などの ``HTTPException``
+    は ``OSError`` ではないため、個別に受けないと呼び出し側まで素通りする。
+    """
     try:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=timeout) as response:
             payload = response.read()
     except urllib.error.HTTPError as exc:
         raise WeatherError("天気 API が HTTP {0} を返しました: {1}".format(exc.code, url)) from exc
     except (urllib.error.URLError, OSError) as exc:
         raise WeatherError("天気 API へ接続できません: {0}".format(exc)) from exc
+    except (http.client.HTTPException, ValueError) as exc:
+        raise WeatherError("天気 API の応答を受け取れません: {0}: {1}".format(
+            type(exc).__name__, exc)) from exc
 
     try:
         return json.loads(payload.decode("utf-8"))
@@ -602,8 +610,14 @@ class WeatherService:
             return cached[2]
 
         payload = fetch_json(url, self.timeout)
-        parts = self._parse_one(payload, parse_settings, today)
-        sentences = build_sentences(parts, self.settings)
+        try:
+            parts = self._parse_one(payload, parse_settings, today)
+            sentences = build_sentences(parts, self.settings)
+        except (KeyError, IndexError, ValueError, TypeError, AttributeError) as exc:
+            # 応答の想定外の形や、sentence_* テンプレートの書き間違い（未知の
+            # 置換名など）。1 地点の失敗として扱い、他の地点を巻き込まない。
+            raise WeatherError("天気予報の解析または文の組み立てに失敗しました（{0}）: {1}: {2}".format(
+                cache_key, type(exc).__name__, exc)) from exc
         if not sentences:
             raise WeatherError("天気予報の読み上げ文を組み立てられませんでした。")
 

@@ -50,7 +50,8 @@ sudo systemctl is-enabled campus_chime.service
 # ログ
 journalctl -u campus_chime.service -f                 # 追尾
 journalctl -u campus_chime.service --since today      # 本日分
-journalctl -u campus_chime.service -p err --since -7d # 直近 1 週間のエラー
+journalctl -u campus_chime.service -p err --since -7d # 直近 1 週間のエラー（v5.3.0 から有効。それ以前は常に空だった）
+journalctl -u campus_chime.service -p warning --since -7d # 警告も見るなら
 
 # 予定
 python3 campus_chime.py --schedule
@@ -62,7 +63,7 @@ python3 campus_chime.py --test-hourly 12   # 12 時の時報
 python3 campus_chime.py --test             # 閉館放送
 python3 campus_chime.py --test-all         # 両方
 python3 campus_chime.py --weather          # 天気予報の読み上げ文を確認（大津の現況）
-python3 campus_chime.py --say "テストです"
+python3 campus_chime.py --say "正午をお知らせしたのだ。"   # 作り置きのある文言だけ鳴る
 
 # 音を出さずに内容だけ見る
 python3 campus_chime.py --test-all --dry-run
@@ -76,6 +77,8 @@ sudo systemctl start campus_chime.service
 ---
 
 ## 3. 運用作業
+
+> **16:55〜17:02（閉館放送の前後）は、更新・再起動・停止をしないでください。** 放送中にサービスを再起動しても再生は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了します（今後の版で改善予定）。待機中の再起動はすぐに効きます。
 
 ### 3-1. 設定を変える
 
@@ -148,7 +151,7 @@ grep -c "お知らせしました" config.json
 ### 3-4. 一時的に止める（休業日など）
 
 ```bash
-sudo systemctl stop campus_chime.service     # その場で停止（再起動すると復活）
+sudo systemctl stop campus_chime.service     # 停止（再起動すると復活）。待機中はすぐ止まるが、再生中は止まらない（3 章冒頭の注意）
 sudo systemctl disable --now campus_chime.service  # 自動起動も止める
 ```
 
@@ -268,7 +271,8 @@ journalctl -u campus_chime.service -n 100 --no-pager
 `Restart=always` のため 10 秒ごとに再起動します。設定ファイルの JSON 書式エラーが典型的な原因です。
 
 ```bash
-python3 -c "import json;json.load(open('/home/pi/campus-chime/config.json'))"
+cd /home/pi/campus-chime
+python3 campus_chime.py --print-config   # 壊れていれば、原因を日本語で表示して終了する
 # エラーが出たら書式を直す。応急処置として config.json を退避すれば既定値で動く
 mv config.json config.json.bak
 sudo systemctl restart campus_chime.service
@@ -291,7 +295,7 @@ sudo iw dev wlan0 set power_save off   # 省電力による切断を防ぐ（応
 
 | 頻度 | 作業 |
 |---|---|
-| 毎月 | 実際の正時に立ち会って放送を聴く／`journalctl -p err --since -30d` を確認 |
+| 毎月 | 実際の正時に立ち会って放送を聴く／`journalctl -p err --since -30d` を確認（v5.3.0 から有効。それ以前は常に空だった。警告も見るなら `-p warning`） |
 | 学期ごと | `sudo apt update && sudo apt upgrade`／再起動して自動復帰を確認 |
 | 年 1 回 | SD カードの健全性確認（可能ならバックアップイメージを取得） |
 | 都度 | 長期休業前後にスケジュール（`weekdays` / `skip_hours`）を見直す |

@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import logging
 import sys
-from datetime import datetime
 from typing import List, Optional
 
 from . import __version__, timesignal
 from .app import ChimeApp
-from .config import ConfigError, load_config
+from .config import DEFAULT_CONFIG, ConfigError, load_config
+from .logsetup import emit_early_error, setup_logging
 from .scheduler import format_events
 from .tts import TTSError
 from .weather import WeatherError
@@ -26,7 +27,7 @@ EPILOG = """\
   campus_chime.py --test-hourly 12     12 時の時報をその場で再生する
   campus_chime.py --test               閉館放送（アナウンス＋蛍の光）を再生する
   campus_chime.py --weather            天気予報の読み上げ文を確認する
-  campus_chime.py --say こんにちは      任意の文言を読み上げる
+  campus_chime.py --say 正午をお知らせしたのだ。  任意の文言を読み上げる
   campus_chime.py --generate-assets    時報音を生成し、時刻アナウンスの音声を用意できるか確認する
 """
 
@@ -71,42 +72,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def setup_logging(level_name: str, log_format: str, timezone: str = "") -> None:
-    """ログ設定。タイムスタンプは設定したタイムゾーンで表示する。"""
-    level = getattr(logging, str(level_name).upper(), logging.INFO)
-    logging.basicConfig(level=level, format=log_format, stream=sys.stdout)
-
-    if not timezone:
-        return
-    try:
-        from zoneinfo import ZoneInfo
-
-        tzinfo = ZoneInfo(timezone)
-    except Exception:  # pragma: no cover - tzdata 欠落時は OS のローカル時刻のまま
-        return
-
-    def _converter(timestamp):
-        return datetime.fromtimestamp(timestamp, tzinfo).timetuple()
-
-    for handler in logging.getLogger().handlers:
-        if handler.formatter is not None:
-            # インスタンス属性として差し替える（クラス属性だと self が渡ってしまう）
-            handler.formatter.converter = _converter
-
-
 def run(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
+    # load_config も警告を出す（既定値の丸ごとコピー・廃止予定のキー）。設定を
+    # 読む前なので、既定値で仮のログ設定をしておき、読み込み後に上書きする。
+    # --print-config は標準出力が JSON なので、警告は標準エラー出力へ出す。
+    log_stream = sys.stderr if args.print_config else None
+    defaults = DEFAULT_CONFIG["logging"]
+    setup_logging(args.log_level or defaults["level"], defaults["format"],
+                  DEFAULT_CONFIG["timezone"], stream=log_stream)
+
     try:
         config = load_config(args.config)
     except ConfigError as exc:
-        print("設定エラー: {0}".format(exc), file=sys.stderr)
+        emit_early_error("設定エラー: {0}".format(exc))
         return 2
 
     setup_logging(args.log_level or config.get("logging.level", "INFO"),
                   config.get("logging.format", "%(asctime)s - %(levelname)s - %(message)s"),
-                  str(config.get("timezone", "")))
+                  str(config.get("timezone", "")), stream=log_stream)
 
     if args.print_config:
         print(json.dumps(config.data, ensure_ascii=False, indent=2))
@@ -130,6 +116,7 @@ def run(argv: Optional[List[str]] = None) -> int:
         if not args.say.strip():
             print("読み上げる文言が空です。", file=sys.stderr)
             return 2
+        warn_if_not_prerecorded(app, args.say)
         app.log_environment()
         plan = app.builder.build_text(args.say)
         if not app.play(plan):
@@ -162,6 +149,32 @@ def run(argv: Optional[List[str]] = None) -> int:
 
     app.install_signal_handlers()
     return app.run_forever()
+
+
+def warn_if_not_prerecorded(app: ChimeApp, text: str) -> None:
+    """``--say`` の文言が作り置きに無ければ、Pi では無音になることを知らせる。
+
+    PC で VOICEVOX が動いていれば、作り置きに無い文言もその場で合成されて鳴る
+    ため、``--say`` が鳴っても Pi で鳴る証拠にならない。この案内は再生の可否
+    とは別で、再生は従来どおり試みる。
+    """
+    text = text.strip()
+    if app.tts.prerecorded_lookup(text) is not None:
+        return
+    known = app.tts.known_phrases()
+    if not known:
+        # 文言の有無ではなく、作り置きそのもの（assets/voice/ と目録）が無い。
+        print("作り置き（assets/voice/）が見つかりません。Pi では読み上げがすべて無音になります。"
+              "git pull が届いているか、設置場所を確認してください。", file=sys.stderr)
+        return
+    print("作り置き（assets/voice/）にこの文言がありません。Pi では無音になります。",
+          file=sys.stderr)
+    close = difflib.get_close_matches(text, known, n=3, cutoff=0.5)
+    if close:
+        print("  近い文言: {0}".format("、".join("「{0}」".format(phrase) for phrase in close)),
+              file=sys.stderr)
+    print("  作り置きに加えるには、PC で作り直します（docs/SETUP.md 8 章）",
+          file=sys.stderr)
 
 
 def generate_assets(app: ChimeApp) -> int:

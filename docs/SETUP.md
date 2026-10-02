@@ -365,9 +365,14 @@ python3 campus_chime.py --schedule   # 反映されたか確認
 
 **地点や読み上げ項目を変えたら、必ず音声を作り置きし直してください**（8 章）。作り置きに無い文言は**その 1 文だけ無音になります**（時報音・蛍の光・他の文言は鳴ります）。京都の音声も v5.2.0 で削除したため、京都を足す場合も作り直しが必要です。
 
+作り直しは PC で行います。`config.json` は Git 管理外で PC には無いため、**Pi の `config.json` を PC に持ってきて `--config` で渡します**（渡さないと、足した地点の文言は生成されません）。
+
 ```bash
-python3 scripts/generate_voicevox.py --include-quotes --prune
+scp pi@<Pi のホスト名>:/home/pi/campus-chime/config.json ./pi-config.json
+python3 scripts/generate_voicevox.py --config pi-config.json --include-quotes --prune
 ```
+
+`--config` は、Pi の `config.json` で文言を変えたときに付けるものです。`config.json` を変えていない場合は、付けなくて構いません（8 章）。
 
 **読み上げる項目を変える**
 
@@ -489,13 +494,26 @@ curl -s http://127.0.0.1:50021/version
 
 2. PC 側でリポジトリを clone し、次を実行
 
+Pi の `config.json` で文言を変えている（天気の地点を足した、時刻アナウンスの言い回しを変えたなど）場合は、その `config.json` を PC に持ってきて `--config` で渡します。
+
+```bash
+scp pi@<Pi のホスト名>:/home/pi/campus-chime/config.json ./pi-config.json
+python3 scripts/generate_voicevox.py --config pi-config.json --include-quotes --prune
+```
+
+`config.json` を変えていない場合は、`--config` なしで構いません。
+
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes --prune
 ```
 
-生成されるのは **138 件**（時刻アナウンス 7 ＋ ひとこと 57 ＋ 天気 74）です。数分かかります。
+`--config` を付けたときに生成する文言は、その設定の文言に**既定の設定の文言を足したもの**です。`config.json` の配列は既定値を丸ごと置き換える（地点に京都だけを書くと、既定の大津が外れる）ため、既定の分も常に含めて、同梱の作り置きを崩さないようにしています。
 
-`--prune` は、**現在の文言集合に無くなった古い音声と manifest のエントリを削除**します。manifest はマージ方式で書き戻すため、文言（語尾や地名、読み上げる項目）を変えると古いファイルが残り続けます。付けない場合も残存件数は表示されるので、消す前に確認できます。
+既定の設定では **138 件**（時刻アナウンス 7 ＋ ひとこと 57 ＋ 天気 74）が生成されます。`--config` で足した文言の分は、これに加わります。数分かかります。
+
+`--prune` は、**現在の文言集合に無くなった古い音声と manifest のエントリを削除**します。manifest はマージ方式で書き戻すため、文言（語尾や地名、読み上げる項目）を変えると古いファイルが残り続けます。付けない場合も残存件数は表示されるので、消す前に確認できます。残す文言の判定も、`--config` の設定の文言と既定の設定の文言の両方が対象です。
+
+**`--config` なしで `--prune` を付けると、Pi の `config.json` で足した文言（地点など）の作り置きは消えます**（警告が出ますが、処理は続きます）。Pi の `config.json` で文言を足しているなら、`--prune` のときは必ず `--config` を付けてください。
 
 `scripts/generate_voicevox.py` は既定でエンジンの起動を最大 90 秒待つため（`--wait` で変更可能）、起動直後で `/version` が応答しない状態でもそのまま実行して構いません。90 秒待っても応答しない場合はエラーメッセージの案内に従って確認してください。
 
@@ -504,6 +522,8 @@ Docker Desktop（Windows）で VOICEVOX ENGINE を動かしている場合、WSL
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes --prune --base-url http://<ホストのIP>:50021
 ```
+
+Pi の `config.json` を渡す場合は、この例にも `--config pi-config.json` を加えてください。
 
 生成した音声を WSL2 側でその場で試聴する場合は、既定では音が鳴りません。`--backend pygame` を明示してください（詳しくは「10-6. WSL2 で試すと音が鳴らない」参照）。
 
@@ -551,6 +571,8 @@ python3 campus_chime.py --test-hourly
 ---
 
 ### A. Pi 側で反映する
+
+> **16:55〜17:02（閉館放送の前後）は、更新も再起動もしないでください。** 放送中にサービスを再起動しても再生は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了します（今後の版で改善予定）。
 
 ```bash
 cd /home/pi/campus-chime
@@ -625,7 +647,14 @@ docker start voicevox
 curl -s http://127.0.0.1:50021/version
 ```
 
-バージョンが返ってから、
+バージョンが返ってから、Pi の `config.json` で文言を変えている場合は、その `config.json` を PC に持ってきて `--config` で渡します。
+
+```bash
+scp pi@<Pi のホスト名>:/home/pi/campus-chime/config.json ./pi-config.json
+python3 scripts/generate_voicevox.py --config pi-config.json --include-quotes --prune
+```
+
+`config.json` を変えていない場合は、`--config` なしで構いません。
 
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes --prune
@@ -633,7 +662,9 @@ python3 scripts/generate_voicevox.py --include-quotes --prune
 
 `--prune` は、**使われなくなった古い音声と manifest のエントリを削除**します。manifest は
 マージ方式で書き戻すため、これを付けないと古いファイルが残り続けます。付けない場合も
-残存件数は表示されるので、消す前に確認できます。
+残存件数は表示されるので、消す前に確認できます。`--config` なしで付けると、Pi の
+`config.json` で足した文言（地点など）の作り置きも消えるため、足している場合は必ず
+`--config` を付けてください（8 章）。
 
 生成できたか確認します。
 

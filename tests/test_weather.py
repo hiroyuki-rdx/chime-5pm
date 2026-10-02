@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import unittest
@@ -13,9 +14,9 @@ from tests.support import load_fixture  # noqa: F401
 
 from chime.config import DEFAULT_CONFIG
 from chime.weather import (WMO_CODES, WeatherError, WeatherService, build_sentences,
-                           build_text, drop_after_markers, normalize_weather_text,
-                           parse_jma, parse_open_meteo, prerecord_phrases,
-                           truncate_weather_text)
+                           build_text, drop_after_markers, fetch_json,
+                           normalize_weather_text, parse_jma, parse_open_meteo,
+                           prerecord_phrases, truncate_weather_text)
 
 WEATHER = DEFAULT_CONFIG["weather"]
 TODAY = date(2026, 8, 26)
@@ -804,6 +805,184 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
         with mock.patch("chime.weather.fetch_json", side_effect=WeatherError("圏外")):
             with self.assertRaises(WeatherError):
                 service.describe_sentences(today=TODAY)
+
+
+def _response(body=None, read_error=None):
+    """``urlopen`` が返す応答のモック（``with`` で使え、``read()`` が本文か例外を返す）。"""
+    response = mock.MagicMock()
+    response.__enter__.return_value = response
+    if read_error is not None:
+        response.read.side_effect = read_error
+    else:
+        response.read.return_value = json.dumps(body).encode("utf-8")
+    return response
+
+
+class FetchJsonTest(unittest.TestCase):
+    """``fetch_json`` は通信まわりの失敗をすべて WeatherError にそろえる。
+
+    ``http.client.IncompleteRead`` と ``BadStatusLine`` は ``OSError`` ではない
+    ため、以前は素通りして放送の組み立てまで壊していた。``urlopen`` をモックし、
+    ネットワークには接続しない。
+    """
+
+    URL = "https://example.invalid/forecast.json"
+
+    def test_incomplete_read_becomes_weather_error(self):
+        response = _response(read_error=http.client.IncompleteRead(b"{\"cur", 200))
+        with mock.patch("chime.weather.urllib.request.urlopen", return_value=response):
+            with self.assertRaises(WeatherError):
+                fetch_json(self.URL, 8.0)
+
+    def test_bad_status_line_becomes_weather_error(self):
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        side_effect=http.client.BadStatusLine("")):
+            with self.assertRaises(WeatherError):
+                fetch_json(self.URL, 8.0)
+
+    def test_other_http_exceptions_become_weather_error(self):
+        # IncompleteRead / BadStatusLine の親クラス（HTTPException）ごと受ける。
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        side_effect=http.client.RemoteDisconnected("切断された")):
+            with self.assertRaises(WeatherError):
+                fetch_json(self.URL, 8.0)
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        side_effect=http.client.LineTooLong("status line")):
+            with self.assertRaises(WeatherError):
+                fetch_json(self.URL, 8.0)
+
+    def test_value_error_becomes_weather_error(self):
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        side_effect=ValueError("unknown url type")):
+            with self.assertRaises(WeatherError):
+                fetch_json(self.URL, 8.0)
+
+    def test_malformed_url_becomes_weather_error(self):
+        with self.assertRaises(WeatherError):
+            fetch_json("not-a-url", 8.0)
+
+    def test_the_error_message_names_the_exception_type(self):
+        # BadStatusLine の文言は空の引用符だけで、型名が無いと原因を読み取れない。
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        side_effect=http.client.BadStatusLine("")):
+            with self.assertRaises(WeatherError) as caught:
+                fetch_json(self.URL, 8.0)
+        self.assertIn("BadStatusLine", str(caught.exception))
+
+    def test_a_valid_response_is_still_parsed(self):
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        return_value=_response({"ok": True})):
+            self.assertEqual(fetch_json(self.URL, 8.0), {"ok": True})
+
+
+class DescribeSentencesDegradeTest(unittest.TestCase):
+    """1 地点の失敗（通信・解析・文の組み立て）が、他の地点を巻き込まないこと。"""
+
+    def setUp(self):
+        self.otsu_payload = load_fixture("open_meteo.json")
+        self.kyoto_payload = load_fixture("open_meteo_kyoto.json")
+
+    def test_incomplete_read_on_one_location_keeps_the_other(self):
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
+        responses = [
+            _response(read_error=http.client.IncompleteRead(b"{", 500)),
+            _response(self.kyoto_payload),
+        ]
+        with mock.patch("chime.weather.urllib.request.urlopen", side_effect=responses):
+            sentences = service.describe_sentences(today=TODAY)
+        self.assertEqual(len(sentences), 2)
+        self.assertIn("京都", "".join(sentences))
+
+    def test_bad_status_line_on_one_location_keeps_the_other(self):
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
+        responses = [_response(self.otsu_payload), http.client.BadStatusLine("")]
+        with mock.patch("chime.weather.urllib.request.urlopen", side_effect=responses):
+            sentences = service.describe_sentences(today=TODAY)
+        self.assertEqual(len(sentences), 2)
+        self.assertIn("大津", "".join(sentences))
+
+    def test_incomplete_read_on_every_location_raises_weather_error(self):
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        return_value=_response(read_error=http.client.IncompleteRead(b"", 1))):
+            with self.assertRaises(WeatherError):
+                service.describe_sentences(today=TODAY)
+
+    def test_unknown_placeholder_in_sentence_temp_becomes_weather_error(self):
+        # config.json の書き間違い（{temp} を {degrees} と書いた等）は KeyError になる。
+        service = WeatherService(dict(
+            WEATHER, provider="open_meteo", sentence_temp="気温は{degrees}度なのだ。"))
+        with mock.patch("chime.weather.fetch_json", return_value=self.otsu_payload):
+            with self.assertRaises(WeatherError):
+                service.describe_sentences(today=TODAY)
+
+    def test_every_sentence_template_typo_becomes_weather_error(self):
+        # 既定で空の sentence_temp_max / sentence_pop も、有効にしたうえで
+        # 書き間違えた場合に同じく WeatherError になること。
+        typos = {
+            "sentence_weather": "今の{place}の天気は{weather}なのだ。",
+            "sentence_temp": "気温は{degrees}度なのだ。",
+            "sentence_temp_max": "最高気温は{max}度なのだ。",
+            "sentence_pop": "降水確率は{percent}パーセントなのだ。",
+        }
+        for key, template in typos.items():
+            with self.subTest(key=key):
+                settings = dict(
+                    WEATHER, provider="open_meteo",
+                    sentence_temp_max="最高気温は{temp_max}度なのだ。",
+                    sentence_pop="降水確率は{pop}パーセントなのだ。")
+                settings[key] = template
+                service = WeatherService(settings)
+                with mock.patch("chime.weather.fetch_json", return_value=self.otsu_payload):
+                    with self.assertRaises(WeatherError):
+                        service.describe_sentences(today=TODAY)
+
+    def test_positional_or_broken_placeholder_becomes_weather_error(self):
+        # {0}（IndexError）と閉じていない {（ValueError）。
+        for template in ("気温は{0}度なのだ。", "気温は{temp度なのだ。"):
+            with self.subTest(template=template):
+                service = WeatherService(dict(
+                    WEATHER, provider="open_meteo", sentence_temp=template))
+                with mock.patch("chime.weather.fetch_json", return_value=self.otsu_payload):
+                    with self.assertRaises(WeatherError):
+                        service.describe_sentences(today=TODAY)
+
+    def test_unexpected_parse_errors_become_weather_error(self):
+        # 解析の途中で出た想定外の例外も、1 地点の失敗として WeatherError にそろえる。
+        for error in (KeyError("x"), IndexError("x"), ValueError("x"),
+                      TypeError("x"), AttributeError("x")):
+            with self.subTest(error=type(error).__name__):
+                service = WeatherService(dict(WEATHER, provider="open_meteo"))
+                with mock.patch("chime.weather.fetch_json", return_value=self.otsu_payload), \
+                        mock.patch("chime.weather.parse_open_meteo", side_effect=error):
+                    with self.assertRaises(WeatherError):
+                        service.describe_sentences(today=TODAY)
+
+    def test_a_parse_error_on_one_location_keeps_the_other(self):
+        service = WeatherService(dict(WEATHER_TWO_LOCATIONS, provider="open_meteo"))
+        real_parse = parse_open_meteo
+        calls = []
+
+        def flaky_parse(payload, settings, today):
+            calls.append(settings.get("label"))
+            if len(calls) == 1:
+                raise KeyError("current")
+            return real_parse(payload, settings, today)
+
+        with mock.patch("chime.weather.fetch_json",
+                        side_effect=[self.otsu_payload, self.kyoto_payload]), \
+                mock.patch("chime.weather.parse_open_meteo", side_effect=flaky_parse):
+            sentences = service.describe_sentences(today=TODAY)
+        self.assertEqual(len(sentences), 2)
+        self.assertIn("京都", "".join(sentences))
+
+    def test_weather_error_from_fetch_is_not_rewrapped(self):
+        # 既に WeatherError になっているものは、そのまま（メッセージを保って）通す。
+        service = WeatherService(dict(WEATHER, provider="open_meteo"))
+        with mock.patch("chime.weather.fetch_json", side_effect=WeatherError("圏外です")):
+            with self.assertRaises(WeatherError) as caught:
+                service.describe_sentences(today=TODAY)
+        self.assertIn("全地点で失敗", str(caught.exception))
 
 
 if __name__ == "__main__":

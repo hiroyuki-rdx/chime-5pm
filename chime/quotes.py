@@ -6,11 +6,11 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import random
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+
+from .jsonfile import JsonFileError, read_json
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +37,13 @@ def load_quotes(path: str) -> Dict[str, Any]:
           "by_hour": {"12": ["お昼の一言"], "16": ["夕方の一言"]}
         }
     """
-    if not os.path.exists(path):
-        logger.warning("ひとことファイルが見つかりません: %s（内蔵の予備を使います）", path)
-        return {"general": list(FALLBACK_QUOTES), "by_hour": {}}
-
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, OSError) as exc:
-        logger.error("ひとことファイルを読めません: %s: %s", path, exc)
+        data = read_json(path)
+    except JsonFileError as exc:
+        if exc.kind == "missing":
+            logger.warning("ひとことファイルが見つかりません: %s（内蔵の予備を使います）", path)
+        else:
+            logger.error("ひとことファイルを読めません（内蔵の予備を使います）: %s", exc)
         return {"general": list(FALLBACK_QUOTES), "by_hour": {}}
 
     if isinstance(data, list):

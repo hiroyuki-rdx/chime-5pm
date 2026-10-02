@@ -40,7 +40,8 @@
 | v4.0.0 | 2026/09 | 読み上げを**ずんだもんの声と「なのだ」調に統一**（全文言を事前生成して同梱）。天気予報を**現在の天気と気温**にし、大津・京都の 2 地点を 2 時間おきに流す。詳細は [CHANGELOG.md](CHANGELOG.md) |
 | v5.0.0 | 2026/09 | 作り置きに無い文言を実行時に合成していた**Open JTalk のフォールバックをコードごと削除**し、**VOICEVOX:ずんだもんの作り置き音声のみ**にした（フォールバックがあると、壊れていても「それらしく」鳴ってしまうため）。作り置きに無い文言は**その 1 文だけ無音**になる（放送本体は止まらない）。詳細は [CHANGELOG.md](CHANGELOG.md) |
 | v5.1.0 | 2026/09 | 天気予報を**12 時の 1 回だけ**にした（それまでは 2 時間おき）。あわせてレビューで見つけた不具合（予備のひとことが無音になる、`--prune` がひとことの音声を消す）を直した。詳細は [CHANGELOG.md](CHANGELOG.md) |
-| **v5.2.0** | **2026/09** | 天気予報を**大津だけ**にした（それまでは大津・京都の 2 地点）。詳細は [CHANGELOG.md](CHANGELOG.md) |
+| v5.2.0 | 2026/09 | 天気予報を**大津だけ**にした（それまでは大津・京都の 2 地点）。詳細は [CHANGELOG.md](CHANGELOG.md) |
+| **v5.3.0** | **2026/09** | **事故の芽の修正**（通信の途中切断や設定の書き間違いでも時報音は鳴る、UTF-8 以外で保存した `config.json` の原因が日本語で分かり、BOM 付き UTF-8 も読める、`journalctl -p err` が効く ほか）。詳細は [CHANGELOG.md](CHANGELOG.md) |
 
 v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです。
 
@@ -159,7 +160,7 @@ python3 campus_chime.py --test-hourly 12   # 12 時の時報を即再生
 python3 campus_chime.py --test             # 閉館放送を即再生
 python3 campus_chime.py --test-all         # 時報 → 閉館放送を続けて再生
 python3 campus_chime.py --weather          # 天気予報の読み上げ文を確認
-python3 campus_chime.py --say "テストです"   # 任意の文言を読み上げ
+python3 campus_chime.py --say "正午をお知らせしたのだ。"   # 任意の文言を読み上げ（作り置きのある文言だけ鳴る）
 python3 campus_chime.py --generate-assets  # 時報音の生成と、時刻アナウンスの音声の確認
 python3 campus_chime.py --print-config     # 適用中の設定を表示
 python3 campus_chime.py --dry-run --test   # 音を出さず内容だけ確認
@@ -225,6 +226,8 @@ sudo systemctl restart campus_chime.service
 ```
 
 `scripts/setup.sh --no-apt` は、時報音の生成、時刻アナウンスの音声の確認、サービスの登録し直しと再起動を行います。何度実行しても安全で、`config.json` は上書きしません。
+
+> **重要:** **16:55〜17:02（閉館放送の前後）は、更新も再起動もしないでください。** 放送中にサービスを再起動しても再生は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了します（今後の版で改善予定）。
 
 ### 確認する
 

@@ -37,7 +37,8 @@ class ChimeApp:
         self.tzinfo = self._resolve_timezone(config.get("timezone", "Asia/Tokyo"))
         self.stop_event = threading.Event()
 
-        self.state = State(config.path("state.file"))
+        # dry-run は実機の記録（再生済み・直近のひとこと）を書き換えない。
+        self.state = State(config.path("state.file"), read_only=dry_run)
         self.tts = TTSService(
             config.section("tts"),
             config.base_dir,
@@ -144,16 +145,28 @@ class ChimeApp:
         return True
 
     def run_event(self, event: Event) -> None:
-        """イベント 1 件を準備・再生し、再生済みとして記録する。"""
+        """イベント 1 件を準備・再生し、再生済みとして記録する。
+
+        組み立てが失敗しても、最小のプラン（時報音／閉館アナウンスと蛍の光）
+        で鳴らす。選んだひとことは、再生できたときだけ記録する（鳴らせな
+        かった文を「使った」ことにしない）。再生済みの記録は、再生に失敗
+        しても付ける（無限にやり直さない）。
+        """
         logger.info("イベント準備: %s", event.describe())
-        plan = self.builder.build(event)
+        try:
+            plan = self.builder.build(event)
+        except Exception as exc:
+            logger.exception("再生内容の組み立てに失敗しました（最小の内容で鳴らします）: %s", exc)
+            plan = self.builder.build_minimal(event)
 
         if not self.scheduler.sleep_until(event.play_at, self.stop_event, precise=True):
             logger.info("停止要求のため再生を中止しました: %s", event.describe())
             return
 
         logger.info("再生開始: %s", event.describe())
-        self.play(plan)
+        played = self.play(plan)
+        if played and plan.quote and not self.dry_run:
+            self.state.remember_quote(plan.quote)
         self.state.mark_fired(event.key, event.day)
 
     def run_forever(self) -> int:

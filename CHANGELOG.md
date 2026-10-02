@@ -3,6 +3,75 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [5.3.0] - 2026-09-29
+
+コードと運用手順を観点別に洗い直し、実害の出うる「事故の芽」をまとめて直した版。
+設定の既定値と読み上げ文言は変わらない（作り置き音声の作り直しは不要）。
+
+### 修正
+
+- **通信の途中切断や設定の書き間違いで、その正時が時報音ごと無音になっていた**
+
+  天気の取得中に接続が途中で切れると（`http.client.IncompleteRead` など。`OSError` では
+  ない）、例外が天気の処理を素通りして放送の組み立て全体が失敗し、その正時は時報音も
+  鳴らないまま「再生済み」になっていた。`config.json` の読み上げ文のテンプレートの
+  書き間違い（例 `{hours}`）でも同じことが起きた。放送を部品（時報音・時刻アナウンス・
+  天気・ひとこと）ごとに守るようにし、1 つが壊れても残りは鳴る。時刻アナウンスの
+  テンプレートを書き間違えたときは既定の文言で読む。組み立て全体が失敗しても、
+  最小構成（時報音、または閉館アナウンスと蛍の光）で鳴らす
+- **閉館放送で、アナウンスか蛍の光の片方の音源が無いと、両方とも鳴らなかった。**
+  欠けた方だけを飛ばす
+- **UTF-8 以外で保存した `config.json`（Windows のメモ帳の Shift_JIS など）で、
+  Python のエラーを出して落ちていた。** 「UTF-8 で保存し直して」と日本語で案内して
+  終了コード 2 にする（常駐は systemd が再起動を繰り返すが、journal に原因が出る）。
+  BOM 付き UTF-8 も読めるようにした。JSON の書き間違いは行・桁と、全角の記号・
+  最後のカンマのヒントを出す。状態ファイル・ひとことファイル・作り置きの目録も
+  同じ読み込みにし、文字コードが壊れていても落ちない
+- **`journalctl -p err` が常に空だった。** ログを素の標準出力に出していたため、
+  systemd がすべての行を info として記録していた。systemd 配下では各行に重大度の
+  接頭辞を付け、`-p err`・`-p warning` で絞り込めるようにした（手動実行の表示は従来どおり）
+- **README などの `--say "テストです"` の例が、Pi では必ず無音だった**（作り置きに
+  無い文言のため）。例を作り置きのある文言にし、作り置きに無い文言を `--say` に渡すと
+  「Pi では無音になる」ことと近い文言の候補を出すようにした。無音になった文の警告には、
+  その文を入れるようにした。`assets/voice/` そのものが見つからないときは「この文言が
+  ありません」ではなく、フォルダが見つからない（`git pull` が届いていない・設置場所の
+  違い）と案内する
+- **`--dry-run` や `--test-hourly` などの試し鳴らしで、`cache/state.json`（直近の
+  ひとこと）が書き換わっていた。** 試し鳴らしは状態ファイルを書かない。常駐でも、
+  ひとことは実際に再生できたときだけ「使った」と記録する
+- **Pi の `config.json` で文言や地点を変えても、PC で読み上げ音声を作り直せなかった。**
+  `scripts/generate_voicevox.py` が PC の設定しか読まなかったため。`--config` で Pi の
+  `config.json` を渡せるようにした（生成するのは、その設定の文言に既定の設定の文言を
+  足したもの）。v5.2.0 の `docs/SETUP.md`「京都を足す」手順もこの形に直した。
+  合成に失敗した文言が manifest に載ってしまう不具合も直した
+- CI の起動確認が、毎回実際に天気 API へ通信していた
+
+### 追加
+
+- `generate_voicevox.py --config`（上記）
+- **廃止予定の設定の警告**: `extra_segment.mode`・`weather_probability`・
+  `always_weather_hours`・`always_quote_hours`・`fallback_to_quote`、
+  `weather.provider`・`jma`・`max_weather_chars` が `config.json` にあると、起動時に
+  「v6.0.0 で廃止予定」と警告する（動作は変えない）
+- CI に pyflakes を追加
+
+### 運用上の注意（文書に追記）
+
+- **16:55〜17:02（閉館放送の前後）は、更新・再起動・停止をしない。** 再生中は
+  停止要求に応じず、蛍の光の途中なら systemd が約 90 秒後に強制終了する（今後の版で改善予定）
+
+### 移行
+
+```bash
+cd /home/pi/campus-chime
+git pull
+bash scripts/setup.sh --no-apt
+python3 campus_chime.py --test-hourly 12 --dry-run
+journalctl -u campus_chime.service -p warning --since "10 min ago"
+```
+
+最後のコマンドで「v6.0.0 で廃止予定」と出たら、その行を `config.json` から消す。
+
 ## [5.2.0] - 2026-09-29
 
 ### 変更
@@ -443,6 +512,7 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[5.3.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.3.0
 [5.2.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.2.0
 [5.1.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.1.0
 [5.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.0.0

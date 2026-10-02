@@ -7,10 +7,10 @@
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from typing import Any, Dict, List, Optional
+
+from .jsonfile import JsonFileError, read_json, write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -18,22 +18,26 @@ MAX_RECENT_QUOTES = 32
 
 
 class State:
-    """``cache/state.json`` の読み書き。"""
+    """``cache/state.json`` の読み書き。
 
-    def __init__(self, path: str) -> None:
+    ``read_only=True`` のときは読み込むだけで、ファイルを作らず書かない
+    （記録はメモリ上だけに残る）。動作確認の実行で、実機の記録を
+    書き換えないために使う。
+    """
+
+    def __init__(self, path: str, read_only: bool = False) -> None:
         self.path = path
+        self.read_only = read_only
         self._data: Dict[str, Any] = {"last_fired": {}, "recent_quotes": []}
         self.load()
 
     # ------------------------------------------------------------------
     def load(self) -> None:
-        if not os.path.exists(self.path):
-            return
         try:
-            with open(self.path, "r", encoding="utf-8") as handle:
-                loaded = json.load(handle)
-        except (json.JSONDecodeError, OSError) as exc:
-            logger.warning("状態ファイルを読めません（初期化します）: %s: %s", self.path, exc)
+            loaded = read_json(self.path)
+        except JsonFileError as exc:
+            if exc.kind != "missing":
+                logger.warning("状態ファイルを読めません（初期化します）: %s", exc)
             return
         if not isinstance(loaded, dict):
             logger.warning("状態ファイルの形式が不正です（初期化します）: %s", self.path)
@@ -47,14 +51,10 @@ class State:
         self._data["recent_quotes"] = [str(item) for item in recent] if isinstance(recent, list) else []
 
     def save(self) -> None:
-        directory = os.path.dirname(os.path.abspath(self.path))
+        if self.read_only:
+            return
         try:
-            os.makedirs(directory, exist_ok=True)
-            temp_path = "{0}.{1}.tmp".format(self.path, os.getpid())
-            with open(temp_path, "w", encoding="utf-8") as handle:
-                json.dump(self._data, handle, ensure_ascii=False, indent=2)
-                handle.write("\n")
-            os.replace(temp_path, self.path)
+            write_json_atomic(self.path, self._data)
         except OSError as exc:
             logger.error("状態ファイルを保存できません: %s: %s", self.path, exc)
 
