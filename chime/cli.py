@@ -161,9 +161,15 @@ def warn_if_not_prerecorded(app: ChimeApp, text: str) -> None:
     text = text.strip()
     if app.tts.prerecorded_lookup(text) is not None:
         return
+    known = app.tts.known_phrases()
+    if not known:
+        # 文言の有無ではなく、作り置きそのもの（assets/voice/ と目録）が無い。
+        print("作り置き（assets/voice/）が見つかりません。Pi では読み上げがすべて無音になります。"
+              "git pull が届いているか、設置場所を確認してください。", file=sys.stderr)
+        return
     print("作り置き（assets/voice/）にこの文言がありません。Pi では無音になります。",
           file=sys.stderr)
-    close = difflib.get_close_matches(text, app.tts.known_phrases(), n=3, cutoff=0.5)
+    close = difflib.get_close_matches(text, known, n=3, cutoff=0.5)
     if close:
         print("  近い文言: {0}".format("、".join("「{0}」".format(phrase) for phrase in close)),
               file=sys.stderr)

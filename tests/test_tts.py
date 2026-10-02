@@ -148,6 +148,21 @@ class ServiceTest(unittest.TestCase):
                         message)
         self.assertIn("（VOICEVOX ENGINE も使えません。Pi ではこれが正常）", message)
 
+    def test_error_says_the_folder_is_missing_when_it_is(self):
+        # assets/voice/ そのものが無いときに「この文言がありません」と出すと、
+        # 原因（git pull が届いていない・設置場所の違い）に辿り着けない。
+        missing = os.path.join(self.cache, "no-such-voice-dir")
+        service = TTSService({"engines": ["prerecorded", "voicevox"]}, "/tmp",
+                             self.cache, missing)
+        with mock.patch("chime.tts.urllib.request.urlopen",
+                        side_effect=urllib.error.URLError("接続できない")):
+            with self.assertRaises(TTSError) as caught:
+                service.synthesize("正午をお知らせしたのだ。")
+        message = str(caught.exception)
+        self.assertTrue(message.startswith("作り置きのフォルダ（assets/voice/）が見つかりません"),
+                        message)
+        self.assertNotIn("この文言がありません", message)
+
     def test_error_keeps_the_details_of_each_engine(self):
         service = TTSService({"engines": ["prerecorded", "voicevox"]}, "/tmp",
                              self.cache, self._prerecorded_dir())
@@ -221,7 +236,8 @@ class ServiceTest(unittest.TestCase):
                         side_effect=urllib.error.URLError("接続できない")):
             with self.assertRaises(TTSError) as caught:
                 service.synthesize("これはどこにも作り置きの無い文言です")
-        self.assertIn("作り置き（assets/voice/）にこの文言がありません", str(caught.exception))
+        # 作り置き先（self.cache/voice）は作っていないので、フォルダが無いと案内される
+        self.assertIn("作り置きのフォルダ（assets/voice/）が見つかりません", str(caught.exception))
 
 
 class PrerecordedEngineTest(unittest.TestCase):

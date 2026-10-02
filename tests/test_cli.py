@@ -456,6 +456,22 @@ class RunTest(unittest.TestCase):
         self.assertNotIn("近い文言", stderr)
         self.assertIn("docs/SETUP.md 8 章", stderr)
 
+    def test_say_reports_missing_voice_folder_instead_of_missing_phrase(self):
+        # assets/voice/ が丸ごと無いときは「この文言がありません」ではなく、
+        # 作り置きそのものが見つからないことを案内する。
+        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"tts": {"prerecorded_dir": os.path.join(tmp, "no-such-dir")}}, handle)
+            with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+                code, stdout, stderr = call_split(
+                    ["--config", path, "--say", "正午をお知らせしたのだ。",
+                     "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertIn("作り置き（assets/voice/）が見つかりません", stderr)
+        self.assertNotIn("この文言がありません", stderr)
+
     def test_say_unknown_phrase_keeps_exit_code_when_synthesis_fails(self):
         """案内を出しても終了コードの決まり方は変わらない（合成も再生もできなければ 1）。"""
         with mock.patch("chime.tts.TTSService.synthesize", side_effect=TTSError("失敗")):

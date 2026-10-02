@@ -9,10 +9,11 @@ on:
 permissions:
   contents: read
 
-# 同じ ref で新しい実行が始まったら、古い実行は止める。
+# 同じ ref で新しい実行が始まったら、古い実行は止める。ただし main は止めない
+# （続けてマージしたとき、どのコミットにも CI の結果が残るように）。
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
   test:

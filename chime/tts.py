@@ -280,7 +280,12 @@ class TTSService:
             raise TTSError("音声合成に失敗しました（" + detail + "）")
         # 主な原因は「作り置きに無い」こと。Pi では VOICEVOX ENGINE が動いて
         # いないのが正常なので、そちらは補足に留める。
-        summary = "作り置き（assets/voice/）にこの文言がありません"
+        if "prerecorded" in unavailable:
+            # 文言の有無ではなく、作り置きのフォルダそのものが無い（git pull が
+            # 届いていない、設置場所が違うなど）。
+            summary = "作り置きのフォルダ（assets/voice/）が見つかりません"
+        else:
+            summary = "作り置き（assets/voice/）にこの文言がありません"
         if "voicevox" in unavailable:
             summary += "（VOICEVOX ENGINE も使えません。Pi ではこれが正常）"
         raise TTSError("{0}。エンジンごとの詳細: {1}".format(summary, detail))
