@@ -40,11 +40,12 @@ class StateTest(unittest.TestCase):
         self.assertFalse(state.is_fired("hourly:11", "2026-08-26"))
         self.assertFalse(state.is_fired("closing", "2026-08-26"))
 
-    def test_last_fired_returns_the_recorded_day(self):
+    def test_is_fired_matches_only_the_recorded_key_and_day(self):
         state = State(self.path)
         state.mark_fired("closing", "2026-08-26")
-        self.assertEqual(state.last_fired("closing"), "2026-08-26")
-        self.assertIsNone(state.last_fired("hourly:10"))
+        self.assertTrue(state.is_fired("closing", "2026-08-26"))
+        self.assertFalse(state.is_fired("closing", "2026-08-25"))
+        self.assertFalse(state.is_fired("hourly:10", "2026-08-26"))
 
     def test_creates_parent_directory(self):
         State(self.path).mark_fired("closing", "2026-08-26")
@@ -201,7 +202,6 @@ class ReadOnlyStateTest(unittest.TestCase):
         state.mark_fired("hourly:10", "2026-08-26")
         state.remember_quote("おつかれさまです。")
         self.assertTrue(state.is_fired("hourly:10", "2026-08-26"))
-        self.assertEqual(state.last_fired("hourly:10"), "2026-08-26")
         self.assertEqual(state.recent_quotes(), ["おつかれさまです。"])
 
     def test_records_are_not_visible_to_the_next_start(self):

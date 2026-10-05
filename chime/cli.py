@@ -76,7 +76,7 @@ def run(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    # load_config も警告を出す（既定値の丸ごとコピー・廃止予定のキー）。設定を
+    # load_config も警告を出す（既定値の丸ごとコピー・廃止したキー）。設定を
     # 読む前なので、既定値で仮のログ設定をしておき、読み込み後に上書きする。
     # --print-config は標準出力が JSON なので、警告は標準エラー出力へ出す。
     log_stream = sys.stderr if args.print_config else None

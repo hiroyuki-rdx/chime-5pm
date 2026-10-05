@@ -38,7 +38,6 @@ class Segment:
     path: str
     label: str = ""
     fade_in_ms: int = 0
-    gap_after_ms: int = 0
     optional: bool = False
 
     def describe(self) -> str:
@@ -109,9 +108,8 @@ class Player:
             for index, segment in enumerate(playable):
                 logger.info("再生[%s]: %s", self.name, segment.describe())
                 self.play_one(segment)
-                gap_ms = segment.gap_after_ms if segment.gap_after_ms else self.gap_ms
-                if gap_ms and index < len(playable) - 1:
-                    time.sleep(gap_ms / 1000.0)
+                if self.gap_ms and index < len(playable) - 1:
+                    time.sleep(self.gap_ms / 1000.0)
         finally:
             self.close()
         return len(playable)

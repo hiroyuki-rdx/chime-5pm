@@ -30,7 +30,7 @@ class EventsForDateTest(unittest.TestCase):
         closing = [event for event in events if event.kind == "closing"]
         self.assertEqual([event.hour for event in hourly], [10, 11, 12, 13, 14, 15, 16])
         self.assertEqual(len(closing), 1)
-        self.assertEqual((closing[0].hour, closing[0].minute), (16, 57))
+        self.assertEqual((closing[0].at.hour, closing[0].at.minute), (16, 57))
 
     def test_weekend_has_no_events(self):
         self.assertEqual(make_scheduler().events_for_date(SATURDAY.date()), [])

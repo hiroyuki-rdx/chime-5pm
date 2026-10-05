@@ -3,6 +3,54 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [6.0.0] - 2026-10-05
+
+使えない気象庁の天気取得と、旧い抽選方式を削除した整理の版。5.3.0 で予告した設定キーを
+削除するため、メジャー版とした。**既定の設定で動かしている場合、動作は変わらない。**
+読み上げ文言と作り置き音声も変わらない（作り直しは不要）。
+
+### 削除（互換性のない変更）
+
+- **気象庁（jma）の天気取得**（`weather.provider`・`weather.jma`・`weather.max_weather_chars`）。
+  天気は Open-Meteo だけになった。気象庁の予報文は自由文で作り置きできず、Pi では天気の文が
+  無音になっていた（v4.0.0 で既定を Open-Meteo に変えて以降は、設定で戻せるだけだった）
+- **天気かひとことのどちらか一方を抽選する方式**（`extra_segment.mode="choice"` と
+  `weather_probability`・`always_weather_hours`・`always_quote_hours`・`fallback_to_quote`）。
+  時報のあとは常に「天気（`extra_segment.weather_hours` の時刻だけ）→ ひとこと」の 1 経路になる
+- 上記 8 キーが `config.json` に残っていると、起動時に「`<ファイル>` の `<キー>` は v6.0.0 で
+  廃止しました（…）。この行は無視します。消してください。」と警告し、値を無視して動く。
+  起動は止めない（止めても systemd が再起動を繰り返すだけで、時報が鳴らなくなるため）。
+  `--print-config` にも出ない
+- 使われていなかった内部の API（`State.last_fired()`・`QuotePicker.reload()`・
+  `timesignal.total_seconds()`・`Segment.gap_after_ms`・`Event.minute`・音声合成の `base_dir`
+  引数、天気の `WeatherService.describe()`・`build_text()` など）
+
+### 追加（テスト）
+
+- `tests/test_voice_assets.py`: 同梱の音声ファイルの検査（manifest と WAV の欠け・余り・形式
+  （24 kHz・モノラル・16 bit）・ファイル名、既定の全文言が作り置きにあること、`announce.wav`・
+  `hotaru.mp3`）
+- `tests/test_docs.py`: `CHANGELOG.md` の先頭の版、文書に書いた件数（作り置き 138 件など）と
+  既定値、廃止したキーが現行の設定として書かれていないこと
+- 読み上げの部品が「欠けてもよい」扱い（その 1 文だけ無音で、放送は止めない）であることの回帰テスト
+
+### 移行
+
+16:55〜17:02（閉館放送の前後）を避けて行う。
+
+```bash
+cd /home/pi/campus-chime
+git pull
+bash scripts/setup.sh --no-apt
+python3 campus_chime.py --test-hourly 12 --dry-run
+journalctl -u campus_chime.service --since "5 min ago" | grep 廃止
+```
+
+最後のコマンドで出た行を `config.json` から消す。`mode: "choice"` を使っていた場合は、天気を
+流したい時刻を `extra_segment.weather_hours` で指定する（例
+`{ "extra_segment": { "weather_hours": [10, 12, 14, 16] } }`）。天気を流す時刻でも、ひとことは
+毎回流れる。
+
 ## [5.3.0] - 2026-09-29
 
 コードと運用手順を観点別に洗い直し、実害の出うる「事故の芽」をまとめて直した版。
@@ -512,6 +560,7 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[6.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.0.0
 [5.3.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.3.0
 [5.2.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.2.0
 [5.1.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.1.0

@@ -28,12 +28,6 @@ def lead_seconds(settings: Mapping[str, Any]) -> float:
     return count * interval_ms / 1000.0
 
 
-def total_seconds(settings: Mapping[str, Any]) -> float:
-    """時報音全体の長さ（秒）を返す。"""
-    long_ms = float(settings.get("long_pip", {}).get("duration_ms", 1000))
-    return lead_seconds(settings) + long_ms / 1000.0
-
-
 def _tone(frequency: float, duration_ms: float, sample_rate: int, volume: float,
           envelope_ms: float) -> list:
     """1 つのトーン（16bit モノラルサンプル列）を生成する。"""

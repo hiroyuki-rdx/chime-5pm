@@ -180,11 +180,6 @@ class PickTest(unittest.TestCase):
                 picker.pick(10)
             self.assertEqual(picker.pick(9), "朝")
 
-    def test_reload_picks_up_changes(self):
-        write_quotes(self.tmp.name, {"general": ["新しい"], "by_hour": {}})
-        self.picker.reload()
-        self.assertEqual(self.picker.pick(10), "新しい")
-
 
 class MisreadWordsTest(unittest.TestCase):
     """特定の誤読を招く表記が紛れ込んでいないことを確認する（回帰防止）。

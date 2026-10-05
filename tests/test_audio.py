@@ -107,6 +107,13 @@ class PlaySequenceTest(unittest.TestCase):
         player.play([Segment(""), Segment(self.first)])
         self.assertEqual(player.played, [self.first])
 
+    def test_gap_ms_is_slept_between_segments_but_not_after_the_last(self):
+        # セグメントごとの間隔指定は無く、プレイヤーの gap_ms だけが使われる。
+        player = RecordingPlayer(dict(AUDIO, gap_ms=250))
+        with mock.patch("chime.audio.time.sleep") as sleep:
+            player.play([Segment(self.first), Segment(self.second)])
+        sleep.assert_called_once_with(0.25)
+
     def test_returns_count_of_played_segments(self):
         player = RecordingPlayer(AUDIO)
         result = player.play([Segment(self.first), Segment(self.second)])

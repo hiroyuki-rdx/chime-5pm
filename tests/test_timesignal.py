@@ -84,9 +84,6 @@ class LeadTimeTest(unittest.TestCase):
         # 短音 3 回 × 1000ms = 3 秒後に「ポーン」が鳴る
         self.assertEqual(timesignal.lead_seconds(SETTINGS), 3.0)
 
-    def test_total_includes_long_pip(self):
-        self.assertEqual(timesignal.total_seconds(SETTINGS), 4.0)
-
     def test_lead_follows_configuration(self):
         settings = dict(SETTINGS, short_pip_count=4, pip_interval_ms=500)
         self.assertEqual(timesignal.lead_seconds(settings), 2.0)

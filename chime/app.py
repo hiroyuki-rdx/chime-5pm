@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import random
 import signal
 import threading
 from datetime import datetime
@@ -41,7 +40,6 @@ class ChimeApp:
         self.state = State(config.path("state.file"), read_only=dry_run)
         self.tts = TTSService(
             config.section("tts"),
-            config.base_dir,
             config.path("tts.cache_dir"),
             config.path("tts.prerecorded_dir"),
         )
@@ -53,7 +51,7 @@ class ChimeApp:
         self.time_signal_path = config.path("time_signal.output_file")
         self.builder = SequenceBuilder(
             config, self.tts, self.weather, self.quotes, self.state,
-            self.time_signal_path, random.Random(),
+            self.time_signal_path,
             # 天気予報の「今日」も、スケジューリングと同じ設定タイムゾーン基準にする
             # （OS のローカル時刻が UTC のままでも日付がずれないように）。
             today_provider=lambda: self.now().date(),

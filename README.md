@@ -41,7 +41,8 @@
 | v5.0.0 | 2026/09 | 作り置きに無い文言を実行時に合成していた**Open JTalk のフォールバックをコードごと削除**し、**VOICEVOX:ずんだもんの作り置き音声のみ**にした（フォールバックがあると、壊れていても「それらしく」鳴ってしまうため）。作り置きに無い文言は**その 1 文だけ無音**になる（放送本体は止まらない）。詳細は [CHANGELOG.md](CHANGELOG.md) |
 | v5.1.0 | 2026/09 | 天気予報を**12 時の 1 回だけ**にした（それまでは 2 時間おき）。あわせてレビューで見つけた不具合（予備のひとことが無音になる、`--prune` がひとことの音声を消す）を直した。詳細は [CHANGELOG.md](CHANGELOG.md) |
 | v5.2.0 | 2026/09 | 天気予報を**大津だけ**にした（それまでは大津・京都の 2 地点）。詳細は [CHANGELOG.md](CHANGELOG.md) |
-| **v5.3.0** | **2026/09** | **事故の芽の修正**（通信の途中切断や設定の書き間違いでも時報音は鳴る、UTF-8 以外で保存した `config.json` の原因が日本語で分かり、BOM 付き UTF-8 も読める、`journalctl -p err` が効く ほか）。詳細は [CHANGELOG.md](CHANGELOG.md) |
+| v5.3.0 | 2026/09 | **事故の芽の修正**（通信の途中切断や設定の書き間違いでも時報音は鳴る、UTF-8 以外で保存した `config.json` の原因が日本語で分かり、BOM 付き UTF-8 も読める、`journalctl -p err` が効く ほか）。詳細は [CHANGELOG.md](CHANGELOG.md) |
+| **v6.0.0** | **2026/10** | **整理（設定キーの削除）**。使えない気象庁の天気取得と、旧い「天気かひとことを抽選する」方式（`extra_segment.mode="choice"`）を削除し、時報のあとは「（12 時だけ）天気 → ひとこと」の 1 経路にした。`config.json` に残った廃止キーは警告して無視する（放送は止まらない）。読み上げ文言と作り置き音声は変わらない。詳細は [CHANGELOG.md](CHANGELOG.md) |
 
 v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです。
 
@@ -257,6 +258,7 @@ sudo systemctl is-enabled campus_chime.service
 |---|---|
 | **読み上げが無音になる（文言が聞こえない）** | 作り置きが無い（言葉を変えた場合は PC 側での作業が要る。下記）か、`config.json` が古い可能性があります。[SETUP.md](docs/SETUP.md) の「10-7. 読み上げが無音になる」を参照 |
 | 12 時以外に天気が流れない | **仕様です。** 天気は 12 時の 1 回だけ |
+| ログに「v6.0.0 で廃止しました」と出る | `config.json` に、廃止した古い設定の行が残っています。値は無視されて放送は止まりません。`journalctl -u campus_chime.service --since "5 min ago" \| grep 廃止` で出た行を `config.json` から消してください（天気を流す時刻は `extra_segment.weather_hours`）。[docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md) 3-3 |
 | 天気だけ流れない | 時刻の読み上げも聞こえない場合は `config.json` が古い可能性大。[SETUP.md](docs/SETUP.md) の「10-7. 読み上げが無音になる」を参照。時刻の読み上げが聞こえる場合はネットワークか時刻のずれ。[SETUP.md](docs/SETUP.md) の「10-5. 天気予報だけ流れない」を参照 |
 | 音が鳴らない | [docs/SETUP.md](docs/SETUP.md) 10 章 |
 | サービスが動いていない | `journalctl -u campus_chime.service -n 50` でログを見る |
@@ -290,5 +292,5 @@ python3 -m unittest discover -s tests -t . -v
 
 - **合成音声（`announce.wav` および `assets/voice/` の作り置き音声）:** VOICEVOX:ずんだもん
 - **楽曲:** Auld Lang Syne（Public Domain / Copyright Free）
-- **天気予報:** [気象庁](https://www.jma.go.jp/bosai/) の防災情報 JSON、または [Open-Meteo](https://open-meteo.com/)（CC BY 4.0）
+- **天気予報:** [Open-Meteo](https://open-meteo.com/)（CC BY 4.0）
 - **時報音:** 本リポジトリのコードが実行時に合成（音源ファイルの同梱なし）

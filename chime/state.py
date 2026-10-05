@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from .jsonfile import JsonFileError, read_json, write_json_atomic
 
@@ -59,9 +59,6 @@ class State:
             logger.error("状態ファイルを保存できません: %s: %s", self.path, exc)
 
     # -- 再生済み判定 ---------------------------------------------------
-    def last_fired(self, key: str) -> Optional[str]:
-        return self._data["last_fired"].get(key)
-
     def is_fired(self, key: str, day: str) -> bool:
         """``key`` のイベントが ``day``（YYYY-MM-DD）に再生済みかを返す。"""
         return self._data["last_fired"].get(key) == day

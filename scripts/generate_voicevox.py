@@ -222,7 +222,7 @@ def main(argv=None) -> int:
         # タイムアウトにしておく。--wait による再試行が全体の待ち時間を
         # 確保するので、ここは 1 回あたりの応答揺らぎを吸収する程度でよい。
         "probe_timeout_seconds": 5.0,
-    }, config.base_dir)
+    })
     if not wait_for_engine(engine, args.wait):
         print("VOICEVOX ENGINE に接続できません: {0}".format(args.base_url), file=sys.stderr)
         if args.wait > 0:

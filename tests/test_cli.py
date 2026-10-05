@@ -269,7 +269,7 @@ class RunTest(unittest.TestCase):
     def test_test_hourly_weather_failure_is_not_an_error(self):
         """天気取得に失敗しても、天気だけ飛ばして他のセグメントは鳴るのでエラーではない。
 
-        既定（mode="both"）では 12 時に天気予報が流れる。その取得に失敗しても
+        既定では 12 時に天気予報が流れる。その取得に失敗しても
         時報音・時刻アナウンス・ひとことは鳴るため、終了コードは 0 のまま。
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -379,7 +379,7 @@ class RunTest(unittest.TestCase):
         self.assertEqual(stdout, "")
 
     def test_config_warnings_have_timestamp_and_level(self):
-        """設定を読み込むときの警告（廃止予定のキーなど）にも、時刻とレベルが付くこと。
+        """設定を読み込むときの警告（廃止したキーなど）にも、時刻とレベルが付くこと。
 
         ログ設定は設定を読んだあとに確定するため、読み込み中の警告は
         仮の設定（既定値）で出す。
@@ -390,21 +390,48 @@ class RunTest(unittest.TestCase):
                 json.dump({"extra_segment": {"mode": "both"}}, handle)
             code, stdout, stderr = call_split(["--config", path, "--schedule", "1"])
         self.assertEqual(code, 0)
-        lines = [line for line in stdout.splitlines() if "廃止予定" in line]
+        lines = [line for line in stdout.splitlines() if "v6.0.0 で廃止しました" in line]
         self.assertEqual(len(lines), 1, stdout)
         self.assertRegex(lines[0], r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}.* - WARNING - ")
 
     def test_print_config_keeps_stdout_pure_json_even_with_warnings(self):
         """``--print-config`` の出力をファイルへ保存しても JSON のままであること
-        （設定を読むときの警告は標準エラー出力へ出す）。"""
+        （設定を読むときの警告は標準エラー出力へ出す）。
+
+        警告を出させるため、有効なキー（上書きが出力に反映される）に、廃止した
+        キーを 1 つ添えている。
+        """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
-                json.dump({"extra_segment": {"mode": "both"}}, handle)
+                json.dump({"quotes": {"avoid_recent": 5},
+                           "extra_segment": {"mode": "both"}}, handle)
             code, stdout, stderr = call_split(["--config", path, "--print-config"])
         self.assertEqual(code, 0)
-        self.assertEqual(json.loads(stdout)["extra_segment"]["mode"], "both")
-        self.assertIn("廃止予定", stderr)
+        self.assertEqual(json.loads(stdout)["quotes"]["avoid_recent"], 5)
+        self.assertIn("v6.0.0 で廃止しました", stderr)
+        self.assertNotIn("v6.0.0 で廃止しました", stdout)
+
+    def test_print_config_ignores_removed_keys_with_a_warning(self):
+        """v6.0.0 で廃止したキーが config.json に残っていても、警告するだけで
+        終了コード 0 のまま動き、出力の設定にも現れないこと。
+
+        Pi の config.json に消し忘れが残っているだけで放送を止めない
+        （systemd の Restart=always が再起動を繰り返すだけになる）ための保証。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"weather": {"provider": "jma"},
+                           "extra_segment": {"mode": "choice"}}, handle)
+            code, stdout, stderr = call_split(["--config", path, "--print-config"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stderr.count("v6.0.0 で廃止しました"), 2, stderr)
+        self.assertIn("weather.provider", stderr)
+        self.assertIn("extra_segment.mode", stderr)
+        printed = json.loads(stdout)
+        self.assertNotIn("provider", printed["weather"])
+        self.assertNotIn("mode", printed["extra_segment"])
 
     def test_log_level_option_applies_to_config_warnings(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -414,7 +441,7 @@ class RunTest(unittest.TestCase):
             code, stdout, stderr = call_split(["--config", path, "--schedule", "1",
                                                "--log-level", "ERROR"])
         self.assertEqual(code, 0)
-        self.assertNotIn("廃止予定", stdout + stderr)
+        self.assertNotIn("廃止しました", stdout + stderr)
 
     # -- --say の案内 ----------------------------------------------------
     def test_epilog_say_example_is_prerecorded(self):

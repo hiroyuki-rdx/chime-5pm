@@ -38,7 +38,6 @@ class Event:
     key: str
     kind: str
     hour: int
-    minute: int
     at: datetime
     play_at: datetime
     prepare_at: datetime
@@ -81,7 +80,6 @@ class Scheduler:
             key=key,
             kind=kind,
             hour=moment.hour,
-            minute=moment.minute,
             at=moment,
             play_at=play_at,
             prepare_at=play_at - timedelta(seconds=self.prepare_lead),

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
 import tempfile
 import unittest
 
-from chime.config import (DEFAULT_CONFIG, DEPRECATED_KEYS, EXAMPLE_CONFIG_PATH, Config,
-                          ConfigError, deep_merge, load_config, redundant_keys)
+from chime.config import (DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, REMOVED_KEYS, Config,
+                          ConfigError, deep_merge, load_config, redundant_keys,
+                          strip_removed_keys)
 
 
 class DeepMergeTest(unittest.TestCase):
@@ -89,38 +91,36 @@ class DefaultConfigMisreadFixesTest(unittest.TestCase):
     def test_announce_template_uses_hour_reading_placeholder(self):
         self.assertIn("{hour_reading}", DEFAULT_CONFIG["time_signal"]["announce_template"])
 
-    def test_weather_drops_region_specific_caveat_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["weather"]["jma"]["drop_after"], ["所により"])
-
-    def test_weather_has_a_max_character_safety_net(self):
-        self.assertEqual(DEFAULT_CONFIG["weather"]["max_weather_chars"], 40)
-
 
 class DefaultExtraIsWeatherThenQuoteTest(unittest.TestCase):
     """運用方針: 時報のあとは毎回「天気予報 → ひとこと」の両方を流す。
 
-    天気を流すには enabled と mode の両方が揃っている必要があり、片方だけでは
-    意図した放送にならないため、まとめて回帰確認する。
+    v6.0.0 で「どちらか一方を選ぶ」方式（mode="choice"）を廃し、この放送に一本化した。
+    天気を流すには weather.enabled と extra_segment.enabled が揃っている必要があり、
+    片方だけでは意図した放送にならないため、まとめて回帰確認する。
     """
 
     def test_weather_is_enabled_by_default(self):
         self.assertTrue(DEFAULT_CONFIG["weather"]["enabled"])
 
-    def test_extra_mode_is_both_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["extra_segment"]["mode"], "both")
+    def test_extra_segment_is_enabled_by_default(self):
+        self.assertTrue(DEFAULT_CONFIG["extra_segment"]["enabled"])
 
 
 class PrerecordableWeatherTest(unittest.TestCase):
     """天気の読み上げを作り置きできる状態に保つための回帰確認。
 
-    気象庁（jma）の予報文は自由文なので語彙が閉じず、事前生成できない。
+    気象庁（JMA）の予報文は自由文なので語彙が閉じず、事前生成できなかった。
     v5.0.0 で実行時合成を廃したため、事前生成が外れた文は無音になる。
-    既定を open_meteo（天気コードで語彙が 28 語に閉じる）に保つことが、
-    放送全体をずんだもんの声で揃える前提になっている。
+    天気の提供元を Open-Meteo（天気コードで語彙が 28 語に閉じる）だけにすることが、
+    放送全体をずんだもんの声で揃える前提になっている（v6.0.0 で JMA を削除）。
     """
 
-    def test_provider_is_open_meteo_by_default(self):
-        self.assertEqual(DEFAULT_CONFIG["weather"]["provider"], "open_meteo")
+    def test_open_meteo_is_the_only_weather_source(self):
+        weather = DEFAULT_CONFIG["weather"]
+        self.assertIn("open_meteo", weather)
+        self.assertNotIn("provider", weather)
+        self.assertNotIn("jma", weather)
 
     def test_location_is_otsu_only(self):
         # v5.1.0 までは大津・京都の 2 地点。京都の読み上げ音声は v5.2.0 で削除した。
@@ -297,10 +297,12 @@ class RedundantKeysTest(unittest.TestCase):
         self.assertEqual(redundant_keys({"timezone": "UTC"}), [])
 
 
-class DeprecatedKeysTest(unittest.TestCase):
-    """v6.0.0 で廃止予定の設定キーを、設定ファイルに書いていれば警告する。
+class RemovedKeysTest(unittest.TestCase):
+    """v6.0.0 で廃止した設定キーは、設定ファイルに書かれていても警告して無視する。
 
-    警告だけで動作は変えない（v6.0.0 までは書かれていればこれまでどおり効く）。
+    Pi の config.json に消し忘れた行が残っているだけで起動を止めない
+    （systemd の Restart=always が再起動を繰り返すだけになる）。無視するだけでなく、
+    マージ前に取り除くので、実行時の設定や ``--print-config`` にも現れない。
     """
 
     EXPECTED_KEYS = {
@@ -314,6 +316,24 @@ class DeprecatedKeysTest(unittest.TestCase):
         "weather.max_weather_chars",
     }
 
+    #: 廃止前（v5.3.0）の config.example.json に入っていた、これらのキーの値。
+    OLD_DEFAULTS = {
+        "extra_segment": {
+            "mode": "both",
+            "weather_probability": 0.0,
+            "always_weather_hours": [],
+            "always_quote_hours": [],
+            "fallback_to_quote": True,
+        },
+        "weather": {
+            "provider": "open_meteo",
+            "jma": {"area_code": "250000", "area_name": "南部",
+                    "temp_area_name": "大津", "label": "滋賀",
+                    "drop_after": ["所により"]},
+            "max_weather_chars": 40,
+        },
+    }
+
     @staticmethod
     def _nested(path, value):
         """``"a.b"`` と値から ``{"a": {"b": 値}}`` を作る。"""
@@ -321,6 +341,11 @@ class DeprecatedKeysTest(unittest.TestCase):
         for part in reversed(path.split(".")):
             result = {part: result}
         return result
+
+    @staticmethod
+    def _expected_line(path, key):
+        return "{0} の {1} は v6.0.0 で廃止しました（{2}）。この行は無視します。消してください。".format(
+            path, key, REMOVED_KEYS[key])
 
     def _load_capturing_warnings(self, local=None, explicit=None):
         """``local``（config.json）・``explicit``（--config）を読み込み、警告ログを返す。
@@ -349,43 +374,68 @@ class DeprecatedKeysTest(unittest.TestCase):
         lines = [line for line in captured.output if not line.endswith("dummy")]
         return lines, tmp, config
 
-    def test_the_deprecated_keys_are_the_planned_ones(self):
-        self.assertEqual(set(DEPRECATED_KEYS), self.EXPECTED_KEYS)
+    # -- 一覧と案内 ------------------------------------------------------
+    def test_the_removed_keys_are_the_planned_ones(self):
+        self.assertEqual(set(REMOVED_KEYS), self.EXPECTED_KEYS)
 
-    def test_every_deprecated_key_still_exists_in_the_defaults(self):
-        # 廃止予定でも v6.0.0 までは既定値に残っている。キーの綴りを間違えると
-        # 警告が永久に出ないので、既定値との突き合わせで防ぐ。
+    def test_defaults_contain_none_of_the_removed_keys(self):
         missing = object()
         config = Config(DEFAULT_CONFIG)
-        for key in DEPRECATED_KEYS:
-            self.assertIsNot(config.get(key, missing), missing, key)
+        for key in REMOVED_KEYS:
+            self.assertIs(config.get(key, missing), missing, key)
+
+    def test_example_config_contains_none_of_the_removed_keys(self):
+        # 雛形を config.json にコピーした利用者に、廃止の警告が出てしまわないこと。
+        with open(EXAMPLE_CONFIG_PATH, encoding="utf-8") as handle:
+            config = Config(json.load(handle))
+        missing = object()
+        for key in REMOVED_KEYS:
+            self.assertIs(config.get(key, missing), missing, key)
 
     def test_choice_keys_point_to_weather_hours(self):
-        for key, guidance in DEPRECATED_KEYS.items():
+        for key, guidance in REMOVED_KEYS.items():
             if key.startswith("extra_segment."):
                 self.assertEqual(guidance, "天気を流す時刻は extra_segment.weather_hours で指定", key)
 
     def test_jma_keys_point_to_open_meteo(self):
-        for key, guidance in DEPRECATED_KEYS.items():
+        for key, guidance in REMOVED_KEYS.items():
             if key.startswith("weather."):
                 self.assertEqual(guidance, "天気は Open-Meteo（weather.open_meteo）に一本化", key)
 
-    def test_each_deprecated_key_warns_once_with_guidance(self):
-        for key, guidance in DEPRECATED_KEYS.items():
+    # -- 警告と、設定に届かないこと --------------------------------------
+    def test_each_removed_key_warns_once_and_never_reaches_the_config(self):
+        for key in REMOVED_KEYS:
             with self.subTest(key=key):
-                lines, tmp, _ = self._load_capturing_warnings(local=self._nested(key, 1))
+                lines, tmp, config = self._load_capturing_warnings(
+                    local=self._nested(key, 1))
                 self.assertEqual(len(lines), 1, lines)
-                path = os.path.join(tmp, "config.json")
-                self.assertIn(
-                    "{0} の {1} は v6.0.0 で廃止予定です（{2}）。この行を消してください。".format(
-                        path, key, guidance), lines[0])
+                self.assertIn(self._expected_line(os.path.join(tmp, "config.json"), key),
+                              lines[0])
+                missing = object()
+                self.assertIs(config.get(key, missing), missing)
+                # 廃止したキーだけを書いたなら、結果は既定値そのもの
+                self.assertEqual(config.data, DEFAULT_CONFIG)
 
-    def test_the_warning_does_not_change_the_behaviour(self):
+    def test_the_removed_value_does_not_change_the_behaviour(self):
+        # 以前は mode="choice" で抽選方式になっていた。いまは書かれていても
+        # 何も変わらない（既定値のまま）。
         lines, _, config = self._load_capturing_warnings(
-            local={"extra_segment": {"mode": "choice", "weather_probability": 0.5}})
+            local={"extra_segment": {"mode": "choice", "weather_probability": 0.5,
+                                     "weather_hours": [10]}})
         self.assertEqual(len(lines), 2, lines)
-        self.assertEqual(config.get("extra_segment.mode"), "choice")
-        self.assertEqual(config.get("extra_segment.weather_probability"), 0.5)
+        self.assertEqual(config.get("extra_segment.weather_hours"), [10])
+        self.assertEqual(config.section("extra_segment"),
+                         {"enabled": True, "weather_hours": [10]})
+
+    def test_a_removed_dict_is_dropped_but_its_siblings_still_take_effect(self):
+        lines, _, config = self._load_capturing_warnings(local={"weather": {
+            "jma": {"area_code": "260000", "area_name": "南部"},
+            "timeout_seconds": 3.0,
+        }})
+        self.assertEqual(len(lines), 1, lines)
+        self.assertIn("weather.jma は", lines[0])
+        self.assertEqual(config.get("weather.timeout_seconds"), 3.0)
+        self.assertNotIn("jma", config.data["weather"])
 
     def test_one_warning_per_key_and_nothing_for_the_keys_under_it(self):
         lines, _, _ = self._load_capturing_warnings(
@@ -394,32 +444,92 @@ class DeprecatedKeysTest(unittest.TestCase):
         self.assertIn("weather.jma は", lines[0])
 
     def test_a_key_set_to_null_still_counts_as_written(self):
-        lines, _, _ = self._load_capturing_warnings(local={"weather": {"provider": None}})
+        lines, _, config = self._load_capturing_warnings(local={"weather": {"provider": None}})
         self.assertEqual(len(lines), 1, lines)
+        self.assertNotIn("provider", config.data["weather"])
+
+    def test_the_same_name_under_another_section_is_left_alone(self):
+        # 廃止したのは "extra_segment.mode" であって、どこかの "mode" ではない。
+        lines, _, config = self._load_capturing_warnings(
+            local={"audio": {"mode": "x"}, "quotes": {"provider": "y"}})
+        self.assertEqual(lines, [])
+        self.assertEqual(config.get("audio.mode"), "x")
+        self.assertEqual(config.get("quotes.provider"), "y")
 
     def test_current_keys_do_not_warn(self):
-        lines, _, _ = self._load_capturing_warnings(local={
+        lines, _, config = self._load_capturing_warnings(local={
             "extra_segment": {"weather_hours": [10, 12]},
             "weather": {"enabled": False, "open_meteo": {"locations": []}},
+            "quotes": {"avoid_recent": 5},
         })
         self.assertEqual(lines, [])
+        self.assertEqual(config.get("quotes.avoid_recent"), 5)
 
     def test_the_defaults_alone_do_not_warn(self):
-        # 既定値にも廃止予定のキーは含まれるが、警告の対象は設定ファイルだけ。
         lines, _, _ = self._load_capturing_warnings()
         self.assertEqual(lines, [])
 
     def test_a_non_object_on_the_way_does_not_break_the_check(self):
-        lines, _, _ = self._load_capturing_warnings(local={"weather": "オブジェクトではない"})
+        lines, _, config = self._load_capturing_warnings(
+            local={"weather": "オブジェクトではない", "extra_segment": [1, 2]})
         self.assertEqual(lines, [])
+        # 辞書でない値は、そのまま（既定値を置き換えて）届く。ここでは落ちないことだけ確かめる。
+        self.assertEqual(config.get("weather"), "オブジェクトではない")
 
     def test_each_file_is_reported_under_its_own_name(self):
-        lines, tmp, _ = self._load_capturing_warnings(
+        lines, tmp, config = self._load_capturing_warnings(
             local={"weather": {"provider": "jma"}},
             explicit={"extra_segment": {"mode": "choice"}})
         self.assertEqual(len(lines), 2, lines)
-        self.assertIn(os.path.join(tmp, "config.json") + " の weather.provider", lines[0])
-        self.assertIn(os.path.join(tmp, "other.json") + " の extra_segment.mode", lines[1])
+        self.assertIn(self._expected_line(os.path.join(tmp, "config.json"),
+                                          "weather.provider"), lines[0])
+        self.assertIn(self._expected_line(os.path.join(tmp, "other.json"),
+                                          "extra_segment.mode"), lines[1])
+        self.assertEqual(config.data, DEFAULT_CONFIG)
+
+    def test_an_old_full_copy_of_the_example_warns_and_still_loads(self):
+        # 廃止前の config.example.json を丸ごと config.json にした Pi。既定値の
+        # 丸ごとコピーの警告に加え、廃止したキーの警告も出るが、起動は続く。
+        old_example = deep_merge(DEFAULT_CONFIG, self.OLD_DEFAULTS)
+        # OLD_DEFAULTS が廃止キーを取りこぼしていると、このテストが意味を失う
+        self.assertEqual({"{0}.{1}".format(section, key)
+                          for section, body in self.OLD_DEFAULTS.items() for key in body},
+                         set(REMOVED_KEYS))
+        lines, tmp, config = self._load_capturing_warnings(local=old_example)
+        removed = [line for line in lines if "v6.0.0 で廃止しました" in line]
+        self.assertEqual(len(removed), len(REMOVED_KEYS), lines)
+        self.assertTrue(any("既定値の丸ごとコピー" in line for line in lines), lines)
+        self.assertEqual(config.data, DEFAULT_CONFIG)
+
+    # -- strip_removed_keys 単体 ------------------------------------------
+    def test_strip_does_not_mutate_the_callers_dict(self):
+        original = {
+            "weather": {"provider": "jma", "timeout_seconds": 3.0,
+                        "jma": {"area_code": "260000"}},
+            "extra_segment": {"mode": "choice", "weather_hours": [10]},
+        }
+        snapshot = copy.deepcopy(original)
+        stripped = strip_removed_keys("config.json", original)
+        self.assertEqual(original, snapshot)
+        self.assertEqual(stripped, {"weather": {"timeout_seconds": 3.0},
+                                    "extra_segment": {"weather_hours": [10]}})
+        # 複製なので、取り除いた結果を書き換えても元には響かない
+        stripped["extra_segment"]["weather_hours"].append(99)
+        self.assertEqual(original, snapshot)
+
+    def test_strip_keeps_a_parent_that_became_empty(self):
+        self.assertEqual(
+            strip_removed_keys("config.json", {"extra_segment": {"mode": "both"}}),
+            {"extra_segment": {}})
+
+    def test_strip_treats_a_non_mapping_parent_as_absent(self):
+        override = {"weather": "x", "extra_segment": None}
+        self.assertEqual(strip_removed_keys("config.json", override), override)
+        self.assertEqual(strip_removed_keys("config.json", {"weather": {"jma": 1}}),
+                         {"weather": {}})
+
+    def test_strip_of_an_empty_override_is_empty(self):
+        self.assertEqual(strip_removed_keys("config.json", {}), {})
 
 
 class LoadConfigTest(unittest.TestCase):

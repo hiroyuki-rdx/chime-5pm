@@ -49,9 +49,8 @@ class TTSEngine:
 
     name = "base"
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str) -> None:
+    def __init__(self, settings: Mapping[str, Any]) -> None:
         self.settings = dict(settings)
-        self.base_dir = base_dir
 
     def voice_id(self) -> str:
         """キャッシュキーに含める、声色を識別する文字列。"""
@@ -73,8 +72,8 @@ class PrerecordedEngine(TTSEngine):
 
     name = "prerecorded"
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str, directory: str) -> None:
-        super().__init__(settings, base_dir)
+    def __init__(self, settings: Mapping[str, Any], directory: str) -> None:
+        super().__init__(settings)
         self.directory = directory
         self._manifest: Optional[Dict[str, str]] = None
 
@@ -119,8 +118,8 @@ class VoicevoxEngine(TTSEngine):
 
     name = "voicevox"
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str) -> None:
-        super().__init__(settings, base_dir)
+    def __init__(self, settings: Mapping[str, Any]) -> None:
+        super().__init__(settings)
         self.base_url = str(self.settings.get("base_url", "")).rstrip("/")
         self.speaker = int(self.settings.get("speaker", 3))
         self.timeout = float(self.settings.get("timeout_seconds", 20.0))
@@ -174,10 +173,9 @@ class VoicevoxEngine(TTSEngine):
 class TTSService:
     """エンジンの選択・フォールバック・キャッシュを束ねる。"""
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str,
+    def __init__(self, settings: Mapping[str, Any],
                  cache_dir: str, prerecorded_dir: str) -> None:
         self.settings = dict(settings)
-        self.base_dir = base_dir
         self.cache_dir = cache_dir
         self.prerecorded_dir = prerecorded_dir
         self.engines: List[TTSEngine] = self._build_engines()
@@ -187,9 +185,9 @@ class TTSService:
         for name in self.settings.get("engines", []):
             name = str(name)
             if name == "prerecorded":
-                engines.append(PrerecordedEngine({}, self.base_dir, self.prerecorded_dir))
+                engines.append(PrerecordedEngine({}, self.prerecorded_dir))
             elif name == "voicevox":
-                engines.append(VoicevoxEngine(self.settings.get("voicevox", {}), self.base_dir))
+                engines.append(VoicevoxEngine(self.settings.get("voicevox", {})))
             else:
                 logger.warning("未知の TTS エンジン '%s' は無視します。", name)
         return engines

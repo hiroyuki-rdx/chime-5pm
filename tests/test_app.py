@@ -87,7 +87,7 @@ class AppTestCase(unittest.TestCase):
 
     def past_event(self, seconds_ago: float = 5.0) -> Event:
         moment = self.app.now() - timedelta(seconds=seconds_ago)
-        return Event(key="hourly:10", kind="hourly", hour=10, minute=0,
+        return Event(key="hourly:10", kind="hourly", hour=10,
                      at=moment, play_at=moment, prepare_at=moment)
 
 
@@ -105,7 +105,7 @@ class RunEventTest(AppTestCase):
 
     def test_stop_request_cancels_playback(self):
         moment = self.app.now() + timedelta(hours=1)
-        event = Event(key="hourly:10", kind="hourly", hour=10, minute=0,
+        event = Event(key="hourly:10", kind="hourly", hour=10,
                       at=moment, play_at=moment, prepare_at=moment)
         self.app.stop_event.set()
         self.app.run_event(event)
@@ -217,7 +217,7 @@ class RunEventDegradeTest(AppTestCase):
 
     def test_a_stop_request_before_playback_remembers_nothing(self):
         moment = self.app.now() + timedelta(hours=1)
-        event = Event(key="hourly:10", kind="hourly", hour=10, minute=0,
+        event = Event(key="hourly:10", kind="hourly", hour=10,
                       at=moment, play_at=moment, prepare_at=moment)
         self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
                                        quote="テストのひとこと")
@@ -422,7 +422,7 @@ class StateFileTest(unittest.TestCase):
             wav = make_wav(os.path.join(tmp, "beep.wav"))
             app.builder = StubBuilder([Segment(wav, label="テスト音")], quote="テストのひとこと")
             moment = app.now() - timedelta(seconds=5)
-            app.run_event(Event(key="hourly:10", kind="hourly", hour=10, minute=0,
+            app.run_event(Event(key="hourly:10", kind="hourly", hour=10,
                                 at=moment, play_at=moment, prepare_at=moment))
             self.assertFalse(os.path.exists(state_file))
 

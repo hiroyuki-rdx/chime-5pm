@@ -85,9 +85,6 @@ class QuotePicker:
         self.rng = rng or random.Random()
         self._data = load_quotes(path)
 
-    def reload(self) -> None:
-        self._data = load_quotes(self.path)
-
     def candidates(self, hour: Optional[int] = None) -> List[str]:
         """対象時刻で使えるひとことの一覧を返す。"""
         quotes: List[str] = list(self._data.get("general", []))
