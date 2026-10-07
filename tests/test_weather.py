@@ -5,13 +5,12 @@ from __future__ import annotations
 import hashlib
 import http.client
 import json
-import logging
 import unittest
 import urllib.parse
 from datetime import date
 from unittest import mock
 
-from tests.support import load_fixture  # noqa: F401
+from tests.support import load_fixture, logs_enabled, urlopen_response
 
 from chime.config import DEFAULT_CONFIG
 from chime.weather import (WMO_CODES, WeatherError, WeatherService, build_sentences,
@@ -311,6 +310,108 @@ class PrerecordPhrasesTest(unittest.TestCase):
         self.assertTrue(any("最高気温" in p for p in phrases))
         self.assertTrue(any("パーセント" in p for p in phrases))
 
+    def test_temp_and_temp_max_phrases_share_the_same_range(self):
+        # 現況の気温と最高気温は、同じ temp_min 〜 temp_max（両端含む）を列挙する。
+        settings = dict(WEATHER, sentence_temp_max="最高気温は{temp_max}度なのだ。",
+                        prerecord=dict(WEATHER["prerecord"], temp_min=-1, temp_max=2))
+        phrases = prerecord_phrases(settings)
+        self.assertEqual([p for p in phrases if p.startswith("気温は")],
+                         ["気温は{0}度なのだ。".format(v) for v in (-1, 0, 1, 2)])
+        self.assertEqual([p for p in phrases if p.startswith("最高気温は")],
+                         ["最高気温は{0}度なのだ。".format(v) for v in (-1, 0, 1, 2)])
+
+    def test_numeric_strings_are_accepted_as_the_temp_range(self):
+        settings = dict(WEATHER, sentence_temp_max="最高気温は{temp_max}度なのだ。",
+                        prerecord=dict(WEATHER["prerecord"], temp_min="3", temp_max="5"))
+        phrases = prerecord_phrases(settings)
+        self.assertEqual([p for p in phrases if "気温は" in p],
+                         ["気温は3度なのだ。", "気温は4度なのだ。", "気温は5度なのだ。",
+                          "最高気温は3度なのだ。", "最高気温は4度なのだ。", "最高気温は5度なのだ。"])
+
+    def test_invalid_temp_range_enumerates_no_temperature_phrases(self):
+        # 数値にできない値・逆転した範囲では、気温の文を列挙しない（天気の文だけが残る）。
+        # 例外にもならない（作り置きの列挙が止まると generate_voicevox が落ちる）。
+        for bad in ({"temp_min": "x"}, {"temp_max": None}, {"temp_min": [1]},
+                    {"temp_min": 5, "temp_max": 1}):
+            with self.subTest(bad=bad):
+                settings = dict(WEATHER, sentence_temp_max="最高気温は{temp_max}度なのだ。",
+                                prerecord=dict(WEATHER["prerecord"], **bad))
+                phrases = prerecord_phrases(settings)
+                self.assertEqual(len(phrases), 28)
+                self.assertFalse(any("気温" in p for p in phrases))
+
+    def test_a_location_label_is_a_string_and_defaults_to_empty(self):
+        # label が無い地点は空の地名、数値の label は文字列として扱う。
+        # キャッシュのキーも、その文字列の label になる。
+        locations = [{"latitude": 1, "longitude": 2},
+                     {"label": 5, "latitude": 3, "longitude": 4}]
+        settings = dict(WEATHER, open_meteo={"locations": locations})
+        phrases = prerecord_phrases(settings)
+        self.assertIn("今のの天気はくもりなのだ。", phrases)
+        self.assertIn("今の5の天気はくもりなのだ。", phrases)
+
+        service = WeatherService(settings)
+        with mock.patch("chime.weather.fetch_json",
+                        return_value=load_fixture("open_meteo.json")):
+            service.describe_sentences(today=TODAY)
+        self.assertEqual(sorted(service._cache), ["", "5"])
+
+
+class NullToleranceTest(unittest.TestCase):
+    """設定の ``None`` の扱い。箇所によって異なり、その差も観測できる。
+
+    - ``open_meteo`` が ``None``: 地点を読む 3 か所（url・describe_sentences の
+      取得先・prerecord_phrases）がどれも AttributeError。
+    - ``prerecord`` が ``None``: prerecord_phrases は許容する（``or {}``）が、
+      build_sentences は許容せず AttributeError になる。describe_sentences では
+      それを _describe_one が WeatherError にし、その地点の天気は読まれない。
+    """
+
+    PARTS = {"when": "今日", "label": "大津", "weather": "くもり",
+             "temp": 28, "temp_max": None, "pop": None}
+
+    def test_open_meteo_none_raises_attribute_error_at_every_site(self):
+        settings = dict(WEATHER, open_meteo=None)
+        with self.assertRaises(AttributeError):
+            WeatherService(settings).url()
+        with mock.patch("chime.weather.fetch_json") as mocked:
+            with self.assertRaises(AttributeError):
+                WeatherService(settings).describe_sentences(today=TODAY)
+        mocked.assert_not_called()
+        with self.assertRaises(AttributeError):
+            prerecord_phrases(settings)
+
+    def test_open_meteo_without_locations_means_no_locations(self):
+        # locations が None・空・キー無しなら「地点なし」（AttributeError にならない）。
+        for open_meteo in ({"locations": None}, {"locations": []}, {}):
+            with self.subTest(open_meteo=open_meteo):
+                settings = dict(WEATHER, open_meteo=open_meteo)
+                with self.assertRaises(WeatherError):
+                    WeatherService(settings).url()
+                # 天気の文は 0 件で、気温の 46 通りだけが残る。
+                self.assertEqual(len(prerecord_phrases(settings)), 46)
+
+    def test_prerecord_none_is_tolerated_by_prerecord_phrases(self):
+        # whens は空、気温の範囲は既定の 0 〜 0 に落ちる。
+        settings = dict(WEATHER, prerecord=None)
+        self.assertEqual(prerecord_phrases(settings), ["気温は0度なのだ。"])
+
+    def test_prerecord_none_is_not_tolerated_by_build_sentences(self):
+        settings = dict(WEATHER, prerecord=None)
+        with self.assertRaises(AttributeError):
+            build_sentences(self.PARTS, settings)
+
+    def test_prerecord_none_skips_that_location_in_describe_sentences(self):
+        # 1 地点なら全地点で失敗、2 地点でもどちらも読めない（どちらも同じ設定のため）。
+        for settings in (WEATHER, WEATHER_TWO_LOCATIONS):
+            with self.subTest(locations=len(settings["open_meteo"]["locations"])):
+                service = WeatherService(dict(settings, prerecord=None))
+                with mock.patch("chime.weather.fetch_json",
+                                return_value=load_fixture("open_meteo.json")):
+                    with self.assertRaises(WeatherError) as caught:
+                        service.describe_sentences(today=TODAY)
+                self.assertIn("全地点で失敗", str(caught.exception))
+
 
 class VocabularyCoverageTest(unittest.TestCase):
     """build_sentences() が組み立てうる全パターンが prerecord_phrases() に
@@ -480,16 +581,13 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
     def test_one_location_failing_still_returns_the_other(self):
         service = WeatherService(WEATHER_TWO_LOCATIONS)
         # tests/__init__.py がテスト全体でログを抑制している（logging.disable
-        # (logging.CRITICAL)）ため、assertLogs で拾えるよう tests/test_sequence.py
-        # と同じ手順でこのテストの間だけ一時的に解除する。
-        logging.disable(logging.NOTSET)
-        try:
+        # (logging.CRITICAL)）ため、assertLogs で拾えるよう logs_enabled() で
+        # このテストの間だけ一時的に解除する。
+        with logs_enabled():
             with mock.patch("chime.weather.fetch_json",
                             side_effect=[WeatherError("圏外"), self.kyoto_payload]):
                 with self.assertLogs("chime.weather", level="WARNING") as cm:
                     sentences = service.describe_sentences(today=TODAY)
-        finally:
-            logging.disable(logging.CRITICAL)
         self.assertTrue(any("大津" in message for message in cm.output))
         self.assertEqual(len(sentences), 2)
         self.assertIn("京都", "".join(sentences))
@@ -499,14 +597,11 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
         otsu_payload_without_current = json.loads(json.dumps(load_fixture("open_meteo.json")))
         del otsu_payload_without_current["current"]
         service = WeatherService(WEATHER_TWO_LOCATIONS)
-        logging.disable(logging.NOTSET)
-        try:
+        with logs_enabled():
             with mock.patch("chime.weather.fetch_json",
                             side_effect=[otsu_payload_without_current, self.kyoto_payload]):
                 with self.assertLogs("chime.weather", level="WARNING") as cm:
                     sentences = service.describe_sentences(today=TODAY)
-        finally:
-            logging.disable(logging.CRITICAL)
         self.assertTrue(any("大津" in message for message in cm.output))
         self.assertEqual(len(sentences), 2)
         self.assertIn("京都", "".join(sentences))
@@ -527,17 +622,6 @@ class DescribeSentencesPartialFailureTest(unittest.TestCase):
                 service.describe_sentences(today=TODAY)
 
 
-def _response(body=None, read_error=None):
-    """``urlopen`` が返す応答のモック（``with`` で使え、``read()`` が本文か例外を返す）。"""
-    response = mock.MagicMock()
-    response.__enter__.return_value = response
-    if read_error is not None:
-        response.read.side_effect = read_error
-    else:
-        response.read.return_value = json.dumps(body).encode("utf-8")
-    return response
-
-
 class FetchJsonTest(unittest.TestCase):
     """``fetch_json`` は通信まわりの失敗をすべて WeatherError にそろえる。
 
@@ -549,7 +633,7 @@ class FetchJsonTest(unittest.TestCase):
     URL = "https://example.invalid/forecast.json"
 
     def test_incomplete_read_becomes_weather_error(self):
-        response = _response(read_error=http.client.IncompleteRead(b"{\"cur", 200))
+        response = urlopen_response(read_error=http.client.IncompleteRead(b"{\"cur", 200))
         with mock.patch("chime.weather.urllib.request.urlopen", return_value=response):
             with self.assertRaises(WeatherError):
                 fetch_json(self.URL, 8.0)
@@ -591,7 +675,7 @@ class FetchJsonTest(unittest.TestCase):
 
     def test_a_valid_response_is_still_parsed(self):
         with mock.patch("chime.weather.urllib.request.urlopen",
-                        return_value=_response({"ok": True})):
+                        return_value=urlopen_response({"ok": True})):
             self.assertEqual(fetch_json(self.URL, 8.0), {"ok": True})
 
 
@@ -633,7 +717,7 @@ class LeftoverJmaSettingsTest(unittest.TestCase):
         service = WeatherService(self.settings())
         payload = load_fixture("open_meteo.json")
         with mock.patch("chime.weather.urllib.request.urlopen",
-                        return_value=_response(payload)) as urlopen:
+                        return_value=urlopen_response(payload)) as urlopen:
             sentences = service.describe_sentences(today=TODAY)
         self.assertEqual(sentences, ["今の大津の天気はくもりなのだ。", "気温は28度なのだ。"])
         urlopen.assert_called_once()
@@ -655,8 +739,8 @@ class DescribeSentencesDegradeTest(unittest.TestCase):
     def test_incomplete_read_on_one_location_keeps_the_other(self):
         service = WeatherService(WEATHER_TWO_LOCATIONS)
         responses = [
-            _response(read_error=http.client.IncompleteRead(b"{", 500)),
-            _response(self.kyoto_payload),
+            urlopen_response(read_error=http.client.IncompleteRead(b"{", 500)),
+            urlopen_response(self.kyoto_payload),
         ]
         with mock.patch("chime.weather.urllib.request.urlopen", side_effect=responses):
             sentences = service.describe_sentences(today=TODAY)
@@ -665,7 +749,7 @@ class DescribeSentencesDegradeTest(unittest.TestCase):
 
     def test_bad_status_line_on_one_location_keeps_the_other(self):
         service = WeatherService(WEATHER_TWO_LOCATIONS)
-        responses = [_response(self.otsu_payload), http.client.BadStatusLine("")]
+        responses = [urlopen_response(self.otsu_payload), http.client.BadStatusLine("")]
         with mock.patch("chime.weather.urllib.request.urlopen", side_effect=responses):
             sentences = service.describe_sentences(today=TODAY)
         self.assertEqual(len(sentences), 2)
@@ -673,8 +757,8 @@ class DescribeSentencesDegradeTest(unittest.TestCase):
 
     def test_incomplete_read_on_every_location_raises_weather_error(self):
         service = WeatherService(WEATHER_TWO_LOCATIONS)
-        with mock.patch("chime.weather.urllib.request.urlopen",
-                        return_value=_response(read_error=http.client.IncompleteRead(b"", 1))):
+        response = urlopen_response(read_error=http.client.IncompleteRead(b"", 1))
+        with mock.patch("chime.weather.urllib.request.urlopen", return_value=response):
             with self.assertRaises(WeatherError):
                 service.describe_sentences(today=TODAY)
 

@@ -9,9 +9,11 @@ import os
 import tempfile
 import unittest
 
+from tests.support import logs_enabled
+
 from chime.config import (DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, REMOVED_KEYS, Config,
-                          ConfigError, deep_merge, load_config, redundant_keys,
-                          strip_removed_keys)
+                          ConfigError, deep_merge, dump_default_config, load_config,
+                          redundant_keys, strip_removed_keys)
 
 
 class DeepMergeTest(unittest.TestCase):
@@ -259,20 +261,16 @@ class RedundantKeysTest(unittest.TestCase):
 
         tests/__init__.py がテスト全体でログを抑制している
         （``logging.disable(logging.CRITICAL)``）ため、assertLogs で拾えるよう
-        tests/test_weather.py と同じ手順でこの間だけ一時的に解除する。
+        tests/support.py の ``logs_enabled()`` でこの間だけ一時的に解除する。
         ``assertLogs`` は 1 件も出ないと失敗するので、判定用のダミーを先に出す。
         """
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(override, handle)
-            logging.disable(logging.NOTSET)
-            try:
-                with self.assertLogs("chime.config", level="WARNING") as captured:
-                    logging.getLogger("chime.config").warning("dummy")
-                    load_config(explicit_path=path, base_dir=tmp)
-            finally:
-                logging.disable(logging.CRITICAL)
+            with logs_enabled(), self.assertLogs("chime.config", level="WARNING") as captured:
+                logging.getLogger("chime.config").warning("dummy")
+                load_config(explicit_path=path, base_dir=tmp)
         return [line for line in captured.output if not line.endswith("dummy")]
 
     def test_a_full_copy_triggers_a_warning(self):
@@ -350,8 +348,8 @@ class RemovedKeysTest(unittest.TestCase):
     def _load_capturing_warnings(self, local=None, explicit=None):
         """``local``（config.json）・``explicit``（--config）を読み込み、警告ログを返す。
 
-        tests/__init__.py がテスト全体でログを抑制しているため、tests/test_weather.py
-        と同じ手順でこの間だけ解除する。``assertLogs`` は 1 件も出ないと失敗するので、
+        tests/__init__.py がテスト全体でログを抑制しているため、tests/support.py の
+        ``logs_enabled()`` でこの間だけ解除する。``assertLogs`` は 1 件も出ないと失敗するので、
         判定用のダミーを先に出す。戻り値は ``(警告の行, 一時ディレクトリ, 設定)``。
         """
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,13 +362,9 @@ class RemovedKeysTest(unittest.TestCase):
                     json.dump(override, handle)
                 if name == "other.json":
                     explicit_path = path
-            logging.disable(logging.NOTSET)
-            try:
-                with self.assertLogs("chime.config", level="WARNING") as captured:
-                    logging.getLogger("chime.config").warning("dummy")
-                    config = load_config(explicit_path, base_dir=tmp)
-            finally:
-                logging.disable(logging.CRITICAL)
+            with logs_enabled(), self.assertLogs("chime.config", level="WARNING") as captured:
+                logging.getLogger("chime.config").warning("dummy")
+                config = load_config(explicit_path, base_dir=tmp)
         lines = [line for line in captured.output if not line.endswith("dummy")]
         return lines, tmp, config
 
@@ -657,6 +651,26 @@ class ExampleConfigTest(unittest.TestCase):
             example, DEFAULT_CONFIG,
             "config.example.json が古くなっています。"
             "`python3 scripts/dump_example_config.py` で更新してください。")
+
+    def test_dump_default_config_writes_the_example_byte_for_byte(self):
+        """書き出し方（インデント・文字コード・末尾の改行）まで雛形と同じであること。
+
+        雛形は ``scripts/dump_example_config.py`` が作る。書式が変わると、
+        既定値を変えていないのに雛形の差分が出てしまう。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.example.json")
+            dump_default_config(path)
+            with open(path, "rb") as handle:
+                dumped = handle.read()
+            self.assertEqual(os.listdir(tmp), ["config.example.json"], "一時ファイルが残っている")
+        with open(EXAMPLE_CONFIG_PATH, "rb") as handle:
+            example = handle.read()
+        self.assertEqual(
+            dumped, example,
+            "config.example.json が古くなっています。"
+            "`python3 scripts/dump_example_config.py` で更新してください。")
+        self.assertTrue(dumped.endswith(b"}\n"))
 
 
 if __name__ == "__main__":

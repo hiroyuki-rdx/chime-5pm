@@ -15,11 +15,12 @@ from datetime import date, datetime, timedelta
 from unittest import mock
 from urllib.parse import urlparse
 
-from tests.support import REPO_ROOT  # noqa: F401
+from tests.support import (ANNOUNCE_PATH, block_network, fixture_path, load_fixture,
+                           load_manifest, logs_enabled)
 
 from chime import env
 from chime.audio import Segment
-from chime.cli import EPILOG, build_parser, run
+from chime.cli import CURRENT_HOUR, EPILOG, build_parser, run
 from chime.sequence import PlaybackPlan
 from chime.tts import TTSError
 from chime.weather import WeatherError
@@ -29,7 +30,7 @@ def call(argv):
     """CLI を実行し、(終了コード, 出力) を返す。
 
     ``print`` 出力とログ出力の両方を 1 つのバッファへ集める
-    （``tests/support.py`` がログを抑制しているため、ここだけ一時的に戻す）。
+    （``tests/__init__.py`` がログを抑制しているため、ここだけ一時的に戻す）。
     """
     buffer = io.StringIO()
     handler = logging.StreamHandler(buffer)
@@ -38,12 +39,10 @@ def call(argv):
     root.addHandler(handler)
     previous_level = root.level
     root.setLevel(logging.INFO)
-    logging.disable(logging.NOTSET)
     try:
-        with redirect_stdout(buffer), redirect_stderr(buffer):
+        with logs_enabled(), redirect_stdout(buffer), redirect_stderr(buffer):
             code = run(argv)
     finally:
-        logging.disable(logging.CRITICAL)
         root.removeHandler(handler)
         root.setLevel(previous_level)
     return code, buffer.getvalue()
@@ -60,12 +59,10 @@ def call_split(argv):
     root = logging.getLogger()
     handlers, previous_level = root.handlers[:], root.level
     root.handlers[:] = []
-    logging.disable(logging.NOTSET)
     try:
-        with redirect_stdout(out), redirect_stderr(err):
+        with logs_enabled(), redirect_stdout(out), redirect_stderr(err):
             code = run(argv)
     finally:
-        logging.disable(logging.CRITICAL)
         root.handlers[:] = handlers
         root.setLevel(previous_level)
     return code, out.getvalue(), err.getvalue()
@@ -84,6 +81,10 @@ class ParserTest(unittest.TestCase):
     def test_test_hourly_without_value(self):
         self.assertEqual(self.parser.parse_args(["--test-hourly"]).test_hourly, -1)
 
+    def test_test_hourly_without_value_is_the_current_hour_sentinel(self):
+        self.assertEqual(CURRENT_HOUR, -1)
+        self.assertEqual(self.parser.parse_args(["--test-hourly"]).test_hourly, CURRENT_HOUR)
+
     def test_test_hourly_with_value(self):
         self.assertEqual(self.parser.parse_args(["--test-hourly", "14"]).test_hourly, 14)
 
@@ -96,6 +97,9 @@ class ParserTest(unittest.TestCase):
 
 
 class RunTest(unittest.TestCase):
+    def setUp(self):
+        block_network(self)
+
     def test_print_config_outputs_valid_json(self):
         code, output = call(["--print-config"])
         self.assertEqual(code, 0)
@@ -124,8 +128,11 @@ class RunTest(unittest.TestCase):
         スタブ化して常に合成成功したことにする（``--dry-run`` のため
         実際のファイル内容や存在は問われない）。
         """
-        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
-        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+        wav = ANNOUNCE_PATH
+        # 12 時は既定で天気予報を流す時刻なので、天気の取得も失敗に確定させて
+        # Open-Meteo へ実際に通信しないようにする（検証の対象は定型文の方）。
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav), \
+                mock.patch("chime.weather.fetch_json", side_effect=WeatherError("圏外")):
             code, output = call(["--test-hourly", "12", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
         self.assertIn("正午をお知らせしたのだ。", output)
@@ -156,9 +163,7 @@ class RunTest(unittest.TestCase):
 
     def test_weather_success_prints_text(self):
         # 既定 provider は open_meteo（天気コードで語彙が閉じ、作り置きできる）。
-        fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "open_meteo.json")
-        with open(fixture, encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = load_fixture("open_meteo.json")
         with mock.patch("chime.weather.fetch_json", return_value=payload):
             code, output = call(["--weather", "--dry-run"])
         self.assertEqual(code, 0)
@@ -168,9 +173,7 @@ class RunTest(unittest.TestCase):
     def test_weather_prints_one_line_per_sentence(self):
         """読み上げは 1 文ずつ別のセグメントとして鳴らすため、確認用の出力も
         同じ単位にする。連結した文字列では作り置き音声との照合が外れる。"""
-        fixture = os.path.join(REPO_ROOT, "tests", "fixtures", "open_meteo.json")
-        with open(fixture, encoding="utf-8") as handle:
-            payload = json.load(handle)
+        payload = load_fixture("open_meteo.json")
         with mock.patch("chime.weather.fetch_json", return_value=payload):
             code, output = call(["--weather", "--dry-run"])
         self.assertEqual(code, 0)
@@ -290,7 +293,7 @@ class RunTest(unittest.TestCase):
         ``fetch_json`` のモックで失敗に確定させている。そのうえで、
         取得できなくても「ひとこと」は必ず流れる、という設計を確かめる。
         """
-        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        wav = ANNOUNCE_PATH
         with mock.patch("chime.tts.TTSService.synthesize", return_value=wav), \
                 mock.patch("chime.weather.fetch_json",
                            side_effect=WeatherError("圏外")):
@@ -331,7 +334,7 @@ class RunTest(unittest.TestCase):
 
     def test_say_returns_0_when_playback_succeeds(self):
         """再生に成功すれば 0 を返す（``build_text`` が返すプランを差し替えて確認）。"""
-        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        wav = ANNOUNCE_PATH
 
         def fake_build_text(self, text):
             return PlaybackPlan(event=None, segments=[Segment(wav, label="読み上げ")])
@@ -447,9 +450,7 @@ class RunTest(unittest.TestCase):
     def test_epilog_say_example_is_prerecorded(self):
         """ヘルプの ``--say`` の例は、そのまま試して鳴らせる文言（作り置きにある文）であること。"""
         example = re.search(r"--say (\S+)", EPILOG).group(1)
-        manifest = os.path.join(REPO_ROOT, "assets", "voice", "manifest.json")
-        with open(manifest, encoding="utf-8") as handle:
-            phrases = json.load(handle)
+        phrases = load_manifest()
         self.assertEqual(example, "正午をお知らせしたのだ。")
         self.assertIn(example, phrases)
 
@@ -461,7 +462,7 @@ class RunTest(unittest.TestCase):
     def test_say_unknown_phrase_shows_candidates_and_guidance(self):
         """作り置きに無い文言は、Pi では無音になることと、近い文言・作り直しの案内を出す。
         そのうえで従来どおり再生を試みる（PC で VOICEVOX が動いていれば鳴る）。"""
-        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        wav = ANNOUNCE_PATH
         with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
             code, stdout, stderr = call_split(
                 ["--say", "正午をお知らせしますのだ。", "--dry-run", "--backend", "mock"])
@@ -475,7 +476,7 @@ class RunTest(unittest.TestCase):
         self.assertIn("dry-run", stdout)
 
     def test_say_unknown_phrase_without_close_match_omits_candidates(self):
-        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        wav = ANNOUNCE_PATH
         with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
             code, stdout, stderr = call_split(["--say", "Qwerty", "--dry-run", "--backend", "mock"])
         self.assertEqual(code, 0)
@@ -486,7 +487,7 @@ class RunTest(unittest.TestCase):
     def test_say_reports_missing_voice_folder_instead_of_missing_phrase(self):
         # assets/voice/ が丸ごと無いときは「この文言がありません」ではなく、
         # 作り置きそのものが見つからないことを案内する。
-        wav = os.path.join(REPO_ROOT, "assets", "announce.wav")
+        wav = ANNOUNCE_PATH
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "config.json")
             with open(path, "w", encoding="utf-8") as handle:
@@ -518,7 +519,7 @@ class RunTest(unittest.TestCase):
         （127.0.0.1）へ問い合わせる。それは想定内なので、動いていないものとして
         失敗を返し、それ以外の通信が一切ないことを確かめる。
         """
-        offline = os.path.join(REPO_ROOT, "tests", "fixtures", "offline_config.json")
+        offline = fixture_path("offline_config.json")
         urls = []
 
         def fake_urlopen(request, *args, **kwargs):
@@ -534,6 +535,221 @@ class RunTest(unittest.TestCase):
         self.assertEqual(code, 0, output)
         external = [url for url in urls if urlparse(url).hostname not in ("127.0.0.1", "localhost")]
         self.assertEqual(external, [])
+
+
+class GenerateAssetsTest(unittest.TestCase):
+    """``--generate-assets``。``scripts/setup.sh`` が終了コードで分岐する。
+
+    設定ファイルで時報音・状態ファイル・合成キャッシュの出力先を一時フォルダへ
+    振り向け、リポジトリには何も書かせない。音声合成は ``TTSService.synthesize``
+    を差し替えて、作り置きの有無や VOICEVOX ENGINE の有無に依存させない。
+    """
+
+    #: 既定設定（10〜16 時）の時刻アナウンス。時の順に並ぶ。
+    ANNOUNCEMENTS = [
+        "午前10時をお知らせしたのだ。",
+        "午前11時をお知らせしたのだ。",
+        "正午をお知らせしたのだ。",
+        "午後1時をお知らせしたのだ。",
+        "午後2時をお知らせしたのだ。",
+        "午後3時をお知らせしたのだ。",
+        "午後よじをお知らせしたのだ。",
+    ]
+
+    def setUp(self):
+        block_network(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.signal_path = os.path.join(self.tmp, "generated", "time_signal.wav")
+
+    def write_config(self, **extra):
+        data = {"time_signal": {"output_file": self.signal_path},
+                "state": {"file": os.path.join(self.tmp, "state.json")},
+                "tts": {"cache_dir": os.path.join(self.tmp, "tts")}}
+        data.update(extra)
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        return path
+
+    def generate(self, synthesize, **extra):
+        """(終了コード, 標準出力, 標準エラー出力, synthesize に渡された文言の一覧)。"""
+        texts = []
+
+        def recording(text):
+            texts.append(text)
+            return synthesize(text)
+
+        path = self.write_config(**extra)
+        with mock.patch("chime.tts.TTSService.synthesize", side_effect=recording):
+            code, stdout, stderr = call_split(
+                ["--config", path, "--generate-assets", "--backend", "mock"])
+        return code, stdout, stderr, texts
+
+    @staticmethod
+    def lines_starting_with(output, prefix):
+        return [line for line in output.splitlines() if line.startswith(prefix)]
+
+    def test_success_prints_ok_line_per_hour_in_order(self):
+        code, stdout, stderr, texts = self.generate(lambda text: "/voice/" + text + ".wav")
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(stderr, "")
+        self.assertIn("時報音を生成しました: {0}".format(self.signal_path), stdout.splitlines())
+        self.assertTrue(os.path.exists(self.signal_path))
+        self.assertEqual(texts, self.ANNOUNCEMENTS)
+        self.assertEqual(
+            self.lines_starting_with(stdout, "  OK "),
+            ["  OK {0} -> /voice/{0}.wav".format(text) for text in self.ANNOUNCEMENTS])
+        self.assertEqual(self.lines_starting_with(stdout, "  NG "), [])
+
+    def test_all_failures_return_1_with_guidance_on_stderr(self):
+        def fail(text):
+            raise TTSError("作り置きに無い")
+
+        code, stdout, stderr, texts = self.generate(fail)
+        self.assertEqual(code, 1)
+        # 時報音は合成不要なので、読み上げが全滅しても先に生成される
+        self.assertIn("時報音を生成しました: {0}".format(self.signal_path), stdout.splitlines())
+        self.assertTrue(os.path.exists(self.signal_path))
+        self.assertEqual(self.lines_starting_with(stdout, "  OK "), [])
+        self.assertEqual(
+            self.lines_starting_with(stderr, "  NG "),
+            ["  NG {0}: 作り置きに無い".format(text) for text in self.ANNOUNCEMENTS])
+        lines = stderr.splitlines()
+        self.assertIn("7 件の時刻アナウンスの音声を用意できませんでした。", lines)
+        self.assertIn("  - 作り置き（assets/voice/）に無い場合: PC で作り直す（docs/SETUP.md 9 章 B）",
+                      lines)
+        self.assertIn("  - config.json が古く文言を上書きしている場合: docs/SETUP.md 10-7", lines)
+        # 見出し → 案内 2 行の順（NG の行より後ろ）
+        summary = lines.index("7 件の時刻アナウンスの音声を用意できませんでした。")
+        self.assertEqual(summary, 7)
+        self.assertEqual(len(lines), 10)
+
+    def test_partial_failure_returns_1_and_counts_only_the_failures(self):
+        def fail_noon_only(text):
+            if text == "正午をお知らせしたのだ。":
+                raise TTSError("失敗")
+            return "/voice/ok.wav"
+
+        code, stdout, stderr, texts = self.generate(fail_noon_only)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.lines_starting_with(stdout, "  OK ")), 6)
+        self.assertEqual(self.lines_starting_with(stderr, "  NG "),
+                         ["  NG 正午をお知らせしたのだ。: 失敗"])
+        self.assertIn("1 件の時刻アナウンスの音声を用意できませんでした。", stderr.splitlines())
+
+    def test_hourly_range_narrows_the_hours(self):
+        code, stdout, stderr, texts = self.generate(
+            lambda text: "/voice/" + text + ".wav",
+            schedule={"hourly": {"start_hour": 11, "end_hour": 12}})
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(texts, ["午前11時をお知らせしたのだ。", "正午をお知らせしたのだ。"])
+        self.assertEqual(len(self.lines_starting_with(stdout, "  OK ")), 2)
+
+    def test_single_hour_range(self):
+        code, stdout, stderr, texts = self.generate(
+            lambda text: "/voice/" + text + ".wav",
+            schedule={"hourly": {"start_hour": 16, "end_hour": 16}})
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(texts, ["午後よじをお知らせしたのだ。"])
+
+
+class ModeHandlersTest(unittest.TestCase):
+    """``--schedule`` / ``--say`` / ``--test*`` の細かい振る舞い（run の分け方を変えても保つもの）。"""
+
+    OFFLINE = fixture_path("offline_config.json")
+
+    def setUp(self):
+        block_network(self)
+
+    def test_schedule_count_below_one_still_shows_one_event(self):
+        for count in ("0", "-4"):
+            with self.subTest(count=count):
+                code, output = call(["--schedule", count])
+                self.assertEqual(code, 0)
+                self.assertEqual(output.count("  - "), 1, output)
+
+    def test_say_warns_before_logging_the_environment(self):
+        """未録音の警告（標準エラー出力）→ 実行環境のログ → 再生、の順。"""
+        wav = ANNOUNCE_PATH
+        with mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, output = call(["--say", "Qwerty", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 0)
+        self.assertLess(output.index("この文言がありません"), output.index("実行環境:"))
+        self.assertLess(output.index("実行環境:"), output.index("dry-run"))
+
+    def test_invalid_hour_is_rejected_after_logging_the_environment(self):
+        code, output = call(["--test-hourly", "42", "--dry-run", "--backend", "mock"])
+        self.assertEqual(code, 2)
+        self.assertLess(output.index("実行環境:"), output.index("0〜23"))
+        self.assertNotIn("テストモード", output)
+
+    def assert_plays_hour(self, argv, hour, now_hour=14):
+        """``argv`` を、現在時刻を ``now_hour`` 時に固定して実行し、``hour`` 時の時報が鳴ること。"""
+        wav = ANNOUNCE_PATH
+        fixed_now = datetime(2026, 10, 6, now_hour, 30)
+        with mock.patch("chime.app.ChimeApp.now", return_value=fixed_now), \
+                mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, output = call(argv + ["--dry-run", "--backend", "mock", "--config", self.OFFLINE])
+        self.assertEqual(code, 0, output)
+        self.assertIn("テストモード: {0} 時の時報を再生します。".format(hour), output)
+
+    def test_test_hourly_without_value_means_the_current_hour(self):
+        self.assert_plays_hour(["--test-hourly"], 14)
+
+    def test_test_hourly_with_negative_value_means_the_current_hour(self):
+        """負の値は「範囲外」ではなく「現在時刻」の意味になる（0〜23 の検証にかからない）。"""
+        for value in ("-1", "-5"):
+            with self.subTest(value=value):
+                self.assert_plays_hour(["--test-hourly", value], 14)
+
+    def test_test_hourly_with_value_ignores_the_current_hour(self):
+        self.assert_plays_hour(["--test-hourly", "0"], 0)
+        self.assert_plays_hour(["--test-hourly", "23"], 23)
+
+    def test_test_all_plays_the_current_hour_then_closing(self):
+        wav = ANNOUNCE_PATH
+        fixed_now = datetime(2026, 10, 6, 15, 10)
+        with mock.patch("chime.app.ChimeApp.now", return_value=fixed_now), \
+                mock.patch("chime.tts.TTSService.synthesize", return_value=wav):
+            code, output = call(["--test-all", "--dry-run", "--backend", "mock",
+                                 "--config", self.OFFLINE])
+        self.assertEqual(code, 0, output)
+        self.assertLess(output.index("テストモード: 15 時の時報を再生します。"),
+                        output.index("テストモード: 閉館放送を再生します。"))
+        self.assertLess(output.index("閉館放送を再生します。"), output.index("テストを終了します。"))
+
+    def test_test_all_plays_closing_even_when_the_hourly_plan_is_empty(self):
+        """時報が再生できなくても閉館放送は続けて試し、どちらかが鳴れば 0 を返す。"""
+        def empty_hourly(self, hour, event=None):
+            return PlaybackPlan(event=event, segments=[], warnings=["時報音すら用意できませんでした"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"audio": {"mock_max_seconds": 0.05}}, handle)
+            with mock.patch("chime.sequence.SequenceBuilder.build_hourly", empty_hourly):
+                code, output = call(["--config", path, "--test-all", "--backend", "mock"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("テストモード: 閉館放送を再生します。", output)
+        self.assertNotIn("再生できるセグメントがありませんでした", output)
+
+    def test_test_all_returns_1_when_neither_plays(self):
+        def empty_hourly(self, hour, event=None):
+            return PlaybackPlan(event=event, segments=[], warnings=["時報音すら用意できませんでした"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"closing": {"announce_file": "assets/does_not_exist.wav",
+                                       "music_file": "assets/also_missing.mp3"}}, handle)
+            with mock.patch("chime.sequence.SequenceBuilder.build_hourly", empty_hourly):
+                code, output = call(["--config", path, "--test-all", "--backend", "mock"])
+        self.assertEqual(code, 1)
+        self.assertIn("テストモード: 閉館放送を再生します。", output)
+        self.assertIn("再生できるセグメントがありませんでした", output)
+        self.assertIn("テストを終了します。", output)
 
 
 class EnvironmentTest(unittest.TestCase):

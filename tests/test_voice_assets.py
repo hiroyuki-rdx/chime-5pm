@@ -8,25 +8,17 @@ Pi には実行時の音声合成が無く、読み上げはリポジトリに�
 
 from __future__ import annotations
 
-import json
 import os
-import sys
 import unittest
 import wave
 
-from tests.support import REPO_ROOT
+from tests.support import ANNOUNCE_PATH, ASSETS_DIR, MANIFEST_PATH, VOICE_DIR, load_manifest
 
-sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+from chime.config import BASE_DIR, DEFAULT_CONFIG, Config
+from chime.phrases import collect_phrases
+from chime.tts import MANIFEST_FILENAME, prerecorded_filename
 
-from generate_voicevox import collect_phrases  # noqa: E402
-
-from chime.config import BASE_DIR, DEFAULT_CONFIG, Config  # noqa: E402
-from chime.tts import _digest  # noqa: E402
-
-VOICE_DIR = os.path.join(REPO_ROOT, "assets", "voice")
-MANIFEST_PATH = os.path.join(VOICE_DIR, "manifest.json")
-ANNOUNCE_PATH = os.path.join(REPO_ROOT, "assets", "announce.wav")
-HOTARU_PATH = os.path.join(REPO_ROOT, "assets", "hotaru.mp3")
+HOTARU_PATH = os.path.join(ASSETS_DIR, "hotaru.mp3")
 
 #: VOICEVOX ENGINE が出力する形式（scripts/generate_voicevox.py が書き出す WAV）。
 EXPECTED_RATE = 24000
@@ -48,17 +40,12 @@ REBUILD_HINT = ("PC で scripts/generate_voicevox.py --include-quotes --prune �
                 "作り直し、assets/voice/ をコミットしてください")
 
 
-def _load_manifest():
-    with open(MANIFEST_PATH, encoding="utf-8") as handle:
-        return json.load(handle)
-
-
 class VoiceManifestTest(unittest.TestCase):
     """``assets/voice/manifest.json``（文言 → ファイル名）と実ファイルの整合。"""
 
     @classmethod
     def setUpClass(cls):
-        cls.manifest = _load_manifest()
+        cls.manifest = load_manifest()
 
     def test_manifest_is_not_empty(self):
         self.assertTrue(self.manifest,
@@ -127,13 +114,19 @@ class VoiceManifestTest(unittest.TestCase):
         # chime/tts.py の PrerecordedEngine は、文言から名前を計算して引く。
         # manifest 上の名前がその計算結果と違うと、ファイルがあっても引けない。
         mismatched = sorted(
-            "{0}: {1}（期待 {2}）".format(text, name, _digest(text) + ".wav")
+            "{0}: {1}（期待 {2}）".format(text, name, prerecorded_filename(text))
             for text, name in self.manifest.items()
-            if name != _digest(text) + ".wav")
+            if name != prerecorded_filename(text))
         self.assertEqual(
             mismatched, [],
-            "manifest.json のファイル名が、文言から計算した名前（chime.tts._digest）と"
-            "食い違っています。{0}。".format(REBUILD_HINT))
+            "manifest.json のファイル名が、文言から計算した名前"
+            "（chime.tts.prerecorded_filename）と食い違っています。{0}。".format(REBUILD_HINT))
+
+    def test_manifest_filename_is_the_one_the_runtime_reads(self):
+        # 実行時（PrerecordedEngine）と生成スクリプトは MANIFEST_FILENAME で目録を探す。
+        # 同梱の目録がその名前で置かれていないと、実行時はどの文言も引けない。
+        self.assertEqual(os.path.join(VOICE_DIR, MANIFEST_FILENAME), MANIFEST_PATH)
+        self.assertTrue(os.path.isfile(os.path.join(VOICE_DIR, MANIFEST_FILENAME)))
 
     def test_manifest_covers_every_phrase_the_chime_speaks(self):
         # 既定の設定で読み上げうる文言（天気の全語彙・時刻・閉館放送・ひとこと）が

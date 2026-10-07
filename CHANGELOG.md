@@ -34,6 +34,30 @@
   既定値、廃止したキーが現行の設定として書かれていないこと
 - 読み上げの部品が「欠けてもよい」扱い（その 1 文だけ無音で、放送は止めない）であることの回帰テスト
 
+### 内部の整理（動作は変わらない）
+
+- 読み上げうる全文言の列挙を `scripts/generate_voicevox.py` から新しい `chime/phrases.py` に移した。
+  生成スクリプト・テスト・CI が同じ列挙を使い、実行時も閉館の追加文言と時報の時刻の範囲を同じ
+  関数から読む（列挙と実際に読む文がずれると、その文だけ Pi で無音になるため）。
+  `from generate_voicevox import collect_phrases` は従来どおり使える
+- 作り置きの WAV のファイル名の規則を `chime.tts.prerecorded_filename()` と `MANIFEST_FILENAME`
+  として公開し、実行時と生成スクリプトで共有した
+- 長い関数を分けた（`cli.run`、生成スクリプトの `main`、`TTSService.synthesize`、
+  `Scheduler.events_for_date`、常駐ループの再生内容の組み立て）。閉館放送の組み立ての重複、
+  天気・時報音・ひとことの内部の重複も整理した
+- テストを足した: それまでテストの無かった `--generate-assets`、生成スクリプトの起動待ち・
+  `--force`・`--include-quotes`・接続できないときの案内、読み上げうる文がすべて作り置きの列挙に
+  入っていること、`chime/phrases.py` が再生系（pygame）を読み込まないこと、`setup.sh` の
+  `--help` と `config.json` の雛形。テストが実際に通信しないようにし（VOICEVOX ENGINE への
+  接続確認などが 1 回の実行で約 30 回走っていた）、一時フォルダを残さないようにした
+
+### 変更（小さなもの）
+
+- 生成スクリプトは `assets/voice/manifest.json` が壊れていると、何も合成・上書きせずに 1 行の
+  案内を出して終了する（終了コード 1。従来は Python の例外で止まっていた）。BOM 付きの UTF-8 も
+  読める。manifest の書き出しは一時ファイル経由（途中で止まっても書きかけにならない）
+- `bash scripts/setup.sh --help` が、説明の後ろに `set -euo pipefail` の行まで表示していたのを直した
+
 ### 移行
 
 16:55〜17:02（閉館放送の前後）を避けて行う。

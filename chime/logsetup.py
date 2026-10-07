@@ -16,6 +16,7 @@ import os
 import sys
 from datetime import datetime
 from typing import IO, Optional
+from zoneinfo import ZoneInfo
 
 #: 自前のハンドラに付ける目印（2 回目以降の呼び出しで見つけて更新する）。
 _HANDLER_MARK = "_chime_handler"
@@ -34,6 +35,14 @@ def priority_prefix(levelno: int) -> str:
     return "<7>"
 
 
+def _prefix_lines(text: str, prefix: str) -> str:
+    """``text`` のすべての行（空行も）の先頭に ``prefix`` を付ける。
+
+    systemd は 1 行ずつ別のエントリとして記録するため、先頭行だけでは足りない。
+    """
+    return "\n".join(prefix + line for line in text.split("\n"))
+
+
 class JournalPriorityFormatter(logging.Formatter):
     """整形後の各行の先頭に、journal 用の重大度の接頭辞を付ける。
 
@@ -43,9 +52,7 @@ class JournalPriorityFormatter(logging.Formatter):
     """
 
     def format(self, record: logging.LogRecord) -> str:
-        text = super().format(record)
-        prefix = priority_prefix(record.levelno)
-        return "\n".join(prefix + line for line in text.split("\n"))
+        return _prefix_lines(super().format(record), priority_prefix(record.levelno))
 
 
 def journal_stream_matches(stream: Optional[IO[str]]) -> bool:
@@ -98,10 +105,8 @@ def setup_logging(level_name: str, log_format: str, timezone: str = "",
     if not timezone:
         return
     try:
-        from zoneinfo import ZoneInfo
-
         tzinfo = ZoneInfo(timezone)
-    except Exception:  # pragma: no cover - tzdata 欠落時は OS のローカル時刻のまま
+    except Exception:  # 未知の名前や tzdata 欠落でも起動は止めず、OS のローカル時刻のまま
         return
 
     def _converter(timestamp):
@@ -119,8 +124,7 @@ def emit_early_error(text: str) -> None:
     標準エラー出力が journal に繋がっているときは、``journalctl -p err``
     で拾えるよう、各行に error の接頭辞を付ける。
     """
-    lines = str(text).split("\n")
+    text = str(text)
     if journal_stream_matches(sys.stderr):
-        prefix = priority_prefix(logging.ERROR)
-        lines = [prefix + line for line in lines]
-    print("\n".join(lines), file=sys.stderr)
+        text = _prefix_lines(text, priority_prefix(logging.ERROR))
+    print(text, file=sys.stderr)

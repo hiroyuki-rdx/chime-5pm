@@ -9,7 +9,7 @@ import logging
 import sys
 from typing import List, Optional
 
-from . import __version__, timesignal
+from . import __version__, phrases, timesignal
 from .app import ChimeApp
 from .config import DEFAULT_CONFIG, ConfigError, load_config
 from .logsetup import emit_early_error, setup_logging
@@ -18,6 +18,10 @@ from .tts import TTSError
 from .weather import WeatherError
 
 logger = logging.getLogger("chime")
+
+#: ``--test-hourly`` を値なしで指定したときに argparse が渡す値。「いまの時刻」を
+#: 表す。0〜23 に収まらない負の値も同じ意味に扱う（:func:`play_tests`）。
+CURRENT_HOUR = -1
 
 EPILOG = """\
 使用例:
@@ -54,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     actions = parser.add_argument_group("動作モード（未指定なら常駐）")
     actions.add_argument("--test", action="store_true",
                          help="閉館放送（アナウンス＋蛍の光）を即時再生して終了")
-    actions.add_argument("--test-hourly", nargs="?", const=-1, type=int, metavar="HOUR",
+    actions.add_argument("--test-hourly", nargs="?", const=CURRENT_HOUR, type=int,
+                         metavar="HOUR",
                          help="時報を即時再生して終了（時刻を省略すると現在時刻）")
     actions.add_argument("--test-all", action="store_true",
                          help="時報と閉館放送を続けて再生して終了")
@@ -101,10 +106,7 @@ def run(argv: Optional[List[str]] = None) -> int:
     app = ChimeApp(config, backend=args.backend, dry_run=args.dry_run)
 
     if args.schedule is not None:
-        print("現在時刻: {0}".format(app.now().strftime("%Y-%m-%d %H:%M:%S %Z")))
-        print("次回以降の予定:")
-        print(format_events(app.scheduler.upcoming(limit=max(1, args.schedule))))
-        return 0
+        return show_schedule(app, args.schedule)
 
     if args.generate_assets:
         return generate_assets(app)
@@ -113,42 +115,37 @@ def run(argv: Optional[List[str]] = None) -> int:
         return show_weather(app)
 
     if args.say is not None:
-        if not args.say.strip():
-            print("読み上げる文言が空です。", file=sys.stderr)
-            return 2
-        warn_if_not_prerecorded(app, args.say)
-        app.log_environment()
-        plan = app.builder.build_text(args.say)
-        if not app.play(plan):
-            return 1
-        return 0
+        return say_text(app, args.say)
 
     if args.test_hourly is not None or args.test or args.test_all:
-        app.log_environment()
-        succeeded = False
-        if args.test_hourly is not None or args.test_all:
-            hour = app.now().hour if (args.test_hourly is None or args.test_hourly < 0) \
-                else args.test_hourly
-            if not 0 <= hour <= 23:
-                print("--test-hourly は 0〜23 で指定してください。", file=sys.stderr)
-                return 2
-            logger.info("テストモード: %d 時の時報を再生します。", hour)
-            plan = app.builder.build_hourly(hour)
-            if app.play(plan):
-                succeeded = True
-        if args.test or args.test_all:
-            logger.info("テストモード: 閉館放送を再生します。")
-            plan = app.builder.build_closing()
-            if app.play(plan):
-                succeeded = True
-        logger.info("テストを終了します。")
-        if not succeeded:
-            logger.error("再生できるセグメントがありませんでした。")
-            return 1
-        return 0
+        return play_tests(app,
+                          hourly=args.test_hourly is not None or args.test_all,
+                          closing=args.test or args.test_all,
+                          hour_arg=args.test_hourly)
 
     app.install_signal_handlers()
     return app.run_forever()
+
+
+def show_schedule(app: ChimeApp, count: int) -> int:
+    """次回以降の予定を ``count`` 件表示する。"""
+    print("現在時刻: {0}".format(app.now().strftime("%Y-%m-%d %H:%M:%S %Z")))
+    print("次回以降の予定:")
+    # 0 や負の値は 1 件に丸める（upcoming の limit の解釈に頼らない）。
+    print(format_events(app.scheduler.upcoming(limit=max(1, count))))
+    return 0
+
+
+def say_text(app: ChimeApp, text: str) -> int:
+    """任意の文言を読み上げる（``--say``）。再生できなければ 1、空の文言は 2。"""
+    # 空の文言を「指定なし」と見なすと常駐ループに落ちてしまうため、引数エラーにする。
+    if not text.strip():
+        print("読み上げる文言が空です。", file=sys.stderr)
+        return 2
+    warn_if_not_prerecorded(app, text)
+    app.log_environment()
+    plan = app.builder.build_text(text)
+    return 0 if app.play(plan) else 1
 
 
 def warn_if_not_prerecorded(app: ChimeApp, text: str) -> None:
@@ -189,11 +186,11 @@ def generate_assets(app: ChimeApp) -> int:
         app.time_signal_path, settings, app.config.section("audio.mixer"))
     print("時報音を生成しました: {0}".format(path))
 
-    hourly = app.config.section("schedule.hourly")
-    hours = range(int(hourly.get("start_hour", 10)), int(hourly.get("end_hour", 16)) + 1)
     failures = 0
-    for hour in hours:
-        text = timesignal.announce_text(hour, settings)
+    # 作り置きの列挙（--prune や CI と同じ）と同じ文言を、1 件ずつ確かめる。
+    # ジェネレーターなので、テンプレートが壊れていても、その時刻の前までは
+    # OK / NG を出してから例外になる。
+    for text in phrases.announcement_phrases(app.config):
         try:
             generated = app.tts.synthesize(text)
         except TTSError as exc:
@@ -229,4 +226,34 @@ def show_weather(app: ChimeApp) -> int:
         print("読み上げ文 {0}/{1}: {2}".format(index, len(sentences), sentence))
     if not app.dry_run:
         app.play(app.builder.build_texts(sentences))
+    return 0
+
+
+def play_tests(app: ChimeApp, hourly: bool, closing: bool, hour_arg: Optional[int]) -> int:
+    """時報・閉館放送をその場で再生する（``--test-hourly`` / ``--test`` / ``--test-all``）。
+
+    ``hour_arg`` が ``None`` か負（:data:`CURRENT_HOUR`）なら、いまの時刻の時報を鳴らす。
+    実行環境のログは時刻の検証より先に出す（指定が誤りでも、どの環境で試したかが残る）。
+    時報が鳴らなくても閉館放送は続けて試し、どちらも鳴らなかったときだけ 1 を返す。
+    """
+    app.log_environment()
+    succeeded = False
+    if hourly:
+        hour = app.now().hour if hour_arg is None or hour_arg < 0 else hour_arg
+        if not 0 <= hour <= 23:
+            print("--test-hourly は 0〜23 で指定してください。", file=sys.stderr)
+            return 2
+        logger.info("テストモード: %d 時の時報を再生します。", hour)
+        plan = app.builder.build_hourly(hour)
+        if app.play(plan):
+            succeeded = True
+    if closing:
+        logger.info("テストモード: 閉館放送を再生します。")
+        plan = app.builder.build_closing()
+        if app.play(plan):
+            succeeded = True
+    logger.info("テストを終了します。")
+    if not succeeded:
+        logger.error("再生できるセグメントがありませんでした。")
+        return 1
     return 0

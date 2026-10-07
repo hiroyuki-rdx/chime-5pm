@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import logging
 import os
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
+
+from tests.support import logs_enabled
 
 from chime.logsetup import (
     JournalPriorityFormatter,
@@ -40,10 +44,11 @@ class LoggingTestCase(unittest.TestCase):
         handlers, level = root.handlers[:], root.level
         root.handlers[:] = []
         # tests/__init__.py がログを抑制しているため、ここだけ戻す
-        logging.disable(logging.NOTSET)
+        enabled = contextlib.ExitStack()
+        enabled.enter_context(logs_enabled())
 
         def restore():
-            logging.disable(logging.CRITICAL)
+            enabled.close()
             root.handlers[:] = handlers
             root.setLevel(level)
 
@@ -85,6 +90,15 @@ class JournalPriorityTest(LoggingTestCase):
         self.assertIn("<3>Traceback (most recent call last):", exception_lines)
         self.assertEqual(exception_lines[-1], "<3>ValueError: boom")
         self.assertTrue(all(line.startswith("<3>") for line in exception_lines), exception_lines)
+
+    def test_blank_lines_also_get_the_prefix(self):
+        """空行も 1 行として別のエントリになるため、接頭辞を付けないと info に戻ってしまう。"""
+        os.environ["JOURNAL_STREAM"] = journal_stream_value(self.stream)
+        setup_logging("INFO", "%(message)s", stream=self.stream)
+
+        self.logger.warning("上\n\n下\n")
+
+        self.assertEqual(read_all(self.stream), "<4>上\n<4>\n<4>下\n<4>\n")
 
     def test_no_prefix_without_journal_stream_variable(self):
         setup_logging("INFO", FORMAT, stream=self.stream)
@@ -160,6 +174,24 @@ class SetupLoggingTest(LoggingTestCase):
 
         self.assertTrue(formatted.startswith("1970-01-01 09:00:00"), formatted)
 
+    def test_unknown_timezone_keeps_the_local_time_and_does_not_raise(self):
+        """未知のタイムゾーン名（書式が不正な名前を含む）でも起動は止めず、OS のローカル時刻のまま。"""
+        for name in ("Nowhere/City", "../escape"):
+            with self.subTest(timezone=name):
+                logging.getLogger().handlers[:] = []
+                setup_logging("INFO", "%(asctime)s %(message)s", name, stream=self.stream)
+                formatter = logging.getLogger().handlers[0].formatter
+                self.assertNotIn("converter", vars(formatter))
+                record = logging.LogRecord("chime", logging.INFO, __file__, 1, "確認", None, None)
+                record.created = 0
+                expected = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(0))
+                formatted = formatter.format(record)
+                self.assertTrue(formatted.startswith(expected), formatted)
+
+    def test_empty_timezone_leaves_the_formatter_alone(self):
+        setup_logging("INFO", FORMAT, "", stream=self.stream)
+        self.assertNotIn("converter", vars(logging.getLogger().handlers[0].formatter))
+
     def test_default_stream_is_stdout_at_call_time(self):
         buffer = io.StringIO()
         with mock.patch.object(sys, "stdout", buffer):
@@ -196,6 +228,22 @@ class EmitEarlyErrorTest(LoggingTestCase):
             emit_early_error("設定エラー: 一行目\n二行目")
 
         self.assertEqual(read_all(self.stream), "<3>設定エラー: 一行目\n<3>二行目\n")
+
+    def test_empty_text_gets_a_single_prefix_when_stderr_is_journal(self):
+        os.environ["JOURNAL_STREAM"] = journal_stream_value(self.stream)
+
+        with mock.patch.object(sys, "stderr", self.stream):
+            emit_early_error("")
+
+        self.assertEqual(read_all(self.stream), "<3>\n")
+
+    def test_non_string_text_is_converted(self):
+        buffer = io.StringIO()
+
+        with mock.patch.object(sys, "stderr", buffer):
+            emit_early_error(ValueError("壊れた設定"))
+
+        self.assertEqual(buffer.getvalue(), "壊れた設定\n")
 
     def test_plain_text_when_stderr_is_not_journal(self):
         buffer = io.StringIO()

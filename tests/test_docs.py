@@ -14,23 +14,18 @@ import glob
 import json
 import os
 import re
-import sys
 import unittest
 from typing import List, NamedTuple, Tuple
 
-from tests.support import REPO_ROOT
+from tests.support import REPO_ROOT, load_manifest
 
-sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
+from chime import __version__, cli, weather
+from chime import config as chime_config
+from chime.config import BASE_DIR, DEFAULT_CONFIG, Config
+from chime.phrases import announcement_phrases, collect_phrases
+from chime.quotes import load_quotes
+from chime.state import MAX_RECENT_QUOTES
 
-import generate_voicevox  # noqa: E402
-
-from chime import __version__, cli, timesignal, weather  # noqa: E402
-from chime import config as chime_config  # noqa: E402
-from chime.config import BASE_DIR, DEFAULT_CONFIG, Config  # noqa: E402
-from chime.quotes import load_quotes  # noqa: E402
-from chime.state import MAX_RECENT_QUOTES  # noqa: E402
-
-MANIFEST_PATH = os.path.join(REPO_ROOT, "assets", "voice", "manifest.json")
 CHANGELOG_PATH = os.path.join(REPO_ROOT, "CHANGELOG.md")
 
 #: ``--say "…"`` / ``--say '…'`` / ``--say …``（引数 1 つ分）を拾う。
@@ -72,11 +67,6 @@ def current_doc_paths() -> list:
 def read_text(path: str) -> str:
     with open(path, "r", encoding="utf-8") as handle:
         return handle.read()
-
-
-def load_manifest() -> dict:
-    with open(MANIFEST_PATH, "r", encoding="utf-8") as handle:
-        return json.load(handle)
 
 
 class SayExampleExtractionTest(unittest.TestCase):
@@ -280,14 +270,10 @@ class DocumentedCounts:
         self.config = config
 
         # 作り置きの総数（文言の重複は 1 件に数える）と、その内訳
-        self.total = len(generate_voicevox.collect_phrases(config, include_quotes=True))
-        self.total_without_quotes = len(
-            generate_voicevox.collect_phrases(config, include_quotes=False))
+        self.total = len(collect_phrases(config, include_quotes=True))
+        self.total_without_quotes = len(collect_phrases(config, include_quotes=False))
 
-        hourly = config.section("schedule.hourly")
-        self.announcements = len({
-            timesignal.announce_text(hour, config.section("time_signal"))
-            for hour in range(int(hourly["start_hour"]), int(hourly["end_hour"]) + 1)})
+        self.announcements = len(set(announcement_phrases(config)))
 
         quotes = load_quotes(config.path("quotes.file"))
         texts = list(quotes.get("general", []))

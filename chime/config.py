@@ -16,12 +16,11 @@ v6.0.0 で廃止した設定キー（:data:`REMOVED_KEYS`）が設定ファイ�
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from .jsonfile import JsonFileError, read_json
+from .jsonfile import JsonFileError, read_json, write_json_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -420,6 +419,4 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 def dump_default_config(path: str) -> None:
     """:data:`DEFAULT_CONFIG` を JSON として書き出す（雛形生成用）。"""
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(DEFAULT_CONFIG, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    write_json_atomic(path, DEFAULT_CONFIG)

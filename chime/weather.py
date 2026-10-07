@@ -138,6 +138,39 @@ def parse_open_meteo(payload: Any, settings: Mapping[str, Any], today: date) -> 
     }
 
 
+def _locations(settings: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    """``open_meteo.locations`` を返す（地点が無ければ空リスト）。
+
+    ``open_meteo`` が ``None`` のときは ``AttributeError`` になる。3 か所の
+    呼び出し元が以前から同じ式でそう振る舞っており、観測できる挙動なので、
+    一本化しても null 許容にはしない。
+    """
+    return settings.get("open_meteo", {}).get("locations", []) or []
+
+
+def _location_label(location: Mapping[str, Any]) -> str:
+    return str(location.get("label", ""))
+
+
+def _sentence_template(settings: Mapping[str, Any], key: str) -> str:
+    """``sentence_*`` のテンプレートを文字列で返す（未設定は空文字列＝その文は出さない）。"""
+    return str(settings.get(key, ""))
+
+
+def _prerecord_temp_range(prerecord: Mapping[str, Any]) -> range:
+    """作り置きする気温の範囲（``temp_min`` 〜 ``temp_max``、両端含む）を返す。
+
+    ``sentence_temp`` と ``sentence_temp_max`` が同じ範囲を使う。範囲が不正
+    （数値にできない）なら空の範囲を返し、何も列挙しない。
+    """
+    try:
+        temp_min = int(prerecord.get("temp_min", 0))
+        temp_max = int(prerecord.get("temp_max", 0))
+    except (TypeError, ValueError):
+        return range(0)
+    return range(temp_min, temp_max + 1)
+
+
 def _round_pop_to_step(pop: Any, pop_step: Any) -> Any:
     """降水確率を ``pop_step`` の刻みに丸める。
 
@@ -193,26 +226,29 @@ def build_sentences(parts: Mapping[str, Any], settings: Mapping[str, Any]) -> Li
       ``parts["pop"]`` 自体は生値のまま変更しない。
     """
     sentences: List[str] = []
+    # prerecord_phrases と違い ``or {}`` を付けない。prerecord が None なら
+    # AttributeError になり、_describe_one がその地点だけを WeatherError
+    # （＝その地点の天気は読まない）にする。この差は観測できるので揃えない。
     pop_step = settings.get("prerecord", {}).get("pop_step")
 
-    weather_template = str(settings.get("sentence_weather", ""))
+    weather_template = _sentence_template(settings, "sentence_weather")
     if weather_template:
         sentences.append(_format_weather_sentence(
             weather_template, parts.get("when", ""), parts.get("label", ""),
             parts.get("weather", "")))
 
     temp = parts.get("temp")
-    temp_template = str(settings.get("sentence_temp", ""))
+    temp_template = _sentence_template(settings, "sentence_temp")
     if temp is not None and temp_template:
         sentences.append(_format_temp_sentence(temp_template, temp))
 
     temp_max = parts.get("temp_max")
-    temp_max_template = str(settings.get("sentence_temp_max", ""))
+    temp_max_template = _sentence_template(settings, "sentence_temp_max")
     if temp_max is not None and temp_max_template:
         sentences.append(_format_temp_max_sentence(temp_max_template, temp_max))
 
     pop = parts.get("pop")
-    pop_template = str(settings.get("sentence_pop", ""))
+    pop_template = _sentence_template(settings, "sentence_pop")
     if pop is not None and pop_template:
         sentences.append(_format_pop_sentence(pop_template, pop, pop_step))
 
@@ -246,38 +282,28 @@ def prerecord_phrases(settings: Mapping[str, Any]) -> List[str]:
 
     prerecord = settings.get("prerecord", {}) or {}
 
-    weather_template = str(settings.get("sentence_weather", ""))
+    weather_template = _sentence_template(settings, "sentence_weather")
     if weather_template:
-        locations = settings.get("open_meteo", {}).get("locations", []) or []
+        locations = _locations(settings)
         whens = list(prerecord.get("whens", []) or [])
         for location in locations:
-            label = str(location.get("label", ""))
+            label = _location_label(location)
             for when in whens:
                 for code in sorted(WMO_CODES):
                     _add(_format_weather_sentence(
                         weather_template, when, label, WMO_CODES[code]))
 
-    temp_template = str(settings.get("sentence_temp", ""))
+    temp_template = _sentence_template(settings, "sentence_temp")
     if temp_template:
-        try:
-            temp_min = int(prerecord.get("temp_min", 0))
-            temp_max = int(prerecord.get("temp_max", 0))
-        except (TypeError, ValueError):
-            temp_min, temp_max = 0, -1  # 範囲が不正なら列挙しない
-        for value in range(temp_min, temp_max + 1):
+        for value in _prerecord_temp_range(prerecord):
             _add(_format_temp_sentence(temp_template, value))
 
-    temp_max_template = str(settings.get("sentence_temp_max", ""))
+    temp_max_template = _sentence_template(settings, "sentence_temp_max")
     if temp_max_template:
-        try:
-            temp_min = int(prerecord.get("temp_min", 0))
-            temp_max = int(prerecord.get("temp_max", 0))
-        except (TypeError, ValueError):
-            temp_min, temp_max = 0, -1  # 範囲が不正なら列挙しない
-        for value in range(temp_min, temp_max + 1):
+        for value in _prerecord_temp_range(prerecord):
             _add(_format_temp_max_sentence(temp_max_template, value))
 
-    pop_template = str(settings.get("sentence_pop", ""))
+    pop_template = _sentence_template(settings, "sentence_pop")
     if pop_template:
         try:
             pop_step = int(prerecord.get("pop_step"))
@@ -319,7 +345,7 @@ class WeatherService:
         （地点を特定しない呼び出し元、例えば ``--weather`` CLI の URL 表示のため）。
         """
         if location is None:
-            locations = self.settings.get("open_meteo", {}).get("locations", []) or []
+            locations = _locations(self.settings)
             if not locations:
                 raise WeatherError("Open-Meteo の地点が設定されていません。")
             location = locations[0]
@@ -342,10 +368,10 @@ class WeatherService:
 
         ``open_meteo.locations`` の各要素ごとに個別の URL を組み立てる。
         """
-        locations = self.settings.get("open_meteo", {}).get("locations", []) or []
+        locations = _locations(self.settings)
         targets: List[Tuple[str, str, Dict[str, Any]]] = []
         for location in locations:
-            label = str(location.get("label", ""))
+            label = _location_label(location)
             targets.append((label, self.url(location), {"label": label}))
         return targets
 

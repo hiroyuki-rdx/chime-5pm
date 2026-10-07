@@ -7,6 +7,7 @@ import signal
 import threading
 from datetime import datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from . import env, timesignal
 from .audio import PlaybackError, Player, create_player
@@ -19,11 +20,6 @@ from .tts import TTSService
 from .weather import WeatherService
 
 logger = logging.getLogger(__name__)
-
-try:  # Python 3.9+
-    from zoneinfo import ZoneInfo
-except ImportError:  # pragma: no cover - 3.9 未満は非対応
-    ZoneInfo = None  # type: ignore
 
 
 class ChimeApp:
@@ -75,12 +71,9 @@ class ChimeApp:
 
     @staticmethod
     def _resolve_timezone(name: str):
-        if ZoneInfo is None:  # pragma: no cover
-            logger.warning("zoneinfo が使えないため、OS のローカル時刻を使用します。")
-            return None
         try:
             return ZoneInfo(str(name))
-        except Exception as exc:  # pragma: no cover - tzdata 欠落時のみ
+        except Exception as exc:  # 未知の名前や tzdata 欠落でも起動は止めない
             logger.error("タイムゾーン '%s' を解決できません（OS のローカル時刻を使用します）: %s",
                          name, exc)
             return None
@@ -133,7 +126,7 @@ class ChimeApp:
         except PlaybackError as exc:
             logger.error("再生に失敗しました: %s", exc)
             return False
-        except Exception as exc:  # pragma: no cover - 再生失敗でプロセスは落とさない
+        except Exception as exc:  # 再生失敗でプロセスは落とさない
             logger.exception("再生中に予期しないエラーが発生しました: %s", exc)
             return False
         if not played:
@@ -141,6 +134,26 @@ class ChimeApp:
             return False
         logger.info("再生シーケンスが完了しました。")
         return True
+
+    def _is_fired(self, event: Event) -> bool:
+        """そのイベントを再生済みとして記録しているか（二重再生の防止）。"""
+        return self.state.is_fired(event.key, event.day)
+
+    def _next_pending_event(self) -> Optional[Event]:
+        """まだ鳴らしていない次のイベント。選ぶときも待機後の再確認も同じ基準にする。"""
+        return self.scheduler.next_event(is_fired=self._is_fired)
+
+    def _build_plan(self, event: Event) -> PlaybackPlan:
+        """再生内容を組み立てる。失敗したら最小のプランに落とす。
+
+        最小のプランの組み立てまで失敗した場合は、例外をそのまま送出する
+        （握りつぶさない。受け止めるのは ``run_forever`` 側）。
+        """
+        try:
+            return self.builder.build(event)
+        except Exception as exc:
+            logger.exception("再生内容の組み立てに失敗しました（最小の内容で鳴らします）: %s", exc)
+            return self.builder.build_minimal(event)
 
     def run_event(self, event: Event) -> None:
         """イベント 1 件を準備・再生し、再生済みとして記録する。
@@ -151,11 +164,7 @@ class ChimeApp:
         しても付ける（無限にやり直さない）。
         """
         logger.info("イベント準備: %s", event.describe())
-        try:
-            plan = self.builder.build(event)
-        except Exception as exc:
-            logger.exception("再生内容の組み立てに失敗しました（最小の内容で鳴らします）: %s", exc)
-            plan = self.builder.build_minimal(event)
+        plan = self._build_plan(event)
 
         if not self.scheduler.sleep_until(event.play_at, self.stop_event, precise=True):
             logger.info("停止要求のため再生を中止しました: %s", event.describe())
@@ -174,8 +183,7 @@ class ChimeApp:
         logger.info("次回以降の予定:\n%s", format_events(upcoming))
 
         while not self.stop_event.is_set():
-            event = self.scheduler.next_event(
-                is_fired=lambda candidate: self.state.is_fired(candidate.key, candidate.day))
+            event = self._next_pending_event()
             if event is None:
                 logger.warning("予定されたイベントがありません。60 秒後に再確認します。")
                 if self.stop_event.wait(60):
@@ -186,15 +194,14 @@ class ChimeApp:
                 break
 
             # 待機中に日付や時刻が大きく動いた場合に備え、対象イベントを再確認する。
-            current = self.scheduler.next_event(
-                is_fired=lambda candidate: self.state.is_fired(candidate.key, candidate.day))
+            current = self._next_pending_event()
             if current is None or current.key != event.key or current.at != event.at:
                 logger.info("待機中に予定が変わりました。再計算します。")
                 continue
 
             try:
                 self.run_event(event)
-            except Exception as exc:  # pragma: no cover - 常駐は継続する
+            except Exception as exc:  # 常駐は継続する
                 logger.exception("イベント処理に失敗しました（継続します）: %s", exc)
                 self.state.mark_fired(event.key, event.day)
 

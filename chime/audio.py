@@ -12,7 +12,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import subprocess
@@ -47,7 +46,7 @@ class Segment:
 def wav_duration(path: str) -> Optional[float]:
     """WAV ファイルの長さ（秒）を返す。WAV でなければ ``None``。"""
     try:
-        with contextlib.closing(wave.open(path, "rb")) as handle:
+        with wave.open(path, "rb") as handle:
             rate = handle.getframerate()
             if not rate:
                 return None
@@ -80,12 +79,13 @@ class Player:
         raise NotImplementedError
 
     # -- 共通処理 -------------------------------------------------------
-    def play(self, segments: Sequence[Segment]) -> int:
-        """セグメントを順番に、間に無音を挟みながら再生する。
+    @staticmethod
+    def _select_playable(segments: Sequence[Segment]) -> List[Segment]:
+        """再生できるセグメントだけを残す。
 
-        戻り値は実際に再生したセグメント数。欠落した optional セグメントは
-        スキップされるためカウントしない。1 件も再生できなかった場合は
-        （元々セグメントが無かった場合も含め）例外を送出せず ``0`` を返す。
+        パスが空のものは無視する。音源が見つからないとき、optional は警告を
+        出してスキップし、必須は ``PlaybackError`` にする。再生の前に全件を
+        確かめるので、後ろに必須の欠落があれば手前も鳴らさず、デバイスも開かない。
         """
         playable: List[Segment] = []
         for segment in segments:
@@ -98,7 +98,16 @@ class Player:
                     continue
                 raise PlaybackError(message)
             playable.append(segment)
+        return playable
 
+    def play(self, segments: Sequence[Segment]) -> int:
+        """セグメントを順番に、間に無音を挟みながら再生する。
+
+        戻り値は実際に再生したセグメント数。欠落した optional セグメントは
+        スキップされるためカウントしない。1 件も再生できなかった場合は
+        （元々セグメントが無かった場合も含め）例外を送出せず ``0`` を返す。
+        """
+        playable = self._select_playable(segments)
         if not playable:
             logger.warning("再生できるセグメントがありません。")
             return 0

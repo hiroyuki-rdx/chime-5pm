@@ -468,6 +468,28 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 ログのタイムスタンプは `timezone` 設定に合わせて表示する（ハンドラのフォーマッタに変換関数を差し替える）。
 
+### 4.12 `chime/phrases.py`（責務: 読み上げうる全文言の列挙）
+
+チャイムが読み上げうる全文言を列挙する。ここで数えた文言が、そのまま「作り置きしなければならない文言」になる。Pi には実行時の音声合成が無く、声は文言の**完全一致**で `assets/voice/manifest.json` から引くため、列挙から漏れた文言はその文だけ無音になる。
+
+| 関数 | 仕様 |
+|---|---|
+| `announcement_phrases(config)` | 時報の文言を、`start_hour`〜`end_hour`（`chime.scheduler.hourly_hours()`）の時刻ごとに返すジェネレーター。重複は除かず、`skip_hours` も見ない（休みにしている時刻の文言も作り置きしておく） |
+| `closing_extra_text(config)` | `closing.extra_text`。`null`・空文字列・キーなしはどれも空文字列 |
+| `closing_phrases(config)` | `closing.extra_text` があれば 1 件、無ければ空 |
+| `quote_phrases(config)` | ひとことの全文言（`general`、`by_hour` の順） |
+| `collect_phrases(config, include_quotes)` | 時報・閉館・ひとこと（`include_quotes` のときだけ）に、天気の全語彙（`weather.prerecord_phrases()`。`include_quotes` や `weather.enabled` に関わらず常に含む）を足し、空と重複を除いて最初に現れた順に返す |
+| `phrases_in_use(config)` | ひとことを含む使用中の全文言（`--prune` の判定に使う） |
+| `phrases_to_generate(config, include_quotes)` | `config` の文言に既定設定の文言を足した和集合（`config.json` の配列は既定値を丸ごと置き換えるため） |
+| `phrases_to_keep(config)` | `--prune` で残す文言。ひとことを含めた `phrases_to_generate` と同じ |
+| `find_stale_entries(manifest, keep_phrases)` | manifest のうち、残す文言に無いエントリ（判定だけで、削除はしない） |
+
+使うのは `scripts/generate_voicevox.py`（WAV の生成と `--prune`。同スクリプトからも `collect_phrases()` などを引けるよう再公開している）、テスト（`tests/test_phrases.py`・`tests/test_voice_assets.py`・`tests/test_docs.py`）、CI の `prerecorded-only` ジョブ。
+
+**層の規則:** `chime.audio` / `chime.sequence` / `chime.app` を import しない（pygame を引き込まない）。生成スクリプトは PC 側で動かすため、再生系の依存が無くても使えるようにしておく。`tests/test_phrases.py` が別プロセスで import して確かめる。
+
+**既知の取り決め:** 実行時の照合（`TTSService`）は文言の前後の空白を除いて引くが、列挙は除かない。
+
 ---
 
 ## 5. 処理フロー（時報）
@@ -623,11 +645,13 @@ python3 -m unittest discover -s tests -t . -v
 | `tests/test_cli.py` | 引数解釈、終了コード、環境判定 |
 | `tests/test_jsonfile.py` | JSON の読み書き（BOM 付き UTF-8、UTF-8 以外の案内、構文エラーの行・桁とヒント、一時ファイル経由の書き込み） |
 | `tests/test_logsetup.py` | journal への重大度の接頭辞（`JOURNAL_STREAM` が一致するときだけ全行に付く）、ハンドラの重複防止 |
-| `tests/test_generate_voicevox.py` | 作り置き生成スクリプト（`--config` の文言と既定の文言の和集合、`--prune` で残す文言、合成に失敗した文言を manifest に書かないこと） |
+| `tests/test_phrases.py` | 全文言の列挙（既定設定・現地設定での件数とハッシュの固定、`--config` の文言と既定の文言の和集合、`--prune` で残す文言、時報・閉館・ひとこと各列挙の振る舞い、`chime/phrases.py` が再生系を import しないこと） |
+| `tests/test_generate_voicevox.py` | 作り置き生成スクリプトの CLI 側（`--config` の文言を既定の文言に足して生成すること、`--prune` の実行、合成に失敗した文言を manifest に書かないこと、列挙の関数を `chime/phrases.py` から再公開していること） |
+| `tests/test_setup_script.py` | 導入スクリプト（`scripts/setup.sh`）。`--help` / `-h` が先頭のコメントブロックだけを表示すること（`set -euo pipefail` まで出さない）、不明なオプションが副作用（apt・systemd など）の前に終了コード 2 で止まること、新規に作る `config.json` の雛形が正しい JSON で、設定項目を持たず、既定値と同じ値を 1 つも写さない（起動時に丸ごとコピーの警告が出ない）こと。副作用のあるコマンドは偽物に差し替えて実行する |
 | `tests/test_voice_assets.py` | 同梱の音声の健全性（`assets/voice/` の manifest と WAV の欠け・余り・形式、既定の設定が読み上げる全文言が manifest にあること、`announce.wav` と `hotaru.mp3`。VOICEVOX は使わずファイルだけを調べる） |
 | `tests/test_docs.py` | 文書の記載と実装の一致（文書中の `--say` の例が作り置きにあること、README・要求定義書・仕様書の版が `chime/__init__.py` の `__version__` と一致すること、`CHANGELOG.md` の先頭の版が `__version__` と一致すること、文書に書いた作り置きの件数・天気コードの語数がコードから数えた値と一致すること、廃止したキーが「廃止」の語なしに現行の設定として書かれていないこと） |
 
-CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ。「CLI が起動すること」の `--test-hourly 12` は、実際の通信をしないよう `--config tests/fixtures/offline_config.json`（天気を無効にした設定）を渡す）。別ジョブ（`lint`。Python 3.11 のみ）で `pyflakes`（版を固定してインストールする）を `python -m pyflakes chime scripts tests campus_chime.py` で実行する。ワークフロー全体の権限は `contents: read` だけで、同じ ref の古い実行は新しい実行が始まると止める（`concurrency`）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`scripts/generate_voicevox.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
+CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ。「CLI が起動すること」の `--test-hourly 12` は、実際の通信をしないよう `--config tests/fixtures/offline_config.json`（天気を無効にした設定）を渡す）。別ジョブ（`lint`。Python 3.11 のみ）で `pyflakes`（版を固定してインストールする）を `python -m pyflakes chime scripts tests campus_chime.py` で実行する。ワークフロー全体の権限は `contents: read` だけで、同じ ref の古い実行は新しい実行が始まると止める（`concurrency`）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`chime/phrases.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
 
 手元で `prerecorded-only` ジョブと同じ検証をするには、`.github/workflows/ci.yml` のコマンドをそのまま実行する（`cache/tts/` を消してから実行すると、キャッシュ済みの合成結果に隠れず確実に検証できる）。
 

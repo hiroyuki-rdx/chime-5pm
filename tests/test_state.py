@@ -8,6 +8,8 @@ import os
 import tempfile
 import unittest
 
+from tests.support import logs_enabled
+
 from chime.state import MAX_RECENT_QUOTES, State
 
 
@@ -101,17 +103,13 @@ class StateTest(unittest.TestCase):
 
     def test_unreadable_file_is_reported_with_guidance(self):
         # 初期化して続行するだけでなく、なぜ初期化されたかを WARNING で残す。
-        # tests/__init__.py がログを抑制しているため、tests/test_sequence.py と
-        # 同じ手順でこのテストの間だけ一時的に解除する。
+        # tests/__init__.py がログを抑制しているため、logs_enabled() で
+        # このテストの間だけ一時的に解除する。
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "wb") as handle:
             handle.write("閉館".encode("shift_jis"))
-        logging.disable(logging.NOTSET)
-        try:
-            with self.assertLogs("chime.state", level="WARNING") as captured:
-                State(self.path)
-        finally:
-            logging.disable(logging.CRITICAL)
+        with logs_enabled(), self.assertLogs("chime.state", level="WARNING") as captured:
+            State(self.path)
         self.assertEqual(len(captured.records), 1)
         message = captured.records[0].getMessage()
         self.assertIn("初期化します", message)
@@ -122,23 +120,15 @@ class StateTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "w", encoding="utf-8") as handle:
             handle.write('{"last_fired": {}\n"recent_quotes": []}')
-        logging.disable(logging.NOTSET)
-        try:
-            with self.assertLogs("chime.state", level="WARNING") as captured:
-                State(self.path)
-        finally:
-            logging.disable(logging.CRITICAL)
+        with logs_enabled(), self.assertLogs("chime.state", level="WARNING") as captured:
+            State(self.path)
         self.assertIn("2 行 1 文字目", captured.records[0].getMessage())
 
     def test_missing_file_is_not_a_warning(self):
         # 初回起動では状態ファイルが無いのが普通。警告は出さない。
-        logging.disable(logging.NOTSET)
-        try:
-            with self.assertLogs("chime.state", level="WARNING") as captured:
-                logging.getLogger("chime.state").warning("dummy")
-                State(self.path)
-        finally:
-            logging.disable(logging.CRITICAL)
+        with logs_enabled(), self.assertLogs("chime.state", level="WARNING") as captured:
+            logging.getLogger("chime.state").warning("dummy")
+            State(self.path)
         self.assertEqual(len(captured.records), 1)
 
     def test_unexpected_shape_is_ignored(self):
@@ -160,12 +150,8 @@ class StateTest(unittest.TestCase):
         with open(blocker, "w", encoding="utf-8") as handle:
             handle.write("ファイルなのでディレクトリを作れない")
         state = State(os.path.join(blocker, "state.json"))
-        logging.disable(logging.NOTSET)
-        try:
-            with self.assertLogs("chime.state", level="ERROR") as captured:
-                state.mark_fired("closing", "2026-08-26")
-        finally:
-            logging.disable(logging.CRITICAL)
+        with logs_enabled(), self.assertLogs("chime.state", level="ERROR") as captured:
+            state.mark_fired("closing", "2026-08-26")
         self.assertIn("状態ファイルを保存できません", captured.records[0].getMessage())
         self.assertTrue(state.is_fired("closing", "2026-08-26"))
 

@@ -24,6 +24,7 @@ from typing import Any, Callable, List, Mapping, Optional, Sequence
 from . import timesignal
 from .audio import Segment
 from .config import DEFAULT_CONFIG
+from .phrases import closing_extra_text
 from .quotes import QuoteError, QuotePicker
 from .scheduler import Event
 from .tts import TTSError, TTSService
@@ -153,12 +154,9 @@ class SequenceBuilder:
         ERROR で飛ばし、残りは鳴らす。
         """
         plan = PlaybackPlan(event=event)
-        announce = self.config.path("closing.announce_file")
-        music = self.config.path("closing.music_file")
-
-        self._append_audio_file(plan, announce, "閉館アナウンス")
+        self._append_closing_announce(plan)
         _guard(plan, "追加アナウンス", self._append_closing_text, plan)
-        self._append_closing_music(plan, music)
+        self._append_closing_music(plan)
         return plan
 
     def build_minimal(self, event: Event) -> PlaybackPlan:
@@ -172,9 +170,8 @@ class SequenceBuilder:
         if event.kind == "hourly":
             self._append_time_signal(plan, self.config.section("time_signal"))
         elif event.kind == "closing":
-            self._append_audio_file(
-                plan, self.config.path("closing.announce_file"), "閉館アナウンス")
-            self._append_closing_music(plan, self.config.path("closing.music_file"))
+            self._append_closing_announce(plan)
+            self._append_closing_music(plan)
         else:
             message = "未知のイベント種別です: {0}".format(event.kind)
             logger.error(message)
@@ -199,7 +196,7 @@ class SequenceBuilder:
 
     # -- 部品 -----------------------------------------------------------
     def _append_audio_file(self, plan: PlaybackPlan, path: str, label: str,
-                           fade_in_ms: int = 0) -> bool:
+                           fade_in_ms: int = 0) -> None:
         """音源ファイルがあれば積む。無ければ ERROR で飛ばす（積まない）。
 
         必須セグメントのファイルが欠けていると、再生時の ``PlaybackError``
@@ -207,14 +204,13 @@ class SequenceBuilder:
         パスが空文字列なら「設定しない」の意味なので、黙って積まない。
         """
         if not path:
-            return False
+            return
         if not os.path.exists(path):
             message = "音源ファイルが見つかりません: {0}".format(path)
             logger.error(message)
             plan.warnings.append(message)
-            return False
+            return
         plan.segments.append(Segment(path, label=label, fade_in_ms=fade_in_ms))
-        return True
 
     def _append_time_signal(self, plan: PlaybackPlan, settings: Mapping[str, Any]) -> None:
         """時報音（ポ・ポ・ポ・ポーン）を積む。生成に失敗しても既存のファイルを使う。"""
@@ -251,19 +247,26 @@ class SequenceBuilder:
         if hour in _resolve_weather_hours(extra_settings):
             self._append_weather(plan)
 
+    def _append_closing_announce(self, plan: PlaybackPlan) -> None:
+        self._append_audio_file(
+            plan, self.config.path("closing.announce_file"), "閉館アナウンス")
+
     def _append_closing_text(self, plan: PlaybackPlan) -> None:
-        extra_text = str(self.config.get("closing.extra_text", "") or "")
+        # 作り置きの列挙（chime.phrases）と同じ読み出しを使う。読み方が食い違うと、
+        # 作り置きに無い文言を読もうとして無音になる。
+        extra_text = closing_extra_text(self.config)
         if extra_text:
             self._append_speech(plan, extra_text, "追加アナウンス")
 
     def _closing_fade_in_ms(self) -> int:
         return int(self.config.get("audio.fade_in_ms", 2000))
 
-    def _append_closing_music(self, plan: PlaybackPlan, music: str) -> None:
+    def _append_closing_music(self, plan: PlaybackPlan) -> None:
         # フェードインの設定が壊れていても、音楽は鳴らす（フェードだけ省く）。
         fade_in_ms = _guard(plan, "フェードイン時間", self._closing_fade_in_ms) or 0
         self._append_audio_file(
-            plan, music, "蛍の光（{0}ms フェードイン）".format(fade_in_ms), fade_in_ms)
+            plan, self.config.path("closing.music_file"),
+            "蛍の光（{0}ms フェードイン）".format(fade_in_ms), fade_in_ms)
 
     def _append_speech(self, plan: PlaybackPlan, text: str, label: str) -> bool:
         if not text:
@@ -310,7 +313,7 @@ class SequenceBuilder:
             self._append_speech(plan, sentence, label)
 
     def _append_quote(self, plan: PlaybackPlan, hour: int) -> None:
-        recent = self.state.recent_quotes() if self.state else []
+        recent = self.state.recent_quotes()
         try:
             quote = self.quotes.pick(hour, recent)
         except QuoteError as exc:

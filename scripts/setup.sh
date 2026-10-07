@@ -19,7 +19,9 @@ for arg in "$@"; do
   case "$arg" in
     --no-apt) DO_APT=0 ;;
     --no-service) DO_SERVICE=0 ;;
-    -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+    # 先頭のコメントブロック（2 行目から、最初のコメントでない行の手前まで）を
+    # 表示する。行番号の決め打ちだと、ずれて set -euo pipefail まで出てしまう。
+    -h|--help) sed -n '2,/^[^#]/{/^[^#]/!p}' "$0"; exit 0 ;;
     *) echo "不明なオプション: $arg" >&2; exit 2 ;;
   esac
 done

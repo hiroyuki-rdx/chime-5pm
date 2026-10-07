@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
-import contextlib
 import http.client
-import json
-import logging
 import os
 import tempfile
 import unittest
 from datetime import date
 from unittest import mock
 
-from tests.support import REPO_ROOT, load_fixture  # noqa: F401
+from tests.support import (REPO_ROOT, SHIPPED_QUOTES, load_fixture, logs_enabled, make_event,
+                           urlopen_response)
 
+from chime import phrases
 from chime.config import DEFAULT_CONFIG, Config
 from chime.quotes import QuotePicker
 from chime.sequence import SequenceBuilder
@@ -91,9 +90,14 @@ class BuilderTestCase(unittest.TestCase):
                 handle.write(b"RIFF")
 
         self.config = Config(DEFAULT_CONFIG, base_dir=root)
+        # 時報音は呼び出しのたびに本物の生成器で作る（4 秒）。既定の 44.1 kHz /
+        # ステレオだと、テストごとに数十 ms かかって全体の大半を占める。組み立ての
+        # テストは WAV の中身を見ないので、軽い形式にする。WAV の形式そのもの
+        # （標本化周波数・チャンネル数）は tests/test_timesignal.py が固定している。
+        self.config.data["audio"]["mixer"].update(frequency=8000, channels=1)
         self.tts = StubTTS(root)
         self.weather = StubWeather()
-        self.quotes = QuotePicker(os.path.join(REPO_ROOT, "assets", "quotes.json"))
+        self.quotes = QuotePicker(SHIPPED_QUOTES)
         self.state = State(os.path.join(root, "cache", "state.json"))
         self.time_signal = os.path.join(root, "assets", "generated", "time_signal.wav")
 
@@ -465,17 +469,6 @@ class BuildClosingTest(BuilderTestCase):
         self.assertEqual(weather.calls, 0, "閉館放送で WeatherService を呼んではいけない")
 
 
-@contextlib.contextmanager
-def logs_enabled(logger_name, level):
-    """tests/__init__.py が止めているログを、このブロックの間だけ拾えるようにする。"""
-    logging.disable(logging.NOTSET)
-    try:
-        with unittest.TestCase().assertLogs(logger_name, level=level) as captured:
-            yield captured
-    finally:
-        logging.disable(logging.CRITICAL)
-
-
 class ExplodingTTS(StubTTS):
     """TTSError ではない想定外の例外を出す音声合成。"""
 
@@ -504,17 +497,6 @@ class ExplodingQuotes:
         raise self.error
 
 
-def open_meteo_response(body=None, read_error=None):
-    """``urlopen`` が返す応答のモック（``with`` で使え、``read()`` が本文か例外を返す）。"""
-    response = mock.MagicMock()
-    response.__enter__.return_value = response
-    if read_error is not None:
-        response.read.side_effect = read_error
-    else:
-        response.read.return_value = json.dumps(body).encode("utf-8")
-    return response
-
-
 class DegradeHourlyTest(BuilderTestCase):
     """時報の一部品が壊れても、残りの部品は必ず鳴ること。"""
 
@@ -527,7 +509,7 @@ class DegradeHourlyTest(BuilderTestCase):
         # （http.client.IncompleteRead は OSError ではない）。
         # 本物の WeatherService と urlopen のモックで確かめる。
         weather = WeatherService(self.config.section("weather"))
-        response = open_meteo_response(read_error=http.client.IncompleteRead(b"{\"cur", 300))
+        response = urlopen_response(read_error=http.client.IncompleteRead(b"{\"cur", 300))
         with mock.patch("chime.weather.urllib.request.urlopen", return_value=response):
             plan = self.make_builder(weather=weather).build_hourly(12)
 
@@ -553,7 +535,7 @@ class DegradeHourlyTest(BuilderTestCase):
         weather = WeatherService(self.config.section("weather"))
         payload = load_fixture("open_meteo.json")
         with mock.patch("chime.weather.urllib.request.urlopen",
-                        return_value=open_meteo_response(payload)):
+                        return_value=urlopen_response(payload)):
             plan = self.make_builder(weather=weather).build_hourly(12)
         self.assertEqual(len(plan.segments), 3)
         self.assertIsNotNone(plan.quote)
@@ -631,7 +613,7 @@ class DegradeHourlyTest(BuilderTestCase):
 
     def test_guarded_failures_are_logged_with_a_traceback(self):
         builder = self.make_builder(weather=ExplodingWeather(RuntimeError("想定外")))
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             builder.build_hourly(12)
         self.assertTrue(any("天気予報" in line for line in captured.output))
         self.assertTrue(any("RuntimeError" in line for line in captured.output))
@@ -649,7 +631,7 @@ class DegradeHourlyTest(BuilderTestCase):
     def test_a_typo_in_announce_template_falls_back_to_the_default_wording(self):
         # {hours} は存在しない置換名（正しくは {hour} / {hour_reading}）。
         self.config.data["time_signal"]["announce_template"] = "{period}{hours}をお知らせしました。"
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             plan = self.make_builder().build_hourly(11)
         self.assert_time_signal_first(plan)
         self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
@@ -707,7 +689,7 @@ class DegradeHourlyTest(BuilderTestCase):
             handle.write(b"RIFF")
         with mock.patch("chime.timesignal.ensure_time_signal",
                         side_effect=OSError("ディスクがいっぱい")):
-            with logs_enabled("chime.sequence", "ERROR"):
+            with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR"):
                 plan = self.make_builder().build_hourly(11)
         self.assert_time_signal_first(plan)
         self.assertEqual(plan.segments[0].path, self.time_signal)
@@ -720,7 +702,7 @@ class DegradeHourlyTest(BuilderTestCase):
         self.assertFalse(os.path.exists(self.time_signal))
         with mock.patch("chime.timesignal.ensure_time_signal",
                         side_effect=OSError("書き込めません")):
-            with logs_enabled("chime.sequence", "ERROR") as captured:
+            with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
                 plan = self.make_builder().build_hourly(11)
         self.assertFalse(any("時報音" in label for label in self.labels(plan)))
         self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
@@ -750,7 +732,7 @@ class DegradeHourlyTest(BuilderTestCase):
     def test_time_signal_generation_failure_is_logged_as_an_error(self):
         with mock.patch("chime.timesignal.ensure_time_signal",
                         side_effect=OSError("書き込めません")):
-            with logs_enabled("chime.sequence", "ERROR") as captured:
+            with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
                 self.make_builder().build_hourly(11)
         self.assertTrue(any("書き込めません" in line for line in captured.output))
 
@@ -764,7 +746,7 @@ class DegradeClosingTest(BuilderTestCase):
 
     def test_music_still_plays_when_the_announcement_is_missing(self):
         os.remove(self.announce_path())
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             plan = self.make_builder().build_closing()
         self.assertEqual(len(plan.segments), 1)
         self.assertIn("蛍の光", plan.segments[0].label)
@@ -775,7 +757,7 @@ class DegradeClosingTest(BuilderTestCase):
 
     def test_announcement_still_plays_when_the_music_is_missing(self):
         os.remove(self.music_path())
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             plan = self.make_builder().build_closing()
         self.assertEqual(len(plan.segments), 1)
         self.assertIn("閉館アナウンス", plan.segments[0].label)
@@ -834,12 +816,9 @@ class BuildMinimalTest(BuilderTestCase):
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        from chime.scheduler import Event
-
         moment = datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
         key = "hourly:12" if kind == "hourly" else "closing"
-        return Event(key=key, kind=kind, hour=12,
-                     at=moment, play_at=moment, prepare_at=moment)
+        return make_event(moment, key=key, kind=kind, hour=12)
 
     def test_hourly_is_the_time_signal_only(self):
         weather = StubWeather()
@@ -939,6 +918,60 @@ class BuildDispatchTest(BuilderTestCase):
         broken = event.__class__(**dict(event.__dict__, kind="mystery"))
         with self.assertRaises(ValueError):
             self.make_builder().build(broken)
+
+
+class SpokenPhrasesArePrerecordedTest(BuilderTestCase):
+    """``SequenceBuilder`` が読み上げうる文言は、すべて作り置きの列挙に入っていること。
+
+    Pi には実行時の音声合成が無く、声は文言の完全一致で作り置きから引く。
+    列挙（``chime.phrases.collect_phrases``）から漏れた文言は、その文だけ無音に
+    なる。組み立て側（``sequence.py``）が列挙と違う読み方をしたり、新しい
+    読み上げを足したりしても、ここで気づけるようにする。
+    """
+
+    #: フィクスチャ（open_meteo.json）の日付。今日の日付に依らず同じ文言にする。
+    FIXTURE_TODAY = date(2026, 8, 26)
+
+    def test_every_spoken_text_is_in_the_prerecorded_set(self):
+        # どの時刻でも天気が流れるようにし、閉館の追加アナウンスも入れて、
+        # 読み上げの経路を全部通す。
+        self.config.data["extra_segment"]["weather_hours"] = list(range(10, 17))
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        # 列挙はひとことの置き場所（quotes.file）を config の base_dir から引く。
+        # このテストの base_dir は一時フォルダなので、リポジトリを指す config に
+        # 作り直す（中身の設定は同じ）。
+        enumerate_config = Config(self.config.data, base_dir=REPO_ROOT)
+        prerecorded = set(phrases.collect_phrases(enumerate_config, include_quotes=True))
+
+        weather = WeatherService(self.config.section("weather"))
+        payload = load_fixture("open_meteo.json")
+        spoken = set()
+        labels = []
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        return_value=urlopen_response(payload)):
+            builder = self.make_builder(weather=weather,
+                                        today_provider=lambda: self.FIXTURE_TODAY)
+            plans = []
+            for hour in range(10, 17):
+                # ひとことは乱数で選ぶので、何度か組み立てて取りこぼしを減らす。
+                for _ in range(5):
+                    plans.append(builder.build_hourly(hour))
+            plans.append(builder.build_closing())
+
+        for plan in plans:
+            self.assertEqual(plan.warnings, [])
+            spoken.update(plan.spoken)
+            labels.extend(self.labels(plan))
+
+        # 空振りの確認: 天気・ひとこと・閉館の追加アナウンスまで実際に読んでいる。
+        self.assertTrue(any("天気予報" in label for label in labels))
+        self.assertTrue(any("ひとこと" in label for label in labels))
+        self.assertIn("追加アナウンス「本日もご利用ありがとうございました。」", labels)
+        self.assertIn("午後よじをお知らせしたのだ。", spoken)
+
+        self.assertEqual(sorted(spoken - prerecorded), [])
+        # 合成に渡した文言も同じ（読み上げとして積まれなかった文言が無い）。
+        self.assertEqual(sorted(set(self.tts.texts) - prerecorded), [])
 
 
 if __name__ == "__main__":
