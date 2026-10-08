@@ -1,0 +1,4 @@
+{
+  "_comment": "天気（Open-Meteo）を無効にする設定。CI などで --test-hourly 12 を通信なしで試すときに --config で渡す。",
+  "weather": {"enabled": false}
+}

@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import wave
 from datetime import date, datetime, timedelta
+from unittest import mock
 
 from chime.app import ChimeApp
 from chime.audio import Player
@@ -28,16 +29,34 @@ class RecordingPlayer(Player):
 
 
 class StubBuilder:
-    def __init__(self, segments, explode=False):
+    """``SequenceBuilder`` のスタブ。
+
+    ``explode`` なら ``build`` が例外を出す。そのとき ``run_event`` は
+    ``build_minimal`` の結果（``minimal_segments``）で鳴らす。``quote`` は
+    プランに載せる「選んだひとこと」。
+    """
+
+    def __init__(self, segments, explode=False, quote=None, minimal_segments=None,
+                 explode_minimal=False):
         self.segments = segments
         self.explode = explode
+        self.quote = quote
+        self.minimal_segments = minimal_segments if minimal_segments is not None else []
+        self.explode_minimal = explode_minimal
         self.built = []
+        self.built_minimal = []
 
     def build(self, event):
         self.built.append(event)
         if self.explode:
             raise RuntimeError("組み立て失敗")
-        return PlaybackPlan(event=event, segments=list(self.segments))
+        return PlaybackPlan(event=event, segments=list(self.segments), quote=self.quote)
+
+    def build_minimal(self, event):
+        self.built_minimal.append(event)
+        if self.explode_minimal:
+            raise RuntimeError("最小プランも組み立て失敗")
+        return PlaybackPlan(event=event, segments=list(self.minimal_segments))
 
 
 def make_wav(path: str) -> str:
@@ -99,6 +118,115 @@ class RunEventTest(AppTestCase):
         self.assertEqual(self.player.played, [])
 
 
+class RunEventDegradeTest(AppTestCase):
+    """組み立ての失敗と、再生後の state の書き込み。"""
+
+    def test_build_failure_plays_the_minimal_plan_and_marks_fired(self):
+        minimal = Segment(self.wav, label="時報音だけ")
+        self.app.builder = StubBuilder([], explode=True, minimal_segments=[minimal])
+        event = self.past_event()
+        self.app.run_event(event)
+        self.assertEqual(self.app.builder.built_minimal, [event])
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+    def test_build_failure_is_logged_with_a_traceback(self):
+        import logging
+
+        self.app.builder = StubBuilder([], explode=True)
+        logging.disable(logging.NOTSET)
+        try:
+            with self.assertLogs("chime.app", level="ERROR") as captured:
+                self.app.run_event(self.past_event())
+        finally:
+            logging.disable(logging.CRITICAL)
+        self.assertTrue(any("組み立て失敗" in line for line in captured.output))
+
+    def test_a_successful_build_does_not_use_the_minimal_plan(self):
+        self.app.run_event(self.past_event())
+        self.assertEqual(self.app.builder.built_minimal, [])
+
+    def test_the_quote_is_remembered_after_a_successful_playback(self):
+        self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
+                                       quote="テストのひとこと")
+        self.app.run_event(self.past_event())
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertEqual(self.app.state.recent_quotes(), ["テストのひとこと"])
+
+    def test_the_quote_is_remembered_before_the_event_is_marked_fired(self):
+        self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
+                                       quote="テストのひとこと")
+        calls = mock.Mock()
+        with mock.patch.object(self.app.state, "remember_quote", calls.remember), \
+                mock.patch.object(self.app.state, "mark_fired", calls.mark_fired):
+            event = self.past_event()
+            self.app.run_event(event)
+        self.assertEqual(calls.mock_calls, [
+            mock.call.remember("テストのひとこと"),
+            mock.call.mark_fired(event.key, event.day),
+        ])
+
+    def test_the_quote_is_not_remembered_when_playback_fails(self):
+        # 鳴らせなかったひとことは「使った」ことにしない。ただし再生済みの
+        # 記録（mark_fired）は従来どおり付ける（無限リトライにしない）。
+        self.app.builder = StubBuilder([Segment("/nonexistent.wav", label="欠落")],
+                                       quote="鳴らなかったひとこと")
+        event = self.past_event()
+        with mock.patch.object(self.app.state, "remember_quote") as remember:
+            self.app.run_event(event)
+        remember.assert_not_called()
+        self.assertEqual(self.app.state.recent_quotes(), [])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+    def test_the_quote_is_not_remembered_when_nothing_was_played(self):
+        # セグメントはあるが optional で全部欠けている（play が False を返す）。
+        self.app.builder = StubBuilder(
+            [Segment("/nonexistent.wav", label="任意", optional=True)],
+            quote="鳴らなかったひとこと")
+        self.app.run_event(self.past_event())
+        self.assertEqual(self.app.state.recent_quotes(), [])
+
+    def test_the_quote_is_not_remembered_when_the_player_raises(self):
+        self.app._player = ExplodingPlayer({})
+        self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
+                                       quote="鳴らなかったひとこと")
+        event = self.past_event()
+        self.app.run_event(event)
+        self.assertEqual(self.app.state.recent_quotes(), [])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+    def test_a_plan_without_a_quote_remembers_nothing(self):
+        with mock.patch.object(self.app.state, "remember_quote") as remember:
+            self.app.run_event(self.past_event())
+        remember.assert_not_called()
+
+    def test_the_quote_is_not_remembered_in_dry_run(self):
+        self.app.dry_run = True
+        self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
+                                       quote="テストのひとこと")
+        with mock.patch.object(self.app.state, "remember_quote") as remember:
+            self.app.run_event(self.past_event())
+        remember.assert_not_called()
+        self.assertEqual(self.player.played, [])
+
+    def test_the_minimal_plan_has_no_quote_to_remember(self):
+        self.app.builder = StubBuilder([], explode=True,
+                                       minimal_segments=[Segment(self.wav, label="時報音だけ")])
+        self.app.run_event(self.past_event())
+        self.assertEqual(self.app.state.recent_quotes(), [])
+
+    def test_a_stop_request_before_playback_remembers_nothing(self):
+        moment = self.app.now() + timedelta(hours=1)
+        event = Event(key="hourly:10", kind="hourly", hour=10, minute=0,
+                      at=moment, play_at=moment, prepare_at=moment)
+        self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
+                                       quote="テストのひとこと")
+        self.app.stop_event.set()
+        self.app.run_event(event)
+        self.assertEqual(self.app.state.recent_quotes(), [])
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+
+
 class RunForeverTest(AppTestCase):
     def _drive(self, event):
         """イベントを 1 件だけ返し、再生済みになったら停止するスケジューラ。"""
@@ -117,11 +245,22 @@ class RunForeverTest(AppTestCase):
         self.assertEqual(self.player.played, [self.wav])
         self.assertTrue(self.app.state.is_fired(event.key, event.day))
 
-    def test_build_failure_does_not_stop_the_loop(self):
-        """組み立てに失敗しても、その回を飛ばして常駐を続ける。"""
-        self.app.builder = StubBuilder([], explode=True)
+    def test_build_failure_plays_the_minimal_plan_and_marks_fired(self):
+        """組み立て全体が失敗しても、最小のプランで鳴らして常駐を続ける。"""
+        minimal = Segment(self.wav, label="時報音だけ")
+        self.app.builder = StubBuilder([], explode=True, minimal_segments=[minimal])
         event = self.past_event()
         self.assertEqual(self._drive(event), 0)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day),
+                        "失敗した回は再生済みとして記録し、無限リトライにしない")
+
+    def test_build_and_minimal_failure_does_not_stop_the_loop(self):
+        """最小プランの組み立てまで失敗しても、その回を飛ばして常駐を続ける。"""
+        self.app.builder = StubBuilder([], explode=True, explode_minimal=True)
+        event = self.past_event()
+        self.assertEqual(self._drive(event), 0)
+        self.assertEqual(self.player.played, [])
         self.assertTrue(self.app.state.is_fired(event.key, event.day),
                         "失敗した回は再生済みとして記録し、無限リトライにしない")
 
@@ -236,12 +375,62 @@ class PlayReturnValueTest(AppTestCase):
         self.assertEqual(self.player.played, [])
 
     def test_run_event_does_not_use_return_value(self):
-        """``run_event()`` は ``play()`` の戻り値を使わず、
-        再生に失敗しても従来どおり再生済みとして記録する。"""
+        """``run_event()`` は再生済みの記録（``mark_fired``）に ``play()`` の
+        戻り値を使わず、再生に失敗しても従来どおり再生済みとして記録する
+        （戻り値を見るのは、ひとことの記録だけ）。"""
         self.app.builder = StubBuilder([Segment("/nonexistent.wav", label="欠落")])
         event = self.past_event()
         self.app.run_event(event)
         self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+
+class StateFileTest(unittest.TestCase):
+    """``--dry-run`` の ChimeApp は、実機の state.json を作らず・書き換えない。"""
+
+    def make_app(self, tmp, dry_run):
+        config = Config(DEFAULT_CONFIG, base_dir=tmp)
+        config.data["state"]["file"] = os.path.join(tmp, "state", "state.json")
+        return ChimeApp(config, backend="mock", dry_run=dry_run), config.data["state"]["file"]
+
+    def test_dry_run_does_not_create_the_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, state_file = self.make_app(tmp, dry_run=True)
+            app.state.mark_fired("hourly:10", "2026-08-26")
+            app.state.remember_quote("テストのひとこと")
+            self.assertFalse(os.path.exists(state_file))
+            self.assertFalse(os.path.exists(os.path.dirname(state_file)))
+
+    def test_dry_run_does_not_touch_an_existing_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(DEFAULT_CONFIG, base_dir=tmp)
+            state_file = os.path.join(tmp, "state.json")
+            config.data["state"]["file"] = state_file
+            original = '{"last_fired": {"hourly:10": "2026-08-25"}, "recent_quotes": ["きのうの一言"]}\n'
+            with open(state_file, "w", encoding="utf-8") as handle:
+                handle.write(original)
+
+            app = ChimeApp(config, backend="mock", dry_run=True)
+            # 既存の記録は読める（直近のひとことを避けるため）。
+            self.assertEqual(app.state.recent_quotes(), ["きのうの一言"])
+            app.state.mark_fired("hourly:11", "2026-08-26")
+            with open(state_file, "r", encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), original)
+
+    def test_dry_run_run_event_does_not_create_the_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, state_file = self.make_app(tmp, dry_run=True)
+            wav = make_wav(os.path.join(tmp, "beep.wav"))
+            app.builder = StubBuilder([Segment(wav, label="テスト音")], quote="テストのひとこと")
+            moment = app.now() - timedelta(seconds=5)
+            app.run_event(Event(key="hourly:10", kind="hourly", hour=10, minute=0,
+                                at=moment, play_at=moment, prepare_at=moment))
+            self.assertFalse(os.path.exists(state_file))
+
+    def test_a_normal_app_does_write_the_state_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app, state_file = self.make_app(tmp, dry_run=False)
+            app.state.mark_fired("hourly:10", "2026-08-26")
+            self.assertTrue(os.path.exists(state_file))
 
 
 if __name__ == "__main__":

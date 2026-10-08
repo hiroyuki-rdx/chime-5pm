@@ -6,18 +6,26 @@
 ひとことだけ。``mode="choice"`` なら抽選）もここで行う。
 
 天気取得や音声合成はここで完結させ、失敗しても本体（時報音・蛍の光）は
-必ず鳴るように、おまけ部分は欠落を許容する設計とする。
+必ず鳴るように、おまけ部分は欠落を許容する設計とする。部品（時刻アナウンス・
+天気・ひとこと・閉館の追加アナウンス）は :func:`_guard` で 1 つずつ守り、
+1 つの失敗がほかの部品を巻き込まないようにする。
+
+組み立ては state（再生済み・直近のひとこと）を書かない。選んだひとことは
+``PlaybackPlan.quote`` に残し、再生できたあとに呼び出し側が記録する。
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import random
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, List, Mapping, Optional, Sequence
 
+from . import timesignal
 from .audio import Segment
+from .config import DEFAULT_CONFIG
 from .quotes import QuoteError, QuotePicker
 from .scheduler import Event
 from .tts import TTSError, TTSService
@@ -48,6 +56,23 @@ class PlaybackPlan:
         for warning in self.warnings:
             lines.append("  警告: {0}".format(warning))
         return "\n".join(lines)
+
+
+def _guard(plan: PlaybackPlan, label: str, func: Callable[..., Any], *args: Any) -> Any:
+    """``func(*args)`` を呼び、想定外の例外はその部品だけ飛ばして続ける。
+
+    例外はログ（トレースバック付き）と ``plan.warnings`` に残し、``None`` を
+    返す。``KeyboardInterrupt`` / ``SystemExit`` は ``Exception`` の子では
+    ないので捕まえない（停止要求は握りつぶさない）。
+    """
+    try:
+        return func(*args)
+    except Exception as exc:
+        message = "{0}の組み立てに失敗しました（この部分だけ飛ばします）: {1}: {2}".format(
+            label, type(exc).__name__, exc)
+        logger.exception(message)
+        plan.warnings.append(message)
+        return None
 
 
 def _resolve_weather_hours(settings: Mapping[str, Any]) -> set:
@@ -124,56 +149,70 @@ class SequenceBuilder:
           天気予報／ひとことのどちらか一方だけを流す。
         - それ以外（設定ミス） 警告ログを出したうえで ``"both"`` として
           扱う。放送そのものが設定ミスで壊れないようにするため。
-        """
-        from . import timesignal  # 循環参照を避けるための遅延インポート
 
+        どの部品が壊れても、ほかの部品は残す。時報音の生成に失敗したときは
+        既存のファイルを使い、ファイルも無ければ時報音だけを省く（必須
+        セグメントを積むと、再生時の ``PlaybackError`` で全体が消えるため）。
+        時刻アナウンスのテンプレートの書き間違いは既定の文言に戻す。
+        天気・ひとことの想定外の例外は :func:`_guard` が受ける。
+        """
         plan = PlaybackPlan(event=event)
         settings = self.config.section("time_signal")
 
-        timesignal.ensure_time_signal(
-            self.time_signal_path, settings, self.config.section("audio.mixer"))
-        plan.segments.append(Segment(self.time_signal_path, label="時報音（ポ・ポ・ポ・ポーン）"))
-
-        text = timesignal.announce_text(hour, settings)
-        self._append_speech(plan, text, "時刻アナウンス")
+        self._append_time_signal(plan, settings)
+        _guard(plan, "時刻アナウンス", self._append_announce, plan, hour, settings)
 
         extra_settings = self.config.section("extra_segment")
         if extra_settings.get("enabled", True):
             mode = str(extra_settings.get("mode", "both") or "both")
             if mode == "choice":
-                extra = choose_extra(hour, extra_settings, self.rng)
+                extra = _guard(plan, "おまけの選択", choose_extra, hour, extra_settings, self.rng)
                 if extra == EXTRA_WEATHER:
-                    self._append_weather(plan, hour)
+                    _guard(plan, "天気予報", self._append_weather, plan, hour)
                 elif extra == EXTRA_QUOTE:
-                    self._append_quote(plan, hour)
+                    _guard(plan, "ひとこと", self._append_quote, plan, hour)
             else:
                 if mode != "both":
                     logger.warning(
                         "未知の extra_segment.mode です: %s。\"both\" として扱います。",
                         mode)
-                if hour in _resolve_weather_hours(extra_settings):
-                    self._append_weather(plan, hour, fallback=False)
-                self._append_quote(plan, hour)
+                _guard(plan, "天気予報", self._append_weather_if_due, plan, hour, extra_settings)
+                _guard(plan, "ひとこと", self._append_quote, plan, hour)
         return plan
 
     def build_closing(self, event: Optional[Event] = None) -> PlaybackPlan:
-        """閉館放送（アナウンス → 蛍の光）を組み立てる。"""
+        """閉館放送（アナウンス → 蛍の光）を組み立てる。
+
+        アナウンスと音楽は、ファイルの有無を確かめてから積む。無い方だけを
+        ERROR で飛ばし、残りは鳴らす。
+        """
         plan = PlaybackPlan(event=event)
         announce = self.config.path("closing.announce_file")
         music = self.config.path("closing.music_file")
-        fade_in_ms = int(self.config.get("audio.fade_in_ms", 2000))
 
-        if announce:
-            plan.segments.append(Segment(announce, label="閉館アナウンス"))
+        self._append_audio_file(plan, announce, "閉館アナウンス")
+        _guard(plan, "追加アナウンス", self._append_closing_text, plan)
+        self._append_closing_music(plan, music)
+        return plan
 
-        extra_text = str(self.config.get("closing.extra_text", "") or "")
-        if extra_text:
-            self._append_speech(plan, extra_text, "追加アナウンス")
+    def build_minimal(self, event: Event) -> PlaybackPlan:
+        """組み立て全体が失敗したときに鳴らす、最小のプラン。
 
-        if music:
-            plan.segments.append(
-                Segment(music, label="蛍の光（{0}ms フェードイン）".format(fade_in_ms),
-                        fade_in_ms=fade_in_ms))
+        ``hourly`` は時報音だけ、``closing`` は閉館アナウンスと蛍の光だけ。
+        読み上げ・天気・ひとこと・テンプレートは使わない（壊れる原因を
+        持ち込まないため）。音源が無ければ、その部品は積まない。
+        """
+        plan = PlaybackPlan(event=event)
+        if event.kind == "hourly":
+            self._append_time_signal(plan, self.config.section("time_signal"))
+        elif event.kind == "closing":
+            self._append_audio_file(
+                plan, self.config.path("closing.announce_file"), "閉館アナウンス")
+            self._append_closing_music(plan, self.config.path("closing.music_file"))
+        else:
+            message = "未知のイベント種別です: {0}".format(event.kind)
+            logger.error(message)
+            plan.warnings.append(message)
         return plan
 
     def build_text(self, text: str) -> PlaybackPlan:
@@ -193,6 +232,73 @@ class SequenceBuilder:
         return plan
 
     # -- 部品 -----------------------------------------------------------
+    def _append_audio_file(self, plan: PlaybackPlan, path: str, label: str,
+                           fade_in_ms: int = 0) -> bool:
+        """音源ファイルがあれば積む。無ければ ERROR で飛ばす（積まない）。
+
+        必須セグメントのファイルが欠けていると、再生時の ``PlaybackError``
+        でプラン全体が鳴らなくなる。積む前に確かめ、欠けた部品だけを省く。
+        パスが空文字列なら「設定しない」の意味なので、黙って積まない。
+        """
+        if not path:
+            return False
+        if not os.path.exists(path):
+            message = "音源ファイルが見つかりません: {0}".format(path)
+            logger.error(message)
+            plan.warnings.append(message)
+            return False
+        plan.segments.append(Segment(path, label=label, fade_in_ms=fade_in_ms))
+        return True
+
+    def _append_time_signal(self, plan: PlaybackPlan, settings: Mapping[str, Any]) -> None:
+        """時報音（ポ・ポ・ポ・ポーン）を積む。生成に失敗しても既存のファイルを使う。"""
+        try:
+            timesignal.ensure_time_signal(
+                self.time_signal_path, settings, self.config.section("audio.mixer"))
+        except Exception as exc:
+            message = "時報音を生成できませんでした（既存のファイルがあればそれを使います）: {0}: {1}".format(
+                type(exc).__name__, exc)
+            logger.exception(message)
+            plan.warnings.append(message)
+        self._append_audio_file(plan, self.time_signal_path, "時報音（ポ・ポ・ポ・ポーン）")
+
+    def _append_announce(self, plan: PlaybackPlan, hour: int,
+                         settings: Mapping[str, Any]) -> None:
+        """「午前10時をお知らせしたのだ。」を積む。テンプレートの書き間違いは既定の文言に戻す。
+
+        ``announce_template`` / ``noon_template`` の未知の置換名（例 ``{hours}``）
+        などは ``announce_text`` で例外になる。既定の文言は作り置き済みなので、
+        ``DEFAULT_CONFIG`` の設定で作り直せば鳴らせる。
+        """
+        try:
+            text = timesignal.announce_text(hour, settings)
+        except (KeyError, IndexError, ValueError) as exc:
+            message = ("時刻アナウンスのテンプレート（announce_template / noon_template）が"
+                       "不正です（既定の文言に戻します）: {0}: {1}".format(type(exc).__name__, exc))
+            logger.error(message)
+            plan.warnings.append(message)
+            text = timesignal.announce_text(hour, DEFAULT_CONFIG["time_signal"])
+        self._append_speech(plan, text, "時刻アナウンス")
+
+    def _append_weather_if_due(self, plan: PlaybackPlan, hour: int,
+                               extra_settings: Mapping[str, Any]) -> None:
+        if hour in _resolve_weather_hours(extra_settings):
+            self._append_weather(plan, hour, fallback=False)
+
+    def _append_closing_text(self, plan: PlaybackPlan) -> None:
+        extra_text = str(self.config.get("closing.extra_text", "") or "")
+        if extra_text:
+            self._append_speech(plan, extra_text, "追加アナウンス")
+
+    def _closing_fade_in_ms(self) -> int:
+        return int(self.config.get("audio.fade_in_ms", 2000))
+
+    def _append_closing_music(self, plan: PlaybackPlan, music: str) -> None:
+        # フェードインの設定が壊れていても、音楽は鳴らす（フェードだけ省く）。
+        fade_in_ms = _guard(plan, "フェードイン時間", self._closing_fade_in_ms) or 0
+        self._append_audio_file(
+            plan, music, "蛍の光（{0}ms フェードイン）".format(fade_in_ms), fade_in_ms)
+
     def _append_speech(self, plan: PlaybackPlan, text: str, label: str,
                        optional: bool = True) -> bool:
         if not text:
@@ -200,7 +306,7 @@ class SequenceBuilder:
         try:
             path = self.tts.synthesize(text)
         except TTSError as exc:
-            message = "{0}を合成できませんでした: {1}".format(label, exc)
+            message = "{0}を合成できませんでした（「{1}」）: {2}".format(label, text, exc)
             logger.error(message)
             plan.warnings.append(message)
             return False
@@ -250,6 +356,6 @@ class SequenceBuilder:
             plan.warnings.append(message)
             return
         if self._append_speech(plan, quote, "ひとこと"):
+            # state には書かない。鳴らせたかどうかは再生後にしか分からないので、
+            # 記録は呼び出し側（ChimeApp.run_event）が plan.quote を見て行う。
             plan.quote = quote
-            if self.state:
-                self.state.remember_quote(quote)
