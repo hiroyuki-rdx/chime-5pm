@@ -8,25 +8,24 @@
 
 ``config.example.json`` は :data:`DEFAULT_CONFIG` をそのまま書き出したもので、
 現地設定を作る際の雛形として同梱する（``tests/test_config.py`` で同期を検証）。
+
+v6.0.0 で廃止した設定キー（:data:`REMOVED_KEYS`）が設定ファイルに残っていても
+起動は止めず、警告を出して無視する（マージ前に取り除くため、実行時の設定には届かない）。
 """
 
 from __future__ import annotations
 
 import copy
-import json
 import logging
 import os
 from typing import Any, Dict, Iterable, List, Mapping, Optional
 
-from .jsonfile import JsonFileError, read_json
+from .jsonfile import JsonFileError, read_json, write_json_atomic
 
 logger = logging.getLogger(__name__)
 
 #: リポジトリ（インストール先）のルート。
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-#: 現地設定ファイル（Git 管理外）。
-LOCAL_CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 
 #: 現地設定の雛形（Git 管理下）。
 EXAMPLE_CONFIG_PATH = os.path.join(BASE_DIR, "config.example.json")
@@ -110,14 +109,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "hour_readings": {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"},
     },
     "extra_segment": {
-        # 時報のあとにおまけを流す
+        # 時報のあとにおまけを流す。中身は、天気予報（下の weather_hours の時刻だけ）
+        # → ひとこと（毎回）の順。ひとことは天気の成否に関わらず必ず流れるため、
+        # 取得に失敗した天気は黙って飛ばす。
         "enabled": True,
-        # "both"   … 天気予報 → ひとこと の順に両方流す（既定）
-        # "choice" … 従来どおり、どちらか一方を選ぶ
-        # "choice" のときだけ weather_probability / always_weather_hours /
-        # always_quote_hours / fallback_to_quote が効く。
-        "mode": "both",
-        # mode="both" で天気予報を流す正時の一覧。ここに無い時刻は
+        # 天気予報を流す正時の一覧。ここに無い時刻は
         # 時報＋ひとことだけになる。空リストにすると一度も流さない。
         # 既定は 12 時の 1 回だけ（1 日 1 回で足りるため）。増やすなら
         # 流したい時刻を並べる（例: [10, 12, 14, 16]）。天気の読み上げ文は
@@ -126,16 +122,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 閉館放送（16:57）は時報とは別の経路なので、ここに何を書いても
         # 天気は付かない。
         "weather_hours": [12],
-        # 天気予報を選ぶ確率（0.0〜1.0）。残りは「ひとこと」。mode="choice" 専用。
-        "weather_probability": 0.0,
-        # この時刻は必ず天気予報にする。mode="choice" 専用。
-        "always_weather_hours": [],
-        # この時刻は必ず「ひとこと」にする。mode="choice" 専用。
-        "always_quote_hours": [],
-        # 天気取得に失敗したら「ひとこと」に切り替える。mode="choice" 専用。
-        # mode="both" では、ひとことは天気の成否に関わらず必ず流れるため、
-        # 取得に失敗した天気は黙って飛ばす（この値は参照されない）。
-        "fallback_to_quote": True,
     },
     "quotes": {
         "file": "assets/quotes.json",
@@ -146,43 +132,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # extra_segment.weather_hours の時刻（既定 12 時）に天気予報を流す。
         # 無効にすると、その時刻も時報のあとは「ひとこと」だけになる。
         "enabled": True,
-        # "jma"（気象庁・キー不要）または "open_meteo"（キー不要）
-        #
-        # 既定が open_meteo なのは、読み上げ文を作り置きできるようにするため。
-        # 気象庁の予報文は自由文なので事前生成できず、Pi には実行時の合成手段が
-        # 無いため、天気の文だけ無音になる。open_meteo は
-        # 天気コード（WMO_CODES・28 語）で語彙が閉じるため、全パターンを
-        # VOICEVOX で作り置きでき、放送全体をずんだもんの声で揃えられる。
-        # jma に戻す場合はこの点を承知しておくこと（docs/SETUP.md 参照）。
-        #
-        # またこの既定は「現在の」天気と気温を読む前提になっている。気象庁に
-        # 現況は無いため、jma に戻すと気温の文が消えて天気 1 文だけになり、
-        # かつ sentence_weather の「今の」が実態（今日 1 日の予報）と食い違う。
-        # jma を使うなら sentence_weather を予報の言い回しに戻し、
-        # sentence_temp_max / sentence_pop を有効にすること。
-        "provider": "open_meteo",
         "timeout_seconds": 8.0,
         "cache_minutes": 60,
-        "jma": {
-            # 地域コード。https://www.jma.go.jp/bosai/common/const/area.json 参照
-            # 既定は滋賀県。一次細分区域は「南部」（大津・草津・近江八幡など）と
-            # 「北部」（彦根・長浜・米原・高島など）の 2 つがあり、既定は南部。
-            # 北部に切り替える場合は area_name を "北部"、temp_area_name を
-            # "彦根" にする（docs/SETUP.md 7 章を参照）。
-            "area_code": "250000",
-            # timeSeries 内で優先的に使う地域名（前方一致）。空なら先頭を使う。
-            # 天気・降水確率の細分区域名（"南部" / "北部"）。
-            "area_name": "南部",
-            # 気温の timeSeries だけは観測地点名（"大津" / "彦根" など）で
-            # area_name とは体系が異なるため、別に指定する。
-            # 空文字列なら従来どおり area_name で選ぶ（後方互換）。
-            "temp_area_name": "大津",
-            "label": "滋賀",
-            # 「所により」以降は地域限定の但し書きで、館内放送には不要かつ
-            # 読み上げが長くなる原因になるため既定で切り捨てる。
-            # 空リスト（[]）にすると切り捨てを無効化できる。
-            "drop_after": ["所により"],
-        },
+        # 提供元は Open-Meteo（キー不要）だけ。読み上げ文は天気コード
+        # （WMO_CODES・28 語）で語彙が閉じるため、全パターンを VOICEVOX で
+        # 作り置きでき、放送全体をずんだもんの声で揃えられる。
         "open_meteo": {
             # 読み上げる地点。既定は大津の 1 か所だけ（v5.1.0 までは大津・京都）。
             # 増やすと上から順に読み、1 か所あたり約 6 秒放送が長くなる。
@@ -198,8 +152,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         # 作り置きできる（1 文にまとめると組み合わせが爆発して作り置きできない）。
         # 空文字列にするとその文を読まない（放送を短くしたいときに使う）。
         #
-        # 既定は「現在の」天気と気温を読む（provider="open_meteo" が current で
-        # 返す値）。時報で知りたいのは今どうなのかであり、その日の予想最高気温を
+        # 既定は「現在の」天気と気温を読む（Open-Meteo の current が返す値）。
+        # 時報で知りたいのは今どうなのかであり、その日の予想最高気温を
         # 午後に読んでも実感と合わないため。
         "sentence_weather": "今の{label}の天気は{weather}なのだ。",
         "sentence_temp": "気温は{temp}度なのだ。",
@@ -221,9 +175,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             # 「明日」も作り置きしたい場合はここに足す（+56 件）。
             "whens": ["今日"],
         },
-        # 天気の説明部分（{weather}）の文字数上限。provider="jma" のときだけ
-        # 意味を持つ（気象庁の自由文が予期せず長い場合の保険）。
-        "max_weather_chars": 40,
     },
     "tts": {
         # 上から順に試し、失敗したら次のエンジンへフォールバックする。
@@ -262,9 +213,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 _CHOICE_GUIDANCE = "天気を流す時刻は extra_segment.weather_hours で指定"
 _JMA_GUIDANCE = "天気は Open-Meteo（weather.open_meteo）に一本化"
 
-#: v6.0.0 で廃止予定の設定キー（ドット区切りのパス → 代わりの案内）。
-#: 設定ファイルに書かれていれば起動時に警告する（動作は変えない）。
-DEPRECATED_KEYS: Dict[str, str] = {
+#: v6.0.0 で廃止した設定キー（ドット区切りのパス → 代わりの案内）。
+#: 設定ファイルに書かれていても起動時に警告して無視する（:func:`strip_removed_keys`）。
+REMOVED_KEYS: Dict[str, str] = {
     "extra_segment.mode": _CHOICE_GUIDANCE,
     "extra_segment.weather_probability": _CHOICE_GUIDANCE,
     "extra_segment.always_weather_hours": _CHOICE_GUIDANCE,
@@ -312,7 +263,7 @@ class Config:
         return self._data
 
     def get(self, path: str, default: Any = None) -> Any:
-        """``"weather.jma.area_code"`` のようなドット区切りで値を取得する。"""
+        """``"schedule.closing.hour"`` のようなドット区切りで値を取得する。"""
         node: Any = self._data
         for part in path.split("."):
             if not isinstance(node, Mapping) or part not in node:
@@ -362,7 +313,7 @@ def load_config(explicit_path: Optional[str] = None, base_dir: str = BASE_DIR) -
     for candidate in candidates:
         override = _read_json(candidate)
         _warn_if_defaults_were_copied(candidate, override)
-        _warn_deprecated_keys(candidate, override)
+        override = strip_removed_keys(candidate, override)
         data = deep_merge(data, override)
         sources.append(candidate)
 
@@ -427,27 +378,31 @@ def _warn_if_defaults_were_copied(path: str, override: Mapping[str, Any]) -> Non
     logger.warning("  既定値と同じ項目の例: %s", "、".join(redundant[:5]))
 
 
-def _has_key_path(data: Mapping[str, Any], path: str) -> bool:
-    """``"weather.jma"`` のようなドット区切りのキーが ``data`` にあるかを返す。"""
-    node: Any = data
-    for part in path.split("."):
-        if not isinstance(node, Mapping) or part not in node:
-            return False
-        node = node[part]
-    return True
+def strip_removed_keys(path: str, override: Mapping[str, Any]) -> Dict[str, Any]:
+    """廃止したキーを警告したうえで取り除いた、``override`` の複製を返す。
 
+    取り除いたものをマージするので、廃止したキーは ``Config.data`` にも
+    ``--print-config`` にも届かない。呼び出し側の ``override`` は書き換えない。
+    親の辞書は、中身が空になってもそのまま残す。途中に辞書でないものがあれば
+    そのキーは「無い」ものとして扱う。
 
-def _warn_deprecated_keys(path: str, override: Mapping[str, Any]) -> None:
-    """廃止予定のキーが設定ファイルに書かれていれば警告する。
-
-    動作は変えない（警告のみ）。v6.0.0 で廃止するまでは、書かれていれば
-    これまでどおり効く。
+    エラーにして止めず、警告して無視するのは、Pi の config.json に消し忘れた
+    1 行が残っただけで放送を止めたくないため。異常終了させても systemd の
+    ``Restart=always`` が再起動を繰り返すだけで、時報は鳴らないままになる。
     """
-    for key, guidance in DEPRECATED_KEYS.items():
-        if _has_key_path(override, key):
-            logger.warning(
-                "%s の %s は v6.0.0 で廃止予定です（%s）。この行を消してください。",
-                path, key, guidance)
+    cleaned: Dict[str, Any] = copy.deepcopy(dict(override))
+    for key, guidance in REMOVED_KEYS.items():
+        *parents, leaf = key.split(".")
+        node: Any = cleaned
+        for part in parents:
+            node = node.get(part) if isinstance(node, dict) else None
+        if not isinstance(node, dict) or leaf not in node:
+            continue
+        del node[leaf]
+        logger.warning(
+            "%s の %s は v6.0.0 で廃止しました（%s）。この行は無視します。消してください。",
+            path, key, guidance)
+    return cleaned
 
 
 def _read_json(path: str) -> Dict[str, Any]:
@@ -464,6 +419,4 @@ def _read_json(path: str) -> Dict[str, Any]:
 
 def dump_default_config(path: str) -> None:
     """:data:`DEFAULT_CONFIG` を JSON として書き出す（雛形生成用）。"""
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(DEFAULT_CONFIG, handle, ensure_ascii=False, indent=2)
-        handle.write("\n")
+    write_json_atomic(path, DEFAULT_CONFIG)

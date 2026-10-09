@@ -95,10 +95,8 @@ jobs:
       - name: 全文言（時刻アナウンス・ひとこと・天気）が作り置きだけで合成できること
         run: |
           python -c "
-          import sys
           from chime.config import load_config
-          sys.path.insert(0, 'scripts')
-          from generate_voicevox import collect_phrases
+          from chime.phrases import collect_phrases
           config = load_config()
           for phrase in collect_phrases(config, include_quotes=True):
               print(phrase)

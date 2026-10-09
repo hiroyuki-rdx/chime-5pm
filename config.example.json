@@ -88,14 +88,9 @@
   },
   "extra_segment": {
     "enabled": true,
-    "mode": "both",
     "weather_hours": [
       12
-    ],
-    "weather_probability": 0.0,
-    "always_weather_hours": [],
-    "always_quote_hours": [],
-    "fallback_to_quote": true
+    ]
   },
   "quotes": {
     "file": "assets/quotes.json",
@@ -103,18 +98,8 @@
   },
   "weather": {
     "enabled": true,
-    "provider": "open_meteo",
     "timeout_seconds": 8.0,
     "cache_minutes": 60,
-    "jma": {
-      "area_code": "250000",
-      "area_name": "南部",
-      "temp_area_name": "大津",
-      "label": "滋賀",
-      "drop_after": [
-        "所により"
-      ]
-    },
     "open_meteo": {
       "locations": [
         {
@@ -135,8 +120,7 @@
       "whens": [
         "今日"
       ]
-    },
-    "max_weather_chars": 40
+    }
   },
   "tts": {
     "engines": [

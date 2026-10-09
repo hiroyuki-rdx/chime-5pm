@@ -1,8 +1,8 @@
 # キャンパス時報システム 仕様書
 
 **プロジェクト名:** Campus Chime System
-**バージョン:** 5.3.0
-**対応要件定義:** `docs/REQUIREMENTS.md` v5.3.0
+**バージョン:** 6.0.0
+**対応要件定義:** `docs/REQUIREMENTS.md` v6.0.0
 **作成日:** 2026/08/26
 
 ---
@@ -49,6 +49,8 @@
 | `tests/` | 新規追加 | NFR-07 |
 | `scripts/` | 新規追加 | 導入手順の自動化・音声事前生成 |
 | `.github/workflows/ci.yml` | 新規追加 | NFR-07 |
+| `.github/workflows/tag.yml` | 新規追加 | `main` へのマージで版のタグを自動で付けるため（10.1 章） |
+| `scripts/tag_releases.py` | 新規追加 | 版のタグ付けの本体。`CHANGELOG.md` の版見出しのリンク（`releases/tag/vX.Y.Z`）の行き先を用意するため |
 | `docs/LEGACY_SYSTEM_SHUTDOWN.md` | **削除** | `weather.py` は OS ごと廃止されるため、停止手順が不要になる |
 
 ---
@@ -126,13 +128,10 @@
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
-| `enabled` | `true` | おまけ放送の有効／無効 |
-| `mode` | `"both"` | `both` = 天気予報 → ひとこと の順に両方流す。`choice` = どちらか一方を選ぶ（従来方式） |
-| `weather_hours` | `[12]` | `mode="both"` で天気予報を流す正時。既定は **12 時の 1 回だけ**（v5.0.0 までは `[10, 12, 14, 16]` の 2 時間おき）。ここに無い時刻は「ひとこと」だけになり、天気 API も呼ばない。空リストなら一度も流さない。要素は文字列でも可（`int` に正規化し、変換できない要素は警告して無視）。**閉館放送は別経路のため、ここに何を書いても天気は付かない** |
-| `weather_probability` | `0.0` | 天気予報が選ばれる確率。**`mode="choice"` 専用** |
-| `always_weather_hours` | `[]` | 必ず天気予報にする時。**`mode="choice"` 専用** |
-| `always_quote_hours` | `[]` | 必ずひとことにする時。**`mode="choice"` 専用** |
-| `fallback_to_quote` | `true` | 天気取得失敗時にひとことへ切り替えるか。**`mode="choice"` 専用**（`mode="both"` ではひとことが必ず後続するため、失敗した天気は黙って飛ばす） |
+| `enabled` | `true` | おまけ放送（天気予報・ひとこと）の有効／無効。`false` なら時報のあとは何も流さず、時報音と時刻アナウンスだけになる |
+| `weather_hours` | `[12]` | 天気予報を流す正時。既定は **12 時の 1 回だけ**（v5.0.0 までは `[10, 12, 14, 16]` の 2 時間おき）。ここに無い時刻は「ひとこと」だけになり、天気 API も呼ばない。空リストなら一度も流さない。要素は文字列でも可（`int` に正規化し、変換できない要素は警告して無視）。**閉館放送は別経路のため、ここに何を書いても天気は付かない** |
+
+時報のあとの放送は**常に 1 経路**で、抽選はしない（4.9 章）。時報音 → 時刻アナウンス → （`weather_hours` の時刻で、かつ `weather.enabled` のときだけ）天気予報 → ひとこと 1 つ。天気を流す時刻でも流さない時刻でも、ひとことは必ず 1 つ流れる。
 
 #### `quotes`
 
@@ -145,15 +144,9 @@
 
 | 項目 | 既定値 | 意味 |
 |---|---|---|
-| `enabled` | `true` | 天気予報の有効／無効。無効にすると時報のあとは「ひとこと」だけになる |
-| `provider` | `"open_meteo"` | `open_meteo` または `jma`（気象庁）。**既定が `open_meteo` なのは、読み上げ文を事前生成できるようにするため**（下記の注記を参照） |
+| `enabled` | `true` | 天気予報の有効／無効。無効にすると、`weather_hours` の時刻でも天気は流れず、時報のあとは「ひとこと」だけになる（警告を 1 件記録する） |
 | `timeout_seconds` | `8.0` | HTTP タイムアウト |
 | `cache_minutes` | `60` | 取得結果のキャッシュ時間 |
-| `jma.area_code` | `"250000"` | 気象庁の地域コード（府県予報区。既定は滋賀県） |
-| `jma.area_name` | `"南部"` | 天気・降水確率の timeSeries 内で優先する細分区域名（前方一致）。滋賀県の一次細分区域は「南部」（大津・草津・近江八幡など）と「北部」（彦根・長浜・米原・高島など） |
-| `jma.temp_area_name` | `"大津"` | 気温の timeSeries 内で優先する観測地点名（前方一致）。天気・降水確率の細分区域名とは体系が異なるため別に指定する。空文字列なら `area_name` を使う（後方互換） |
-| `jma.label` | `"滋賀"` | 読み上げに使う地名 |
-| `jma.drop_after` | `["所により"]` | 予報文中でこの文字列が最初に現れる位置以降を切り捨てる（地域限定の但し書き除去）。空リストなら切り捨てない |
 | `open_meteo.locations` | 大津 の 1 件（v5.1.0 までは 大津 / 京都 の 2 件） | 読み上げる地点の配列（`label` / `latitude` / `longitude`）。**上から順に読む**。増やすと 1 か所あたり約 6 秒放送が長くなる。増やした地点の文は作り置きが無いので、PC で読み上げ音声を作り直すこと（作り直すまでその地点の文は無音になる）。配列は `config.json` で丸ごと置き換わる（deep merge されない）ため、地点を足すときは大津も含めて全地点を書く。`label` はそのまま読み上げられるので、読み間違えない表記にすること |
 | `sentence_weather` | `"今の{label}の天気は{weather}なのだ。"` | 天気の文。**現在の天気**を読む |
 | `sentence_temp` | `"気温は{temp}度なのだ。"` | 気温の文。**現在の気温**を読む |
@@ -162,20 +155,17 @@
 | `prerecord.temp_min` / `temp_max` | `-5` / `40` | 事前生成する気温の範囲（両端含む） |
 | `prerecord.pop_step` | `10` | 降水確率を丸める刻み（`sentence_pop` を有効にしたときに効く） |
 | `prerecord.whens` | `["今日"]` | 事前生成する `{when}` の一覧（予報の文を有効にしたときに効く） |
-| `max_weather_chars` | `40` | `{weather}` 部分の文字数上限。**`provider="jma"` のときだけ意味を持つ**（気象庁の自由文が予期せず長い場合の保険） |
 
 **読み上げを 1 文ずつに分けている理由。** 地名・気温をそれぞれ別の文にすると、各文の語彙が
 有限に収まり、全パターンを VOICEVOX で事前生成できる（`assets/voice/`）。1 文にまとめると
 値の組み合わせが爆発して事前生成できず、**その文だけ無音になる**（他の文・時報音は鳴る）。
 テンプレートを空文字列にするとその文を読まない。
 
-**`provider` の既定が `open_meteo` である理由。** 気象庁の予報文は自由文で語彙が閉じず、
-事前生成できない。Open-Meteo は天気コード（`WMO_CODES`・28 語）で語彙が閉じるため、
-全パターンを作り置きできる。`jma` に戻すこと自体は可能だが、(1) 天気だけ無音になる、
-(2) 気象庁に現況が無いため `sentence_temp` が出力されず天気 1 文だけになる、
-(3) `sentence_weather` の「今の」が実態（今日 1 日の予報）と食い違う、の 3 点を承知すること。
-`jma` を使うなら `sentence_weather` を予報の言い回しに戻し、`sentence_temp_max` /
-`sentence_pop` を有効にする（手順は `docs/SETUP.md`）。
+**取得先が Open-Meteo だけである理由。** 天気の文面を自由文のまま読むと語彙が閉じず、事前生成
+できない（Pi には実行時の音声合成が無いので、その文だけ無音になる）。Open-Meteo は天気コード
+（`WMO_CODES`・28 語）で語彙が閉じるため、気温の文と合わせて全パターンを作り置きできる。
+気象庁の取得先は、予報文が自由文で作り置きできなかったため、v6.0.0 で削除した（5.3.0 で
+予告）。
 
 #### `tts`
 
@@ -214,6 +204,13 @@ pygame 2.x の `mixer.init()` は buffer 既定値が **512 サンプル**であ
 
 なお音源のサンプリング周波数は mixer 設定と一致していなくてよい（SDL_mixer が読み込み時に変換する）。ただし変換は CPU を使うため、可能なら 44.1kHz に揃えることが望ましい。
 
+### 3.4 廃止した設定キー（v6.0.0）
+
+次の 8 キーは v6.0.0 で廃止した（5.3.0 から起動時に「廃止予定」と警告していた）。`config.json` に残っていても起動は止まらず、起動時に警告して値を無視する（既定値が使われる。8 章）。
+
+- 廃止した `extra_segment.mode` / `weather_probability` / `always_weather_hours` / `always_quote_hours` / `fallback_to_quote`: 天気を流す時刻は `extra_segment.weather_hours` で指定する。「天気かひとことのどちらか一方を選ぶ」方式（`mode="choice"`）は廃止した
+- 廃止した `weather.provider` / `weather.jma` / `weather.max_weather_chars`: 天気は Open-Meteo（`weather.open_meteo`）に一本化した。気象庁の取得先は廃止した
+
 ---
 
 ## 4. モジュール仕様
@@ -236,7 +233,6 @@ pygame 2.x の `mixer.init()` は buffer 既定値が **512 サンプル**であ
 | `generate_time_signal(path, settings, mixer)` | 標準ライブラリ（`wave` / `math` / `struct`）だけで 16bit PCM の WAV を書き出す |
 | `ensure_time_signal(path, ...)` | ファイルが無ければ生成する |
 | `lead_seconds(settings)` | 短音区間の長さ＝`short_pip_count × pip_interval_ms`（既定 3.0 秒） |
-| `total_seconds(settings)` | 時報音全体の長さ（既定 4.0 秒） |
 | `hour_parts(hour, settings)` | 12 時間表記の部品（`period` / `hour` / `hour24` / `hour_reading`） |
 | `announce_text(hour, settings)` | 読み上げ文言。12 時は `noon_template` |
 
@@ -260,7 +256,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 ### 4.3 `chime/audio.py`（責務: 音声再生制御）
 
-`Segment`（`path` / `label` / `fade_in_ms` / `gap_after_ms` / `optional`）の列を順番に再生する。
+`Segment`（`path` / `label` / `fade_in_ms` / `optional`）の列を順番に再生する。
 
 | クラス | 仕様 |
 |---|---|
@@ -295,21 +291,15 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 ### 4.5 `chime/weather.py`（責務: 天気予報の取得）
 
+提供元は **Open-Meteo だけ**（API キー不要）。エンドポイントは次のとおり。
+
 | 提供元 | エンドポイント |
 |---|---|
-| `jma` | `https://www.jma.go.jp/bosai/forecast/data/forecast/{area_code}.json` |
-| `open_meteo` | `https://api.open-meteo.com/v1/forecast?...&current=weather_code,temperature_2m&daily=...&timezone=Asia/Tokyo&forecast_days=1` |
+| Open-Meteo | `https://api.open-meteo.com/v1/forecast?...&current=weather_code,temperature_2m&daily=...&timezone=Asia/Tokyo&forecast_days=1` |
 
-`open_meteo` は `weather.open_meteo.locations` の**地点ごとに個別に問い合わせる**。
+`weather.open_meteo.locations` の**地点ごとに個別に問い合わせる**。
 複数地点の一括クエリは応答形式が変わる（配列になる）ため使わない。地点数が少ないうちは
 素直に地点ごとに叩くほうが堅い。キャッシュも地点ごとに持つ。
-
-**気象庁 JSON の解釈**
-
-- 天気: `timeSeries` のうち `weathers` を持つ系列から、`area_name`（細分区域名。前方一致、無ければ先頭）で選ぶ。`timeDefines` が当日の要素を優先する。予報文中の空白（全角・半角）は形態素の境界を表すため、削除ではなく読点「、」に変換する（削除すると読み上げエンジンの形態素解析が崩れて読み上げが崩壊する）。続けて `drop_after`（既定 `["所により"]`）のいずれかが最初に現れる位置以降を切り捨てる
-- 最高／最低気温: `temps` を持つ系列を `timeDefines` と対にし、**時刻が 6 時未満なら最低・以降なら最高**として日付ごとに畳み込む。気温の地点名は天気・降水確率の細分区域名とは体系が異なる（例: 滋賀県なら細分区域は「南部」「北部」、気温の地点は「大津」「彦根」）ため、`temp_area_name`（空なら `area_name`）で選ぶ
-- 降水確率: `pops` を持つ系列から `area_name` で選んだ地域の、当日分の**最大値**を採る
-- いずれも欠落しうる前提で、取れた要素だけで文を組み立てる（当日昼発表の予報には当日の最低気温が無い、など）
 
 **Open-Meteo JSON の解釈**
 
@@ -345,8 +335,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 両者の文言がずれることはない。この網羅性は `tests/test_weather.py` の語彙網羅テストが
 機械的に検証している（**これが「天気だけ無音になる」ことを防ぐ唯一の担保**）。
 
-`{weather}` は `provider="jma"` のときのみ `max_weather_chars`（既定 40 文字）で長さを確認し、
-超えていれば読点の位置で切り詰める（予期しない長文への保険。文の途中では切らない）。
+`{weather}` には `WMO_CODES` の語しか入らないため、文字数の上限や切り詰めは持たない。
 
 取得結果は `cache_minutes` の間、**地点ごとに**メモリ上に保持する（NFR-06）。あらゆる失敗は
 `WeatherError` に正規化する。全地点が失敗したときだけ `describe_sentences()` が送出し、
@@ -383,7 +372,7 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 ### 4.8 `chime/scheduler.py`（責務: 次イベントの算出と待機）
 
-`Event` は `key` / `kind` / `hour` / `minute` / `at`（内容の時刻）/ `play_at`（再生開始）/ `prepare_at`（準備開始）を持つ。
+`Event` は `key` / `kind` / `hour` / `at`（内容の時刻）/ `play_at`（再生開始）/ `prepare_at`（準備開始）を持つ。
 
 | メソッド | 仕様 |
 |---|---|
@@ -401,28 +390,21 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 | メソッド | 生成される `Segment` |
 |---|---|
-| `build_hourly(hour)` | ①時報音 ②時刻アナウンス ③おまけ（天気予報・ひとこと） |
+| `build_hourly(hour)` | ①時報音 ②時刻アナウンス ③（`weather_hours` の時刻だけ）天気予報 ④ひとこと |
 | `build_closing()` | ①閉館アナウンス ②（任意）追加読み上げ ③蛍の光（フェードイン） |
 | `build_text(text)` / `build_texts(texts)` | 任意文言の読み上げのみ。複数文は 1 文ずつ別セグメントにする |
 
-**おまけの決まり方**
+**時報の放送の決まり方（1 経路）**
 
-`extra_segment.enabled` が `false` ならおまけは出ない。以降は `extra_segment.mode` で分かれる。
+`build_hourly(hour)` は次の順に積む。抽選や分岐はなく、設定で変わるのは天気を流す時刻だけ。
 
-`mode = "both"`（既定）:
+1. 時報音
+2. 時刻アナウンス
+3. `extra_segment.enabled` が `false` ならここで終わり。そうでなければ続けて:
+   1. `hour` が `weather_hours`（既定 `[12]`）に含まれる → 天気予報を積む。含まれなければ**天気 API を呼ばない**。`weather.enabled` が `false` のときは天気を積まず、警告を 1 件記録する
+   2. 必ずひとことを 1 つ積む（天気の成否に関わらず）
 
-1. `hour` が `weather_hours`（既定 `[12]`）に含まれる → 天気予報を積む。
-   含まれなければ**天気 API を呼ばない**
-2. 続けて必ずひとことを積む（天気の成否に関わらず）
-
-`mode = "choice"`（従来方式）— `choose_extra(hour, settings, rng)` の判定順序:
-
-1. `hour` が `always_weather_hours` に含まれる → 天気予報
-2. `hour` が `always_quote_hours` に含まれる → ひとこと
-3. `rng.random() < weather_probability` → 天気予報、そうでなければひとこと
-
-未知の `mode` は警告を出して `"both"` として扱う（設定ミスで放送が壊れないように）。
-`weather_hours` の要素は `int` に正規化し、変換できない要素は警告して無視する。
+`weather_hours` の要素は `int` に正規化し、変換できない要素は警告して無視する。v6.0.0 で廃止した旧設定（3.4 章）が `config.json` に残っていても、ここでは読まない。
 
 **閉館放送は `build_closing()` という別経路のため、`weather_hours` に何を書いても
 天気は付かない**（回帰テストで固定している）。
@@ -432,10 +414,8 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 
 **失敗時の扱い（重要）**
 
-- 天気取得失敗
-  - `mode="both"` → 警告を記録して**天気を黙って飛ばす**。ひとことは後続で必ず流れるため
-    沈黙せず、ここでひとことへ切り替えるとひとことが 2 つ流れてしまう
-  - `mode="choice"` → 警告を記録し、`fallback_to_quote` ならひとことへ
+- 天気取得失敗 → 警告を記録して**天気を黙って飛ばす**。ひとことは後続で必ず流れるため
+  沈黙せず、ここでひとことへ切り替えるとひとことが 2 つ流れてしまう
 - 音声合成失敗 → 当該セグメントを落として続行（**時報音そのものは必ず鳴る**）
 - 組み立て中の想定外の例外（通信の途中切断、読み上げ文のテンプレートの書き間違いなど）→ 部品ごとに縮退し、**時報音は必ず鳴る**。時刻アナウンスのテンプレートを書き間違えたときは既定の文言で読む（8 章）
 
@@ -489,6 +469,28 @@ WAV の先頭を「正時 − `lead_seconds()`」に再生開始することで�
 `--dry-run` や `--test-hourly` などの試し鳴らしは、`cache/state.json` を書き換えない（ひとこと履歴が進まない）。
 
 ログのタイムスタンプは `timezone` 設定に合わせて表示する（ハンドラのフォーマッタに変換関数を差し替える）。
+
+### 4.12 `chime/phrases.py`（責務: 読み上げうる全文言の列挙）
+
+チャイムが読み上げうる全文言を列挙する。ここで数えた文言が、そのまま「作り置きしなければならない文言」になる。Pi には実行時の音声合成が無く、声は文言の**完全一致**で `assets/voice/manifest.json` から引くため、列挙から漏れた文言はその文だけ無音になる。
+
+| 関数 | 仕様 |
+|---|---|
+| `announcement_phrases(config)` | 時報の文言を、`start_hour`〜`end_hour`（`chime.scheduler.hourly_hours()`）の時刻ごとに返すジェネレーター。重複は除かず、`skip_hours` も見ない（休みにしている時刻の文言も作り置きしておく） |
+| `closing_extra_text(config)` | `closing.extra_text`。`null`・空文字列・キーなしはどれも空文字列 |
+| `closing_phrases(config)` | `closing.extra_text` があれば 1 件、無ければ空 |
+| `quote_phrases(config)` | ひとことの全文言（`general`、`by_hour` の順） |
+| `collect_phrases(config, include_quotes)` | 時報・閉館・ひとこと（`include_quotes` のときだけ）に、天気の全語彙（`weather.prerecord_phrases()`。`include_quotes` や `weather.enabled` に関わらず常に含む）を足し、空と重複を除いて最初に現れた順に返す |
+| `phrases_in_use(config)` | ひとことを含む使用中の全文言（`--prune` の判定に使う） |
+| `phrases_to_generate(config, include_quotes)` | `config` の文言に既定設定の文言を足した和集合（`config.json` の配列は既定値を丸ごと置き換えるため） |
+| `phrases_to_keep(config)` | `--prune` で残す文言。ひとことを含めた `phrases_to_generate` と同じ |
+| `find_stale_entries(manifest, keep_phrases)` | manifest のうち、残す文言に無いエントリ（判定だけで、削除はしない） |
+
+使うのは `scripts/generate_voicevox.py`（WAV の生成と `--prune`。同スクリプトからも `collect_phrases()` などを引けるよう再公開している）、テスト（`tests/test_phrases.py`・`tests/test_voice_assets.py`・`tests/test_docs.py`）、CI の `prerecorded-only` ジョブ。
+
+**層の規則:** `chime.audio` / `chime.sequence` / `chime.app` を import しない（pygame を引き込まない）。生成スクリプトは PC 側で動かすため、再生系の依存が無くても使えるようにしておく。`tests/test_phrases.py` が別プロセスで import して確かめる。
+
+**既知の取り決め:** 実行時の照合（`TTSService`）は文言の前後の空白を除いて引くが、列挙は除かない。
 
 ---
 
@@ -585,8 +587,8 @@ WantedBy=multi-user.target
 | 組み立て全体の失敗 | 最小構成で再生する（時報音は鳴る） |
 | 閉館放送の一方の欠落（アナウンスか蛍の光のどちらかを用意できない） | ログに記録し、欠けた側だけを落として、残りは鳴らす |
 | `config.json` の文字コード不正（UTF-8 以外。Shift_JIS など） | 「UTF-8 で保存し直して」と日本語で案内し、**終了コード 2** で終了する（常駐は systemd が 10 秒ごとに再起動を繰り返すが、journal に原因が出る。以前は Python のトレースバックだけだった）。BOM 付き UTF-8 は読める。`python3 campus_chime.py --print-config` で確認できる |
-| 廃止予定の設定キー（`extra_segment.mode` / `weather_probability` / `always_weather_hours` / `always_quote_hours` / `fallback_to_quote`、`weather.provider` / `jma` / `max_weather_chars`） | 起動時に WARNING ログ（「v6.0.0 で廃止予定」）。動作は変えない |
-| 天気取得失敗 | WARNING ログ。既定（`mode="both"`）は天気だけ飛ばす（ひとことは元から流れる）。`mode="choice"` のときだけ `fallback_to_quote` に従いひとことへ切り替え |
+| 廃止した設定キー（v6.0.0。`extra_segment.mode` / `weather_probability` / `always_weather_hours` / `always_quote_hours` / `fallback_to_quote`、`weather.provider` / `jma` / `max_weather_chars`）が `config.json` に残っている | 起動時に WARNING ログ「`<ファイル>` の `<キー>` は v6.0.0 で廃止しました（`<案内>`）。この行は無視します。消してください。」を 1 キーにつき 1 行出す。案内は、`extra_segment` の 5 キーが「天気を流す時刻は extra_segment.weather_hours で指定」、`weather` の 3 キーが「天気は Open-Meteo（weather.open_meteo）に一本化」。**値は無視して起動を続け**（既定値が使われる）、止めない。`journalctl -u campus_chime.service -p warning` で確認できる（キーの一覧と代わりの設定は 3.4 章） |
+| 天気取得失敗 | WARNING ログ。天気だけ飛ばし、ひとことは必ず流れる（ひとことへの切り替えはしない） |
 | ひとこと定義ファイル欠落・破損 | WARNING ログ。内蔵の予備文言を使用 |
 | 状態ファイル破損 | WARNING ログ。初期状態として扱う |
 | 再生中の例外 | ERROR ログ。`finally` で mixer を解放し、プロセスは継続 |
@@ -628,29 +630,37 @@ journalctl -u campus_chime.service -p warning       # 警告も見るなら（�
 python3 -m unittest discover -s tests -t . -v
 ```
 
-ネットワーク・音声デバイス・外部コマンドに依存せず実行できる（気象庁／Open-Meteo の応答は `tests/fixtures/` の実データ形式で再現）。
+ネットワーク・音声デバイス・外部コマンドに依存せず実行できる（Open-Meteo の応答は `tests/fixtures/` の実データ形式で再現）。
 
 | ファイル | 対象 |
 |---|---|
-| `tests/test_config.py` | 設定のマージ・解決、`config.example.json` との同期 |
+| `tests/test_config.py` | 設定のマージ・解決、`config.example.json` との同期、廃止した設定キーの警告と無視 |
 | `tests/test_timesignal.py` | 読み上げ文言、WAV の形式・長さ・長音の開始位置 |
 | `tests/test_scheduler.py` | 曜日・時間帯の展開、追いかけ再生、待機処理 |
-| `tests/test_weather.py` | 気象庁／Open-Meteo の解析、文の組み立て、異常応答 |
+| `tests/test_weather.py` | Open-Meteo の解析、文の組み立て、語彙の網羅、異常応答 |
 | `tests/test_quotes.py` | 候補の抽出、直近除外、同梱データの健全性 |
 | `tests/test_tts.py` | エンジンのフォールバック、キャッシュ、事前生成音声の参照 |
 | `tests/test_state.py` | 永続化、日付をまたぐリセット、破損時の挙動 |
-| `tests/test_sequence.py` | セグメント構成、おまけの抽選、失敗時の縮退 |
+| `tests/test_sequence.py` | セグメント構成（天気を流す時刻・ひとことは毎回）、失敗時の縮退 |
 | `tests/test_audio.py` | 再生順序、デバイス解放、バックエンド選択 |
 | `tests/test_app.py` | 常駐ループ、停止要求、例外時の継続 |
 | `tests/test_cli.py` | 引数解釈、終了コード、環境判定 |
 | `tests/test_jsonfile.py` | JSON の読み書き（BOM 付き UTF-8、UTF-8 以外の案内、構文エラーの行・桁とヒント、一時ファイル経由の書き込み） |
 | `tests/test_logsetup.py` | journal への重大度の接頭辞（`JOURNAL_STREAM` が一致するときだけ全行に付く）、ハンドラの重複防止 |
-| `tests/test_generate_voicevox.py` | 作り置き生成スクリプト（`--config` の文言と既定の文言の和集合、`--prune` で残す文言、合成に失敗した文言を manifest に書かないこと） |
-| `tests/test_docs.py` | 文書の記載と実装の一致（文書中の `--say` の例が作り置きにあること、README・要求定義書・仕様書の版が `chime/__init__.py` の `__version__` と一致すること） |
+| `tests/test_phrases.py` | 全文言の列挙（既定設定・現地設定での件数とハッシュの固定、`--config` の文言と既定の文言の和集合、`--prune` で残す文言、時報・閉館・ひとこと各列挙の振る舞い、`chime/phrases.py` が再生系を import しないこと） |
+| `tests/test_generate_voicevox.py` | 作り置き生成スクリプトの CLI 側（`--config` の文言を既定の文言に足して生成すること、`--prune` の実行、合成に失敗した文言を manifest に書かないこと、列挙の関数を `chime/phrases.py` から再公開していること） |
+| `tests/test_setup_script.py` | 導入スクリプト（`scripts/setup.sh`）。`--help` / `-h` が先頭のコメントブロックだけを表示すること（`set -euo pipefail` まで出さない）、不明なオプションが副作用（apt・systemd など）の前に終了コード 2 で止まること、新規に作る `config.json` の雛形が正しい JSON で、設定項目を持たず、既定値と同じ値を 1 つも写さない（起動時に丸ごとコピーの警告が出ない）こと。副作用のあるコマンドは偽物に差し替えて実行する |
+| `tests/test_tag_releases.py` | 版のタグ付け（`scripts/tag_releases.py` と `.github/workflows/tag.yml`）。使い捨ての git リポジトリで、first-parent 上で `__version__` がその版になった最初のコミット（版を出した PR のマージコミット）に版のタグが付くこと、`CHANGELOG.md` に `## [X.Y.Z]` の見出しが無い版には付けないこと、`--since` より古い版には付けないこと、タグが注釈付きであること、何度実行しても結果が変わらず既存のタグを動かさないこと（別のコミットを指す既存のタグは警告だけ）、GitHub Actions 上では警告が注釈として出ること、`--dry-run` が何も作らないこと、`--push` が bare リポジトリのリモートへ届くことと push の失敗が終了コード 1 になり手で push するコマンドが表示されること、タグを 1 つ作れなくても残りは作って push し終了コード 1 になること、git が読めないオブジェクトがあると終了コード 1 でタグを 1 つも付けないこと、付けられなかった版（見出しが無い・先頭の版が読めない）が警告になること、浅い clone・git のリポジトリでない場所・不正な `--since` が終了コード 2 になること、`tag.yml` の静的な検査（トリガー、ジョブ単位の `main` 限定の条件、ワークフロー全体の `permissions` が 1 つだけであること、認証情報や権限を上書きする設定が無いこと、`fetch-depth: 0`、ref ごとの `concurrency` グループ） |
+| `tests/test_voice_assets.py` | 同梱の音声の健全性（`assets/voice/` の manifest と WAV の欠け・余り・形式、既定の設定が読み上げる全文言が manifest にあること、`announce.wav` と `hotaru.mp3`。VOICEVOX は使わずファイルだけを調べる） |
+| `tests/test_docs.py` | 文書の記載と実装の一致（文書中の `--say` の例が作り置きにあること、README・要求定義書・仕様書の版が `chime/__init__.py` の `__version__` と一致すること、`CHANGELOG.md` の先頭の版が `__version__` と一致すること、文書に書いた作り置きの件数・天気コードの語数がコードから数えた値と一致すること、廃止したキーが「廃止」の語なしに現行の設定として書かれていないこと） |
 
-CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ。「CLI が起動すること」の `--test-hourly 12` は、実際の通信をしないよう `--config tests/fixtures/offline_config.json`（天気を無効にした設定）を渡す）。別ジョブ（`lint`。Python 3.11 のみ）で `pyflakes`（版を固定してインストールする）を `python -m pyflakes chime scripts tests campus_chime.py` で実行する。ワークフロー全体の権限は `contents: read` だけで、同じ ref の古い実行は新しい実行が始まると止める（`concurrency`）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`scripts/generate_voicevox.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
+CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ。「CLI が起動すること」の `--test-hourly 12` は、実際の通信をしないよう `--config tests/fixtures/offline_config.json`（天気を無効にした設定）を渡す）。別ジョブ（`lint`。Python 3.11 のみ）で `pyflakes`（版を固定してインストールする）を `python -m pyflakes chime scripts tests campus_chime.py` で実行する。ワークフロー全体の権限は `contents: read` だけで、同じ ref の古い実行は新しい実行が始まると止める（`concurrency`）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`chime/phrases.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
 
 手元で `prerecorded-only` ジョブと同じ検証をするには、`.github/workflows/ci.yml` のコマンドをそのまま実行する（`cache/tts/` を消してから実行すると、キャッシュ済みの合成結果に隠れず確実に検証できる）。
+
+版のタグは、別のワークフロー（`.github/workflows/tag.yml`、名前は「タグ付け」）が付ける。`main` への push のたびに（手動実行の `workflow_dispatch` も `main` だけ）、`github-actions[bot]` として `python scripts/tag_releases.py --since 5.2.0 --push` を実行する。タグを push するため、権限に `contents: write` を持つのはこのワークフローだけで、`ci.yml` は `contents: read` のままにしてある。履歴をたどるので、取得は `fetch-depth: 0`（全履歴）にする（浅い clone ではスクリプトが終了コード 2 で止まる）。スクリプトは `main` を first-parent でたどり、`chime/__init__.py` の `__version__` がその版になった**最初のコミット**（版を出した PR のマージコミット）に、`vX.Y.Z` の注釈付きタグ（メッセージはタグ名）を付ける。ただし `CHANGELOG.md` にその版の見出し（`## [X.Y.Z]`）が無いコミットには付けない。既存のタグは動かさず、消しもしない（別のコミットを指すタグがあっても警告するだけ）ので、何度実行しても結果は変わらない。タグを付けるのは 5.2.0 以降の版だけで、この下限はスクリプトに埋め込まず、ワークフローが `--since 5.2.0` で渡す。実行は `concurrency`（グループ `tag-${{ github.ref }}`、つまり ref ごと）で 1 つずつ順に行い、実行中のものを取り消さない。`main` への push と `main` での手動実行は同じグループに並ぶので順に実行され、別のブランチでの手動実行（`main` ではないのでタグは付けずに終わる）が、待っている `main` の実行を押しのけることはない。PR は「Create a merge commit」（または「Squash and merge」）でマージする。「Rebase and merge」やファストフォワードでは、マージコミットができず、PR の版を上げたコミットがそのまま `main` の first-parent に載るため、タグがそのコミットに付いてしまう。
+
+付けられなかった版（`__version__` がその版なのに `CHANGELOG.md` に `## [X.Y.Z]` の見出しが無い場合と、ref の先頭で `__version__` を読み取れない場合）は、警告として報告する（Actions の画面では注釈になる）。実行は緑のまま終わる。1 つのタグの作成に失敗しても、残りのタグは作って push し、実行は赤（終了コード 1）で終わる。git が履歴やオブジェクトを読めない（clone が壊れている・途中までしかない）ときは、何もタグを付けず、実行は赤で終わる。
 
 ### 10.2 実機での確認
 
@@ -668,7 +678,7 @@ CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自�
 | T-10 | 自動復旧 | Pi を再起動 | 起動後にサービスが自動的に active になる |
 | T-11 | 待機負荷 | `top` で当該プロセスを確認 | CPU 使用率 1% 未満（NFR-02） |
 | T-12 | オフライン動作 | Wi-Fi を切って `--test-hourly` | 時報は鳴り、おまけはひとことになる |
-| T-13 | 天気取得 | `python3 campus_chime.py --weather` | 当日の予報文が表示・読み上げされる |
+| T-13 | 天気取得 | `python3 campus_chime.py --weather` | 現在の天気と気温の文が表示・読み上げされる |
 
 > T-07 実施後は `config.json` を元に戻すこと。
 
@@ -688,6 +698,8 @@ CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自�
 | 時報音の再生成（時報音の設定を変えたとき） | `python3 campus_chime.py --generate-assets` |
 
 > **運用上の注意:** **16:55〜17:02（閉館放送の前後）は、更新・再起動・停止をしない。** 待機中は停止要求にすぐ応じるが、再生中は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了する（4.10 章。今後の版で改善予定）。
+
+> **版のタグ:** `main` にマージすると、GitHub Actions が版のタグ（`v5.2.0` 以降）を自動で付ける（10.1 章）。手でタグを作る必要はなく、`CHANGELOG.md` の版見出しのリンク（`releases/tag/vX.Y.Z`）は v5.2.0 から先がこのタグに解決する。
 
 ---
 

@@ -9,18 +9,39 @@ import random
 import tempfile
 import unittest
 
-from tests.support import REPO_ROOT
+from tests.support import SHIPPED_QUOTES, load_manifest, logs_enabled, write_quotes
 
-from chime.quotes import FALLBACK_QUOTES, QuoteError, QuotePicker, load_quotes
-
-SHIPPED_QUOTES = os.path.join(REPO_ROOT, "assets", "quotes.json")
+from chime.quotes import FALLBACK_QUOTES, QuoteError, QuotePicker, _normalize_quotes, load_quotes
 
 
-def write_quotes(directory: str, data) -> str:
-    path = os.path.join(directory, "quotes.json")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False)
-    return path
+class _Records(logging.Handler):
+    """ログを集めるだけのハンドラ（``assertLogs`` は 0 件だと失敗するため、無音の確認に使う）。"""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.records = []
+
+    def emit(self, record) -> None:
+        self.records.append(record)
+
+
+def normalize_capturing_logs(data, path="quotes.json"):
+    """``_normalize_quotes`` を呼び、結果と ``[(レベル, メッセージ)]`` を返す。
+
+    tests/__init__.py がログを抑制しているため、この間だけ一時的に解除する。
+    """
+    target = logging.getLogger("chime.quotes")
+    handler = _Records()
+    old_level = target.level
+    target.addHandler(handler)
+    target.setLevel(logging.DEBUG)
+    try:
+        with logs_enabled():
+            result = _normalize_quotes(data, path)
+    finally:
+        target.setLevel(old_level)
+        target.removeHandler(handler)
+    return result, [(record.levelno, record.getMessage()) for record in handler.records]
 
 
 class LoadQuotesTest(unittest.TestCase):
@@ -56,15 +77,11 @@ class LoadQuotesTest(unittest.TestCase):
     def _load_capturing_logs(self, path, level):
         """``load_quotes`` を呼び、``level`` 以上のログを集めて返す。
 
-        tests/__init__.py がログを抑制しているため、tests/test_sequence.py と
-        同じ手順でこの間だけ一時的に解除する。
+        tests/__init__.py がログを抑制しているため、tests/support.py の
+        ``logs_enabled()`` でこの間だけ一時的に解除する。
         """
-        logging.disable(logging.NOTSET)
-        try:
-            with self.assertLogs("chime.quotes", level=level) as captured:
-                data = load_quotes(path)
-        finally:
-            logging.disable(logging.CRITICAL)
+        with logs_enabled(), self.assertLogs("chime.quotes", level=level) as captured:
+            data = load_quotes(path)
         return data, captured.records
 
     def test_shift_jis_file_is_an_error_with_guidance(self):
@@ -134,6 +151,118 @@ class LoadQuotesTest(unittest.TestCase):
             data = load_quotes(path)
             self.assertEqual(data["general"], FALLBACK_QUOTES)
 
+    def test_every_fallback_is_a_fresh_copy(self):
+        # 予備を使う 3 つの場合（ファイルなし・形式不正・何も定義なし）のどれでも、
+        # 呼び出し側がリストを書き換えても FALLBACK_QUOTES や次の読み込みに響かない。
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = {
+                "missing": "/nonexistent/quotes.json",
+                "not_a_mapping": write_quotes(tmp, "文字列"),
+                "nothing_defined": write_quotes(tmp, {"general": [], "by_hour": {}}),
+            }
+            for name, path in cases.items():
+                with self.subTest(case=name):
+                    first = load_quotes(path)
+                    first["general"].append("書き換え")
+                    first["by_hour"]["9"] = ["朝"]
+                    self.assertNotIn("書き換え", FALLBACK_QUOTES)
+                    self.assertEqual(load_quotes(path),
+                                     {"general": list(FALLBACK_QUOTES), "by_hour": {}})
+
+    def test_the_nothing_defined_fallback_keeps_by_hour_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_quotes(tmp, {"general": [], "by_hour": {}})
+            self.assertEqual(load_quotes(path),
+                             {"general": list(FALLBACK_QUOTES), "by_hour": {}})
+
+    def test_by_hour_only_definition_is_not_replaced_by_the_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_quotes(tmp, {"by_hour": {"9": ["朝"]}})
+            self.assertEqual(load_quotes(path), {"general": [], "by_hour": {"9": ["朝"]}})
+
+    def test_non_string_items_are_converted_to_strings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = write_quotes(tmp, {"general": ["A", 1, None], "by_hour": {"9": [2.5, True]}})
+            self.assertEqual(load_quotes(path), {"general": ["A", "1", "None"],
+                                                 "by_hour": {"9": ["2.5", "True"]}})
+
+
+class NormalizeQuotesTest(unittest.TestCase):
+    """読み込んだデータの整形（``_normalize_quotes``。ファイルは読まない）。"""
+
+    def test_a_plain_list_becomes_general(self):
+        data, records = normalize_capturing_logs(["ひとつめ", "ふたつめ"])
+        self.assertEqual(data, {"general": ["ひとつめ", "ふたつめ"], "by_hour": {}})
+        self.assertEqual(records, [])
+
+    def test_a_non_mapping_is_an_error_and_uses_the_fallback(self):
+        for raw in ("文字列", 42, None, 3.5, True):
+            with self.subTest(raw=raw):
+                data, records = normalize_capturing_logs(raw, path="q/quotes.json")
+                self.assertEqual(data, {"general": list(FALLBACK_QUOTES), "by_hour": {}})
+                self.assertEqual([level for level, _ in records], [logging.ERROR])
+                self.assertIn("形式が不正", records[0][1])
+                self.assertIn("q/quotes.json", records[0][1])
+
+    def test_a_truthy_non_list_general_is_warned_about(self):
+        data, records = normalize_capturing_logs(
+            {"general": {"a": 1}, "by_hour": {"9": ["朝"]}}, path="q/quotes.json")
+        # general は空になるが、by_hour があるので予備には置き換わらない。
+        self.assertEqual(data, {"general": [], "by_hour": {"9": ["朝"]}})
+        self.assertEqual([level for level, _ in records], [logging.WARNING])
+        self.assertIn("general が配列ではありません", records[0][1])
+        self.assertIn("q/quotes.json", records[0][1])
+
+    def test_a_falsy_non_list_general_is_silently_empty(self):
+        for raw in (None, {}, "", 0):
+            with self.subTest(raw=raw):
+                data, records = normalize_capturing_logs(
+                    {"general": raw, "by_hour": {"9": ["朝"]}})
+                self.assertEqual(data["general"], [])
+                self.assertEqual(records, [])
+
+    def test_non_list_by_hour_entries_are_dropped_and_truthy_ones_warned_about(self):
+        data, records = normalize_capturing_logs({
+            "general": ["共通"],
+            "by_hour": {"10": {"a": 1}, "11": "文字列", "12": None, "13": "", "14": 0,
+                        "15": {}, "16": ["夕方"]},
+        })
+        self.assertEqual(data, {"general": ["共通"], "by_hour": {"16": ["夕方"]}})
+        self.assertEqual([level for level, _ in records], [logging.WARNING, logging.WARNING])
+        self.assertIn("by_hour[10] が配列ではありません", records[0][1])
+        self.assertIn("by_hour[11] が配列ではありません", records[1][1])
+
+    def test_a_non_mapping_by_hour_is_ignored_silently(self):
+        for raw in (None, [], ["x"], "text", 0):
+            with self.subTest(raw=raw):
+                data, records = normalize_capturing_logs({"general": ["共通"], "by_hour": raw})
+                self.assertEqual(data, {"general": ["共通"], "by_hour": {}})
+                self.assertEqual(records, [])
+
+    def test_by_hour_keys_become_strings(self):
+        data, _ = normalize_capturing_logs({"general": ["共通"], "by_hour": {12: ["お昼"]}})
+        self.assertEqual(data["by_hour"], {"12": ["お昼"]})
+
+    def test_nothing_defined_warns_and_uses_the_fallback(self):
+        for raw in ({}, {"general": [], "by_hour": {}}, {"general": None, "by_hour": None}):
+            with self.subTest(raw=raw):
+                data, records = normalize_capturing_logs(raw, path="q/quotes.json")
+                self.assertEqual(data, {"general": list(FALLBACK_QUOTES), "by_hour": {}})
+                self.assertEqual([level for level, _ in records], [logging.WARNING])
+                self.assertIn("1 件も定義されていません", records[0][1])
+                self.assertIn("q/quotes.json", records[0][1])
+
+    def test_warnings_come_in_the_order_general_then_by_hour_then_empty(self):
+        # general が不正で by_hour も使えない場合、3 つの警告がこの順に出る。
+        data, records = normalize_capturing_logs(
+            {"general": "x", "by_hour": {"9": "y"}}, path="q/quotes.json")
+        self.assertEqual(data, {"general": list(FALLBACK_QUOTES), "by_hour": {}})
+        messages = [message for _, message in records]
+        self.assertEqual(len(messages), 3)
+        self.assertIn("general が配列ではありません", messages[0])
+        self.assertIn("by_hour[9] が配列ではありません", messages[1])
+        self.assertIn("1 件も定義されていません", messages[2])
+
 
 class PickTest(unittest.TestCase):
     def setUp(self):
@@ -172,6 +301,43 @@ class PickTest(unittest.TestCase):
         picker = QuotePicker(path)
         self.assertEqual(picker.candidates(), ["A", "B"])
 
+    def test_candidates_keep_first_seen_order_across_general_and_by_hour(self):
+        # general が先、時刻専用が後。重複は最初に出た位置に残り、空文字列は除く。
+        path = write_quotes(self.tmp.name, {
+            "general": ["C", "A", "", "C", "B"],
+            "by_hour": {"12": ["B", "D", "", "A", "E", "D"]},
+        })
+        picker = QuotePicker(path)
+        self.assertEqual(picker.candidates(12), ["C", "A", "B", "D", "E"])
+        self.assertEqual(picker.candidates(10), ["C", "A", "B"])
+        self.assertEqual(picker.candidates(), ["C", "A", "B"])
+
+    def test_pick_chooses_from_the_ordered_fresh_candidates(self):
+        # rng.choice に渡る並び（＝シード固定の抽選が指す位置）は、候補の順から
+        # 直近のものを除いたもの。
+        class RecordingRng:
+            def __init__(self):
+                self.seen = None
+
+            def choice(self, seq):
+                self.seen = list(seq)
+                return seq[-1]
+
+        rng = RecordingRng()
+        picker = QuotePicker(self.path, avoid_recent=1, rng=rng)
+        self.assertEqual(picker.pick(12, recent=["B"]), "ランチ")
+        self.assertEqual(rng.seen, ["A", "C", "ランチ"])
+        # 全部が直近なら、除かずに全候補から選ぶ。
+        picker = QuotePicker(self.path, avoid_recent=10, rng=rng)
+        picker.pick(10, recent=["A", "B", "C"])
+        self.assertEqual(rng.seen, ["A", "B", "C"])
+
+    def test_seeded_picks_are_reproducible(self):
+        first = QuotePicker(self.path, rng=random.Random(42))
+        second = QuotePicker(self.path, rng=random.Random(42))
+        for hour in (None, 10, 12, 16, 12):
+            self.assertEqual(first.pick(hour), second.pick(hour))
+
     def test_empty_definition_raises(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = write_quotes(tmp, {"general": [], "by_hour": {"9": ["朝"]}})
@@ -179,11 +345,6 @@ class PickTest(unittest.TestCase):
             with self.assertRaises(QuoteError):
                 picker.pick(10)
             self.assertEqual(picker.pick(9), "朝")
-
-    def test_reload_picks_up_changes(self):
-        write_quotes(self.tmp.name, {"general": ["新しい"], "by_hour": {}})
-        self.picker.reload()
-        self.assertEqual(self.picker.pick(10), "新しい")
 
 
 class MisreadWordsTest(unittest.TestCase):
@@ -239,9 +400,7 @@ class FallbackQuotesTest(unittest.TestCase):
     """
 
     def test_every_fallback_quote_has_a_prerecorded_voice(self):
-        manifest_path = os.path.join(REPO_ROOT, "assets", "voice", "manifest.json")
-        with open(manifest_path, "r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
+        manifest = load_manifest()
         for quote in FALLBACK_QUOTES:
             self.assertIn(quote, manifest)
 

@@ -1,9 +1,8 @@
 """再生シーケンスの組み立て。
 
 イベント（時報／閉館放送）から、実際に再生する :class:`~chime.audio.Segment`
-の並びを作る。時報のあとに流す「天気予報／ひとこと」のおまけの組み立て
-（既定は ``weather_hours`` の時刻（12 時）だけ 天気予報 → ひとこと、それ以外は
-ひとことだけ。``mode="choice"`` なら抽選）もここで行う。
+の並びを作る。時報の放送は常に 時報音 → 時刻アナウンス → （``weather_hours``
+の時刻だけ）天気予報 → ひとこと の 1 経路で、抽選は行わない。
 
 天気取得や音声合成はここで完結させ、失敗しても本体（時報音・蛍の光）は
 必ず鳴るように、おまけ部分は欠落を許容する設計とする。部品（時刻アナウンス・
@@ -18,7 +17,6 @@ from __future__ import annotations
 
 import logging
 import os
-import random
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, List, Mapping, Optional, Sequence
@@ -26,15 +24,13 @@ from typing import Any, Callable, List, Mapping, Optional, Sequence
 from . import timesignal
 from .audio import Segment
 from .config import DEFAULT_CONFIG
+from .phrases import closing_extra_text
 from .quotes import QuoteError, QuotePicker
 from .scheduler import Event
 from .tts import TTSError, TTSService
 from .weather import WeatherError, WeatherService
 
 logger = logging.getLogger(__name__)
-
-EXTRA_WEATHER = "weather"
-EXTRA_QUOTE = "quote"
 
 
 @dataclass
@@ -93,25 +89,11 @@ def _resolve_weather_hours(settings: Mapping[str, Any]) -> set:
     return hours
 
 
-def choose_extra(hour: int, settings: Mapping[str, Any],
-                 rng: random.Random) -> Optional[str]:
-    """時報のあとに流す内容（天気予報／ひとこと）を抽選する。"""
-    if not settings.get("enabled", True):
-        return None
-    if hour in {int(h) for h in settings.get("always_weather_hours", []) or []}:
-        return EXTRA_WEATHER
-    if hour in {int(h) for h in settings.get("always_quote_hours", []) or []}:
-        return EXTRA_QUOTE
-    probability = float(settings.get("weather_probability", 0.0))
-    return EXTRA_WEATHER if rng.random() < probability else EXTRA_QUOTE
-
-
 class SequenceBuilder:
     """設定と各サービスから :class:`PlaybackPlan` を作る。"""
 
     def __init__(self, config, tts: TTSService, weather: WeatherService,
                  quotes: QuotePicker, state, time_signal_path: str,
-                 rng: Optional[random.Random] = None,
                  today_provider: Optional[Callable[[], date]] = None) -> None:
         self.config = config
         self.tts = tts
@@ -119,7 +101,6 @@ class SequenceBuilder:
         self.quotes = quotes
         self.state = state
         self.time_signal_path = time_signal_path
-        self.rng = rng or random.Random()
         # 天気予報の「今日」を決める手段。既定は OS のローカル日付だが、
         # スケジューリングは設定タイムゾーン（``ChimeApp.now()``）基準で動くため、
         # 呼び出し側（``ChimeApp``）はそちらの日付を渡すことで両者を一致させる。
@@ -136,25 +117,23 @@ class SequenceBuilder:
     def build_hourly(self, hour: int, event: Optional[Event] = None) -> PlaybackPlan:
         """時報（ポ・ポ・ポ・ポーン → 時刻読み上げ → おまけ）を組み立てる。
 
-        おまけ（``extra_segment``）は ``mode`` で分岐する。
-
-        - ``"both"``（既定） ``extra_segment.weather_hours`` に含まれる時刻
-          だけ 天気予報 → ひとこと の順に両方流す。含まれない時刻は
-          ひとことだけを流す（``WeatherService`` は呼ばない。毎正時に
-          無駄な HTTP リクエストが発生するのを避けるため）。天気を流す
-          時刻でも、その成否に関わらずひとことは必ず流す
-          （``_append_weather`` に ``fallback=False`` を渡し、失敗時に
-          「ひとこと」が二重に流れるのを防ぐ）。
-        - ``"choice"``       従来どおり :func:`choose_extra` の抽選結果で、
-          天気予報／ひとことのどちらか一方だけを流す。
-        - それ以外（設定ミス） 警告ログを出したうえで ``"both"`` として
-          扱う。放送そのものが設定ミスで壊れないようにするため。
+        おまけ（``extra_segment``）は 1 経路だけ。``extra_segment.weather_hours``
+        に含まれる時刻だけ 天気予報 → ひとこと の順に流し、含まれない時刻は
+        ひとことだけを流す（``WeatherService`` は呼ばない。毎正時に無駄な
+        HTTP リクエストが発生するのを避けるため）。天気を流す時刻でも、
+        その成否に関わらずひとことは必ず 1 つ流す。天気の取得に失敗しても
+        ひとことへ切り替えはしない（ここで切り替えると、この後の
+        ひとことと二重になるため）。``extra_segment.enabled`` が false なら
+        おまけは流さない。
 
         どの部品が壊れても、ほかの部品は残す。時報音の生成に失敗したときは
         既存のファイルを使い、ファイルも無ければ時報音だけを省く（必須
         セグメントを積むと、再生時の ``PlaybackError`` で全体が消えるため）。
         時刻アナウンスのテンプレートの書き間違いは既定の文言に戻す。
         天気・ひとことの想定外の例外は :func:`_guard` が受ける。
+
+        v6.0.0 で、抽選方式（``mode="choice"`` とその関連キー）は廃止した。
+        古い設定にそれらが残っていても読まない。
         """
         plan = PlaybackPlan(event=event)
         settings = self.config.section("time_signal")
@@ -164,20 +143,8 @@ class SequenceBuilder:
 
         extra_settings = self.config.section("extra_segment")
         if extra_settings.get("enabled", True):
-            mode = str(extra_settings.get("mode", "both") or "both")
-            if mode == "choice":
-                extra = _guard(plan, "おまけの選択", choose_extra, hour, extra_settings, self.rng)
-                if extra == EXTRA_WEATHER:
-                    _guard(plan, "天気予報", self._append_weather, plan, hour)
-                elif extra == EXTRA_QUOTE:
-                    _guard(plan, "ひとこと", self._append_quote, plan, hour)
-            else:
-                if mode != "both":
-                    logger.warning(
-                        "未知の extra_segment.mode です: %s。\"both\" として扱います。",
-                        mode)
-                _guard(plan, "天気予報", self._append_weather_if_due, plan, hour, extra_settings)
-                _guard(plan, "ひとこと", self._append_quote, plan, hour)
+            _guard(plan, "天気予報", self._append_weather_if_due, plan, hour, extra_settings)
+            _guard(plan, "ひとこと", self._append_quote, plan, hour)
         return plan
 
     def build_closing(self, event: Optional[Event] = None) -> PlaybackPlan:
@@ -187,12 +154,9 @@ class SequenceBuilder:
         ERROR で飛ばし、残りは鳴らす。
         """
         plan = PlaybackPlan(event=event)
-        announce = self.config.path("closing.announce_file")
-        music = self.config.path("closing.music_file")
-
-        self._append_audio_file(plan, announce, "閉館アナウンス")
+        self._append_closing_announce(plan)
         _guard(plan, "追加アナウンス", self._append_closing_text, plan)
-        self._append_closing_music(plan, music)
+        self._append_closing_music(plan)
         return plan
 
     def build_minimal(self, event: Event) -> PlaybackPlan:
@@ -206,9 +170,8 @@ class SequenceBuilder:
         if event.kind == "hourly":
             self._append_time_signal(plan, self.config.section("time_signal"))
         elif event.kind == "closing":
-            self._append_audio_file(
-                plan, self.config.path("closing.announce_file"), "閉館アナウンス")
-            self._append_closing_music(plan, self.config.path("closing.music_file"))
+            self._append_closing_announce(plan)
+            self._append_closing_music(plan)
         else:
             message = "未知のイベント種別です: {0}".format(event.kind)
             logger.error(message)
@@ -233,7 +196,7 @@ class SequenceBuilder:
 
     # -- 部品 -----------------------------------------------------------
     def _append_audio_file(self, plan: PlaybackPlan, path: str, label: str,
-                           fade_in_ms: int = 0) -> bool:
+                           fade_in_ms: int = 0) -> None:
         """音源ファイルがあれば積む。無ければ ERROR で飛ばす（積まない）。
 
         必須セグメントのファイルが欠けていると、再生時の ``PlaybackError``
@@ -241,14 +204,13 @@ class SequenceBuilder:
         パスが空文字列なら「設定しない」の意味なので、黙って積まない。
         """
         if not path:
-            return False
+            return
         if not os.path.exists(path):
             message = "音源ファイルが見つかりません: {0}".format(path)
             logger.error(message)
             plan.warnings.append(message)
-            return False
+            return
         plan.segments.append(Segment(path, label=label, fade_in_ms=fade_in_ms))
-        return True
 
     def _append_time_signal(self, plan: PlaybackPlan, settings: Mapping[str, Any]) -> None:
         """時報音（ポ・ポ・ポ・ポーン）を積む。生成に失敗しても既存のファイルを使う。"""
@@ -283,24 +245,30 @@ class SequenceBuilder:
     def _append_weather_if_due(self, plan: PlaybackPlan, hour: int,
                                extra_settings: Mapping[str, Any]) -> None:
         if hour in _resolve_weather_hours(extra_settings):
-            self._append_weather(plan, hour, fallback=False)
+            self._append_weather(plan)
+
+    def _append_closing_announce(self, plan: PlaybackPlan) -> None:
+        self._append_audio_file(
+            plan, self.config.path("closing.announce_file"), "閉館アナウンス")
 
     def _append_closing_text(self, plan: PlaybackPlan) -> None:
-        extra_text = str(self.config.get("closing.extra_text", "") or "")
+        # 作り置きの列挙（chime.phrases）と同じ読み出しを使う。読み方が食い違うと、
+        # 作り置きに無い文言を読もうとして無音になる。
+        extra_text = closing_extra_text(self.config)
         if extra_text:
             self._append_speech(plan, extra_text, "追加アナウンス")
 
     def _closing_fade_in_ms(self) -> int:
         return int(self.config.get("audio.fade_in_ms", 2000))
 
-    def _append_closing_music(self, plan: PlaybackPlan, music: str) -> None:
+    def _append_closing_music(self, plan: PlaybackPlan) -> None:
         # フェードインの設定が壊れていても、音楽は鳴らす（フェードだけ省く）。
         fade_in_ms = _guard(plan, "フェードイン時間", self._closing_fade_in_ms) or 0
         self._append_audio_file(
-            plan, music, "蛍の光（{0}ms フェードイン）".format(fade_in_ms), fade_in_ms)
+            plan, self.config.path("closing.music_file"),
+            "蛍の光（{0}ms フェードイン）".format(fade_in_ms), fade_in_ms)
 
-    def _append_speech(self, plan: PlaybackPlan, text: str, label: str,
-                       optional: bool = True) -> bool:
+    def _append_speech(self, plan: PlaybackPlan, text: str, label: str) -> bool:
         if not text:
             return False
         try:
@@ -310,12 +278,14 @@ class SequenceBuilder:
             logger.error(message)
             plan.warnings.append(message)
             return False
+        # 読み上げは欠けても放送全体を止めない（無音になるだけ）ので常に optional。
+        # 必須なのは時報音と閉館の音源（_append_audio_file）だけ。
         plan.segments.append(Segment(path, label="{0}「{1}」".format(label, text),
-                                     optional=optional))
+                                     optional=True))
         plan.spoken.append(text)
         return True
 
-    def _append_weather(self, plan: PlaybackPlan, hour: int, fallback: bool = True) -> None:
+    def _append_weather(self, plan: PlaybackPlan) -> None:
         """天気予報を、地点の順に文ごと独立したセグメントとして積む。
 
         作り置き音声は文単位で用意されているため、複数文を 1 つの文字列に
@@ -323,22 +293,18 @@ class SequenceBuilder:
         ``describe_sentences()`` が返す各文を
         そのまま ``_append_speech`` に渡し、1 文 1 セグメントにする。
 
-        ``fallback`` は ``extra_segment.mode == "choice"`` のときだけ効く
-        （``fallback_to_quote`` 設定を見て「ひとこと」に切り替える）。
-        ``mode == "both"`` では呼び出し側（``build_hourly``）がこの後で
-        必ず ``_append_quote`` を呼ぶため、ここでも「ひとこと」へ落とすと
-        二重に流れてしまう。そのため ``build_hourly`` は ``mode == "both"``
-        のとき ``fallback=False`` を渡し、失敗時は警告を積むだけに留める。
+        取得に失敗したら警告を積むだけで、「ひとこと」へは切り替えない。
+        呼び出し側（``build_hourly``）がこの後で必ず ``_append_quote`` を
+        呼ぶので、ここで流すと二重になる。``weather.enabled`` が false の
+        ときも ``WeatherService`` が ``WeatherError`` を送出するので、
+        同じ警告になる。
         """
-        settings = self.config.section("extra_segment")
         try:
             sentences = self.weather.describe_sentences(today=self.today_provider())
         except WeatherError as exc:
             message = "天気予報を取得できませんでした: {0}".format(exc)
             logger.warning(message)
             plan.warnings.append(message)
-            if fallback and settings.get("fallback_to_quote", True):
-                self._append_quote(plan, hour)
             return
 
         total = len(sentences)
@@ -347,7 +313,7 @@ class SequenceBuilder:
             self._append_speech(plan, sentence, label)
 
     def _append_quote(self, plan: PlaybackPlan, hour: int) -> None:
-        recent = self.state.recent_quotes() if self.state else []
+        recent = self.state.recent_quotes()
         try:
             quote = self.quotes.pick(hour, recent)
         except QuoteError as exc:

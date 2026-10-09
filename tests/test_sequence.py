@@ -2,27 +2,33 @@
 
 from __future__ import annotations
 
-import contextlib
 import http.client
-import json
-import logging
 import os
-import random
 import tempfile
 import unittest
 from datetime import date
 from unittest import mock
 
-from tests.support import REPO_ROOT, load_fixture  # noqa: F401
+from tests.support import (REPO_ROOT, SHIPPED_QUOTES, load_fixture, logs_enabled, make_event,
+                           urlopen_response)
 
+from chime import phrases
 from chime.config import DEFAULT_CONFIG, Config
 from chime.quotes import QuotePicker
-from chime.sequence import EXTRA_QUOTE, EXTRA_WEATHER, SequenceBuilder, choose_extra
+from chime.sequence import SequenceBuilder
 from chime.state import State
 from chime.tts import TTSError
 from chime.weather import WeatherError, WeatherService
 
-EXTRA = DEFAULT_CONFIG["extra_segment"]
+#: 6.0.0 で廃止した extra_segment のキー。古い config.json に残っていても
+#: 放送の組み立てには一切影響しない（起動時に警告して無視するだけ）。
+LEGACY_EXTRA_SEGMENT_KEYS = {
+    "mode": "choice",
+    "weather_probability": 1.0,
+    "always_weather_hours": [10],
+    "always_quote_hours": [12],
+    "fallback_to_quote": True,
+}
 
 #: StubWeather の既定の読み上げ文。複数地点（大津・京都）を設定した場合を模した
 #: 4 要素（2 地点 × 2 文（現在の天気／気温））。既定（大津の 1 地点）では 2 文。
@@ -33,52 +39,6 @@ DEFAULT_WEATHER_SENTENCES = [
     "今の京都の天気はくもりなのだ。",
     "気温は29度なのだ。",
 ]
-
-
-class FixedRandom(random.Random):
-    """``random()`` が常に決まった値を返す乱数。"""
-
-    def __init__(self, value):
-        super().__init__(0)
-        self.value = value
-
-    def random(self):
-        return self.value
-
-
-class ChooseExtraTest(unittest.TestCase):
-    def test_disabled_returns_none(self):
-        self.assertIsNone(choose_extra(11, dict(EXTRA, enabled=False), FixedRandom(0.0)))
-
-    def test_always_weather_hours_win(self):
-        settings = dict(EXTRA, always_weather_hours=[10], weather_probability=0.0)
-        self.assertEqual(choose_extra(10, settings, FixedRandom(0.99)), EXTRA_WEATHER)
-
-    def test_always_quote_hours_win(self):
-        settings = dict(EXTRA, always_quote_hours=[15], weather_probability=1.0)
-        self.assertEqual(choose_extra(15, settings, FixedRandom(0.0)), EXTRA_QUOTE)
-
-    def test_probability_boundary(self):
-        settings = dict(EXTRA, always_weather_hours=[], weather_probability=0.4)
-        self.assertEqual(choose_extra(11, settings, FixedRandom(0.39)), EXTRA_WEATHER)
-        self.assertEqual(choose_extra(11, settings, FixedRandom(0.40)), EXTRA_QUOTE)
-
-    def test_zero_probability_is_always_quote(self):
-        settings = dict(EXTRA, always_weather_hours=[], weather_probability=0.0)
-        for value in (0.0, 0.5, 0.999):
-            self.assertEqual(choose_extra(11, settings, FixedRandom(value)), EXTRA_QUOTE)
-
-    def test_default_extra_settings_choose_quote_when_mode_is_choice(self):
-        # choose_extra() 自体は mode="choice" 運用のための抽選関数で、
-        # "mode" キーそのものは見ない。既定の weather_probability は 0.0 の
-        # ままなので、運用者が mode="choice" に切り替えた場合の既定挙動は
-        # 「常にひとこと」になることを回帰確認する。
-        #
-        # 実際の既定運用（mode="both"）では天気予報とひとことの両方が必ず
-        # 流れる。それは BuildHourlyTest 側で確認する。
-        for hour in range(24):
-            for value in (0.0, 0.4, 0.5, 0.999):
-                self.assertEqual(choose_extra(hour, EXTRA, FixedRandom(value)), EXTRA_QUOTE)
 
 
 class StubTTS:
@@ -130,23 +90,33 @@ class BuilderTestCase(unittest.TestCase):
                 handle.write(b"RIFF")
 
         self.config = Config(DEFAULT_CONFIG, base_dir=root)
+        # 時報音は呼び出しのたびに本物の生成器で作る（4 秒）。既定の 44.1 kHz /
+        # ステレオだと、テストごとに数十 ms かかって全体の大半を占める。組み立ての
+        # テストは WAV の中身を見ないので、軽い形式にする。WAV の形式そのもの
+        # （標本化周波数・チャンネル数）は tests/test_timesignal.py が固定している。
+        self.config.data["audio"]["mixer"].update(frequency=8000, channels=1)
         self.tts = StubTTS(root)
         self.weather = StubWeather()
-        self.quotes = QuotePicker(os.path.join(REPO_ROOT, "assets", "quotes.json"))
+        self.quotes = QuotePicker(SHIPPED_QUOTES)
         self.state = State(os.path.join(root, "cache", "state.json"))
         self.time_signal = os.path.join(root, "assets", "generated", "time_signal.wav")
 
     def tearDown(self):
         self.tmp.cleanup()
 
-    def make_builder(self, rng=None, tts=None, weather=None, today_provider=None):
+    def make_builder(self, tts=None, weather=None, today_provider=None):
         return SequenceBuilder(self.config, tts or self.tts, weather or self.weather,
                                self.quotes, self.state, self.time_signal,
-                               rng or FixedRandom(0.99),
                                today_provider=today_provider)
 
     def labels(self, plan):
         return [segment.label for segment in plan.segments]
+
+    def quote_labels(self, plan):
+        return [label for label in self.labels(plan) if "ひとこと" in label]
+
+    def weather_labels(self, plan):
+        return [label for label in self.labels(plan) if "天気予報" in label]
 
 
 class BuildHourlyTest(BuilderTestCase):
@@ -168,43 +138,55 @@ class BuildHourlyTest(BuilderTestCase):
         self.assertIn("正午をお知らせしたのだ。", plan.spoken)
 
     def test_quote_is_appended(self):
-        # mode="choice" のとき、既定の weather_probability は 0.0 のため、
-        # rng の値によらず「ひとこと」が選ばれる。
-        self.config.data["extra_segment"]["mode"] = "choice"
+        # 11 時は weather_hours の外。時報音 + 時刻 + ひとこと の 3 個になる。
         plan = self.make_builder().build_hourly(11)
         self.assertEqual(len(plan.segments), 3)
         self.assertIsNotNone(plan.quote)
         self.assertIn(plan.quote, plan.spoken)
 
-    def force_weather_selection(self):
-        """既定は mode="both"（天気予報とひとこと両方を流す）のため、
-        choose_extra による排他選択の経路そのものを検証するテストでは、
-        ここで明示的に mode="choice" にしたうえで weather_probability を
-        1.0 にして天気予報が選ばれるようにする。"""
-        self.config.data["extra_segment"]["mode"] = "choice"
-        self.config.data["extra_segment"]["weather_probability"] = 1.0
-
-    # -- mode="both"（既定） ---------------------------------------------
-
     def test_weather_hours_get_weather_then_quote(self):
-        """既定設定（config.json を作らない場合、mode="both"）では、
-        ``extra_segment.weather_hours``（既定は 12 時だけ）に含まれる
-        時刻だけ、時報のあとに天気予報（複数文）→ ひとこと の順に両方流れる
-        こと（天気は 12 時の 1 回だけ、という v5.1.0 の方針を回帰確認する）。
+        """``extra_segment.weather_hours``（既定は 12 時だけ）に含まれる
+        時刻だけ、時報のあとに天気予報（複数文）→ ひとこと の順に流れること
+        （天気は 12 時の 1 回だけ、という v5.1.0 の方針を回帰確認する）。
+        ひとことは天気の成否に関わらず、毎回ちょうど 1 つ。
 
         スタブが 4 文返す場合、セグメントは
         時報音 1 + 時刻 1 + 天気 4 + ひとこと 1 = 7 個になる。
         """
-        for hour in (12,):
-            with self.subTest(hour=hour):
-                weather = StubWeather()
-                builder = self.make_builder(weather=weather)
-                plan = builder.build_hourly(hour)
-                self.assertEqual(weather.calls, 1)
-                self.assertEqual(len(plan.segments), 2 + len(weather.sentences) + 1)
-                self.assertIsNotNone(plan.quote)
-                for sentence in weather.sentences:
-                    self.assertIn(sentence, plan.spoken)
+        weather = StubWeather()
+        plan = self.make_builder(weather=weather).build_hourly(12)
+        self.assertEqual(weather.calls, 1)
+        self.assertEqual(len(plan.segments), 2 + len(weather.sentences) + 1)
+        self.assertIsNotNone(plan.quote)
+        # 読み上げの順序は 時刻 → 天気（地点の順） → ひとこと。
+        self.assertEqual(plan.spoken,
+                         ["正午をお知らせしたのだ。"] + weather.sentences + [plan.quote])
+        self.assertEqual(len(self.quote_labels(plan)), 1)
+
+    def test_speech_segments_are_optional_and_the_time_signal_is_required(self):
+        """読み上げのセグメントは optional=True、時報音は optional=False であること。
+
+        読み上げの WAV が 1 つ欠けても、無音になるのはその 1 文だけで済ませたい。
+        ``Player.play`` は欠けた optional セグメントを飛ばすが、必須セグメントが
+        欠けると ``PlaybackError`` を送出する。読み上げを必須にしてしまうと、
+        音声ファイル 1 つの欠落で放送全体（時報音も含む）が鳴らなくなる。
+        """
+        # 12 時は天気を流す時刻。時報音 + 時刻 + 天気（複数文）+ ひとこと が揃う。
+        plan = self.make_builder().build_hourly(12)
+        self.assertEqual(len(plan.segments), 2 + len(self.weather.sentences) + 1)
+
+        time_signal, speech = plan.segments[0], plan.segments[1:]
+        self.assertIn("時報音", time_signal.label)
+        self.assertFalse(time_signal.optional, "時報音は必須セグメントのはず")
+
+        # 読み上げの数は plan.spoken と一致する（時刻 + 天気の各文 + ひとこと）。
+        self.assertEqual(len(speech), len(plan.spoken))
+        self.assertEqual(speech[0].label, "時刻アナウンス「正午をお知らせしたのだ。」")
+        self.assertEqual(len(self.weather_labels(plan)), len(self.weather.sentences))
+        self.assertEqual(len(self.quote_labels(plan)), 1)
+        for segment in speech:
+            with self.subTest(label=segment.label):
+                self.assertTrue(segment.optional, "読み上げは optional のはず")
 
     def test_non_weather_hours_get_quote_only_and_never_call_weather(self):
         """``weather_hours`` に無い時刻（既定では 10/11/13/14/15/16 時）は、天気を
@@ -220,8 +202,7 @@ class BuildHourlyTest(BuilderTestCase):
                 self.assertEqual(weather.calls, 0)
                 self.assertEqual(len(plan.segments), 3)
                 self.assertIsNotNone(plan.quote)
-                weather_labels = [label for label in self.labels(plan) if "天気予報" in label]
-                self.assertEqual(weather_labels, [])
+                self.assertEqual(self.weather_labels(plan), [])
 
     def test_empty_weather_hours_never_plays_weather(self):
         # weather_hours を空リストにすると、設定で天気だけ止められる
@@ -251,22 +232,6 @@ class BuildHourlyTest(BuilderTestCase):
 
         self.assertEqual(weather.calls, 1)
 
-    def test_choice_mode_does_not_consult_weather_hours(self):
-        # mode="choice" では weather_hours を一切参照せず、従来どおり
-        # choose_extra() の抽選結果だけで天気予報／ひとことが決まること。
-        # weather_hours を空にしても、choice モードでは影響しない。
-        self.config.data["extra_segment"]["mode"] = "choice"
-        self.config.data["extra_segment"]["weather_probability"] = 1.0
-        self.config.data["extra_segment"]["weather_hours"] = []
-        weather = StubWeather()
-        # 11 時は weather_hours が空でも対象外だが、choice モードでは
-        # weather_probability=1.0 なので天気予報が選ばれるはず。
-        plan = self.make_builder(rng=FixedRandom(0.0), weather=weather).build_hourly(11)
-        self.assertEqual(weather.calls, 1)
-        for sentence in weather.sentences:
-            self.assertIn(sentence, plan.spoken)
-        self.assertIsNone(plan.quote)
-
     def test_weather_sentences_are_appended_as_separate_segments(self):
         # 天気の各文が 1 つの文字列に連結されず、文ごとに独立したセグメント
         # として積まれること（作り置き音声は文単位のため、連結すると
@@ -288,104 +253,124 @@ class BuildHourlyTest(BuilderTestCase):
         self.assertEqual(len(set(weather_labels)), len(weather_labels),
                          "天気の各セグメントのラベルは重複しないはず")
 
-    def test_weather_failure_does_not_prevent_the_quote_in_both_mode(self):
-        # 天気が全滅（WeatherError）しても、ひとことは必ず流れること。
-        # かつ、ひとことが 2 つ流れないこと（mode="both" では
-        # _append_weather(fallback=False) のため、ここでの失敗はひとことへ
-        # 二重に落とさない）。12 時は既定の weather_hours に含まれる時刻。
+    def test_weather_failure_adds_a_warning_but_no_second_quote(self):
+        # 天気が全滅（WeatherError）しても、ひとことは必ず 1 つ流れること。
+        # 天気の失敗を「ひとこと」で埋めると、その後の通常のひとことと
+        # 二重になるので、ここでは警告を積むだけ。
+        # 12 時は既定の weather_hours に含まれる時刻。
         builder = self.make_builder(weather=StubWeather(fail=True))
         plan = builder.build_hourly(12)
 
         self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
         self.assertIsNotNone(plan.quote)
         self.assertTrue(any("天気予報を取得できませんでした" in w for w in plan.warnings))
+        self.assertEqual(len(self.quote_labels(plan)), 1, "ひとことが2つ流れてはいけない")
 
-        quote_labels = [label for label in self.labels(plan) if "ひとこと" in label]
-        self.assertEqual(len(quote_labels), 1, "ひとことが2つ流れてはいけない")
-
-    def test_unknown_mode_falls_back_to_both_and_logs_a_warning(self):
-        self.config.data["extra_segment"]["mode"] = "surprise"
-        # tests/__init__.py がテスト全体でログを抑制している（logging.disable
-        # (logging.CRITICAL)）ため、assertLogs で拾えるよう tests/test_cli.py
-        # と同じ手順でこのテストの間だけ一時的に解除する。
-        logging.disable(logging.NOTSET)
-        try:
-            with self.assertLogs("chime.sequence", level="WARNING") as cm:
-                # 12 時は既定の weather_hours に含まれる時刻。
-                plan = self.make_builder().build_hourly(12)
-        finally:
-            logging.disable(logging.CRITICAL)
-        self.assertTrue(any("mode" in message for message in cm.output))
-        self.assertEqual(len(plan.segments), 2 + len(self.weather.sentences) + 1)
-        self.assertIsNotNone(plan.quote)
-        for sentence in self.weather.sentences:
-            self.assertIn(sentence, plan.spoken)
-
-    # -- mode="choice"（従来どおりの排他選択） ----------------------------
-
-    def test_weather_is_appended(self):
-        self.force_weather_selection()
-        plan = self.make_builder(rng=FixedRandom(0.0)).build_hourly(11)
-        self.assertEqual(self.weather.calls, 1)
-        for sentence in self.weather.sentences:
-            self.assertIn(sentence, plan.spoken)
-        self.assertIsNone(plan.quote)
-
-    def test_always_weather_hours_setting_forces_weather(self):
-        # 既定では always_weather_hours は空だが、mode="choice" で設定すれば
-        # その時刻は weather_probability に関わらず必ず天気予報になること。
-        self.config.data["extra_segment"]["mode"] = "choice"
-        self.config.data["extra_segment"]["always_weather_hours"] = [10]
-        plan = self.make_builder(rng=FixedRandom(0.99)).build_hourly(10)
-        for sentence in self.weather.sentences:
-            self.assertIn(sentence, plan.spoken)
-        self.assertIsNone(plan.quote)
+    def test_weather_disabled_adds_a_warning_and_keeps_the_quote(self):
+        # weather.enabled=false でも weather_hours の時刻には WeatherService を
+        # 呼ぶ（無効の判断は WeatherService の側）。その WeatherError が
+        # 「取得できませんでした」の警告になり、ひとことは 1 つだけ残る。
+        self.config.data["weather"]["enabled"] = False
+        weather = WeatherService(self.config.section("weather"))
+        with mock.patch("chime.weather.urllib.request.urlopen") as urlopen:
+            plan = self.make_builder(weather=weather).build_hourly(12)
+        urlopen.assert_not_called()
+        self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
+        self.assertEqual(self.weather_labels(plan), [])
+        self.assertEqual(len(self.quote_labels(plan)), 1)
+        self.assertTrue(any("天気予報を取得できませんでした" in w and "無効化" in w
+                            for w in plan.warnings))
 
     def test_weather_uses_the_configured_today_provider(self):
         # スケジューリングは設定タイムゾーン基準（ChimeApp.now().date()）で動くため、
         # 天気の「今日」判定も OS のローカル日付ではなく today_provider に従うこと。
         # OS のローカル日付とは絶対に一致しないよう、遠い未来日を注入して確認する。
-        self.force_weather_selection()
         injected_today = date(2099, 1, 1)
         self.assertNotEqual(injected_today, date.today())
-        builder = self.make_builder(rng=FixedRandom(0.0),
-                                    today_provider=lambda: injected_today)
-        builder.build_hourly(11)
+        builder = self.make_builder(today_provider=lambda: injected_today)
+        builder.build_hourly(12)
         self.assertEqual(self.weather.received_today, [injected_today])
 
     def test_weather_defaults_to_os_local_today_without_a_provider(self):
         # today_provider を渡さない既存の呼び出し方でも壊れず、
         # 従来どおり OS のローカル日付が使われること。
-        self.force_weather_selection()
-        builder = self.make_builder(rng=FixedRandom(0.0), today_provider=None)
-        builder.build_hourly(11)
+        builder = self.make_builder(today_provider=None)
+        builder.build_hourly(12)
         self.assertEqual(self.weather.received_today, [date.today()])
 
-    def test_weather_failure_falls_back_to_a_quote(self):
-        # mode="choice" のときだけ、天気の失敗が fallback_to_quote に従って
-        # 「ひとこと」に切り替わる。
-        self.force_weather_selection()
-        builder = self.make_builder(rng=FixedRandom(0.0),
-                                    weather=StubWeather(fail=True))
-        plan = builder.build_hourly(11)
-        self.assertIsNotNone(plan.quote)
-        self.assertTrue(any("天気予報を取得できませんでした" in w for w in plan.warnings))
+    # -- 廃止したキー（v6.0.0） --------------------------------------------------
+
+    def use_legacy_keys(self, legacy):
+        """extra_segment を「既定 + 廃止キー」にする（変種どうしが混ざらないよう作り直す）。"""
+        self.config.data["extra_segment"] = dict(DEFAULT_CONFIG["extra_segment"], **legacy)
+
+    def legacy_variants(self):
+        """古い config.json に残りうる extra_segment の廃止キーの組み合わせ。"""
+        return {
+            "legacy": dict(LEGACY_EXTRA_SEGMENT_KEYS),
+            # 未知の mode は以前は警告つきで "both" 扱いだった。今は読まない。
+            "unknown-mode": {"mode": "surprise"},
+            # 読んでいたら ValueError / TypeError になる値でも、読まなければ無害。
+            "garbage": {"mode": 42, "weather_probability": "たくさん",
+                        "always_weather_hours": "x", "always_quote_hours": None,
+                        "fallback_to_quote": "?"},
+        }
+
+    def test_legacy_extra_segment_keys_are_ignored_in_a_non_weather_hour(self):
+        # always_weather_hours=[10] / weather_probability=1.0 は効かない。
+        # 10 時は天気を流さず（WeatherService も呼ばず）、ひとこと 1 つだけ。
+        for name, legacy in self.legacy_variants().items():
+            with self.subTest(variant=name):
+                self.use_legacy_keys(legacy)
+                weather = StubWeather()
+                with mock.patch("chime.sequence.logger") as log:
+                    plan = self.make_builder(weather=weather).build_hourly(10)
+                self.assertEqual(weather.calls, 0)
+                self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
+                self.assertEqual(self.weather_labels(plan), [])
+                self.assertEqual(len(self.quote_labels(plan)), 1)
+                self.assertIsNotNone(plan.quote)
+                self.assertEqual(plan.warnings, [])
+                log.warning.assert_not_called()
+
+    def test_legacy_extra_segment_keys_are_ignored_in_the_weather_hour(self):
+        # always_quote_hours=[12] は効かない。12 時は天気 → ひとこと のまま。
+        for name, legacy in self.legacy_variants().items():
+            with self.subTest(variant=name):
+                self.use_legacy_keys(legacy)
+                weather = StubWeather()
+                plan = self.make_builder(weather=weather).build_hourly(12)
+                self.assertEqual(weather.calls, 1)
+                self.assertEqual(
+                    plan.spoken,
+                    ["正午をお知らせしたのだ。"] + weather.sentences + [plan.quote])
+                self.assertEqual(len(self.quote_labels(plan)), 1)
+                self.assertEqual(plan.warnings, [])
+
+    def test_legacy_extra_segment_keys_do_not_turn_a_weather_failure_into_a_quote(self):
+        # fallback_to_quote=true は効かない。天気が失敗しても、ひとことは
+        # 通常の 1 つだけ（天気の代わりの 2 つめは出ない）。
+        for name, legacy in self.legacy_variants().items():
+            with self.subTest(variant=name):
+                self.use_legacy_keys(legacy)
+                weather = StubWeather(fail=True)
+                plan = self.make_builder(weather=weather).build_hourly(12)
+                self.assertEqual(weather.calls, 1)
+                self.assertEqual(len(plan.segments), 3)  # 時報音 + 時刻 + ひとこと
+                self.assertEqual(len(self.quote_labels(plan)), 1)
+                self.assertTrue(any("天気予報を取得できませんでした" in w
+                                    for w in plan.warnings))
 
     def test_extra_can_be_disabled(self):
-        self.config.data["extra_segment"]["enabled"] = False
-        plan = self.make_builder().build_hourly(11)
-        self.assertEqual(len(plan.segments), 2)
-        self.assertEqual(self.weather.calls, 0)
-        self.assertIsNone(plan.quote)
-
-    def test_extra_can_be_disabled_in_choice_mode_too(self):
-        # enabled=False は mode に関わらず、どちらの mode でもおまけを出さない。
-        self.config.data["extra_segment"]["mode"] = "choice"
-        self.config.data["extra_segment"]["enabled"] = False
-        plan = self.make_builder().build_hourly(11)
-        self.assertEqual(len(plan.segments), 2)
-        self.assertEqual(self.weather.calls, 0)
-        self.assertIsNone(plan.quote)
+        # 天気を流す 12 時でも、おまけ全体が止まる（時報音 + 時刻だけ）。
+        for hour in (11, 12):
+            with self.subTest(hour=hour):
+                self.config.data["extra_segment"]["enabled"] = False
+                weather = StubWeather()
+                plan = self.make_builder(weather=weather).build_hourly(hour)
+                self.assertEqual(len(plan.segments), 2)
+                self.assertEqual(weather.calls, 0)
+                self.assertIsNone(plan.quote)
 
     def test_pips_still_play_when_tts_is_broken(self):
         """音声合成が壊れていても、時報音そのものは必ず鳴る。"""
@@ -410,10 +395,9 @@ class BuildHourlyTest(BuilderTestCase):
         self.assertFalse(os.path.exists(self.state.path))
 
     def test_recent_quotes_are_not_repeated(self):
-        # mode="both"（既定）でも、天気とは独立に「ひとこと」が毎回別のものに
-        # なること。記録は build の外（再生後）で行うので、ここでは
-        # remember_quote を自分で呼ぶ。
-        builder = self.make_builder(rng=FixedRandom(0.99))
+        # 天気とは独立に「ひとこと」が毎回別のものになること。記録は
+        # build の外（再生後）で行うので、ここでは remember_quote を自分で呼ぶ。
+        builder = self.make_builder()
         picked = set()
         for _ in range(5):
             quote = builder.build_hourly(11).quote
@@ -423,7 +407,7 @@ class BuildHourlyTest(BuilderTestCase):
 
     def test_recent_quotes_in_the_state_are_still_read(self):
         # 記録済みの文は、build が state から読んで避けること。
-        builder = self.make_builder(rng=FixedRandom(0.99))
+        builder = self.make_builder()
         first = builder.build_hourly(11).quote
         self.state.remember_quote(first)
         for _ in range(5):
@@ -448,6 +432,28 @@ class BuildClosingTest(BuilderTestCase):
         self.assertEqual(len(plan.segments), 3)
         self.assertIn("本日もご利用ありがとうございました。", plan.spoken)
 
+    def test_closing_extra_text_is_optional_and_the_audio_files_are_required(self):
+        """追加アナウンス（読み上げ）は optional=True、閉館アナウンスと蛍の光の
+        音源ファイルは optional=False であること。
+
+        追加アナウンスの WAV が欠けても、無音になるのはその 1 文だけで済ませたい。
+        ``Player.play`` は欠けた optional セグメントを飛ばすが、必須セグメントが
+        欠けると ``PlaybackError`` を送出する。読み上げを必須にすると、
+        音声ファイル 1 つの欠落で閉館放送（蛍の光も含む）全体が鳴らなくなる。
+        """
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        plan = self.make_builder().build_closing()
+
+        self.assertEqual(len(plan.segments), 3)
+        announce, extra, music = plan.segments
+        self.assertIn("閉館アナウンス", announce.label)
+        self.assertIn("追加アナウンス", extra.label)
+        self.assertIn("蛍の光", music.label)
+
+        self.assertFalse(announce.optional, "閉館アナウンスは必須セグメントのはず")
+        self.assertTrue(extra.optional, "追加アナウンス（読み上げ）は optional のはず")
+        self.assertFalse(music.optional, "蛍の光は必須セグメントのはず")
+
     def test_closing_never_includes_weather(self):
         """利用者の「17 時には流さない」という要望は、確認したところ
         時報（``build_hourly``）とは別経路の閉館放送（16:57、アナウンスが
@@ -461,17 +467,6 @@ class BuildClosingTest(BuilderTestCase):
         self.assertIn("閉館アナウンス", plan.segments[0].label)
         self.assertIn("蛍の光", plan.segments[1].label)
         self.assertEqual(weather.calls, 0, "閉館放送で WeatherService を呼んではいけない")
-
-
-@contextlib.contextmanager
-def logs_enabled(logger_name, level):
-    """tests/__init__.py が止めているログを、このブロックの間だけ拾えるようにする。"""
-    logging.disable(logging.NOTSET)
-    try:
-        with unittest.TestCase().assertLogs(logger_name, level=level) as captured:
-            yield captured
-    finally:
-        logging.disable(logging.CRITICAL)
 
 
 class ExplodingTTS(StubTTS):
@@ -502,25 +497,11 @@ class ExplodingQuotes:
         raise self.error
 
 
-def open_meteo_response(body=None, read_error=None):
-    """``urlopen`` が返す応答のモック（``with`` で使え、``read()`` が本文か例外を返す）。"""
-    response = mock.MagicMock()
-    response.__enter__.return_value = response
-    if read_error is not None:
-        response.read.side_effect = read_error
-    else:
-        response.read.return_value = json.dumps(body).encode("utf-8")
-    return response
-
-
 class DegradeHourlyTest(BuilderTestCase):
     """時報の一部品が壊れても、残りの部品は必ず鳴ること。"""
 
     def assert_time_signal_first(self, plan):
         self.assertIn("時報音", self.labels(plan)[0])
-
-    def quote_labels(self, plan):
-        return [label for label in self.labels(plan) if "ひとこと" in label]
 
     # -- 天気 ---------------------------------------------------------------
     def test_incomplete_read_from_the_real_weather_service_keeps_every_other_part(self):
@@ -528,7 +509,7 @@ class DegradeHourlyTest(BuilderTestCase):
         # （http.client.IncompleteRead は OSError ではない）。
         # 本物の WeatherService と urlopen のモックで確かめる。
         weather = WeatherService(self.config.section("weather"))
-        response = open_meteo_response(read_error=http.client.IncompleteRead(b"{\"cur", 300))
+        response = urlopen_response(read_error=http.client.IncompleteRead(b"{\"cur", 300))
         with mock.patch("chime.weather.urllib.request.urlopen", return_value=response):
             plan = self.make_builder(weather=weather).build_hourly(12)
 
@@ -554,7 +535,7 @@ class DegradeHourlyTest(BuilderTestCase):
         weather = WeatherService(self.config.section("weather"))
         payload = load_fixture("open_meteo.json")
         with mock.patch("chime.weather.urllib.request.urlopen",
-                        return_value=open_meteo_response(payload)):
+                        return_value=urlopen_response(payload)):
             plan = self.make_builder(weather=weather).build_hourly(12)
         self.assertEqual(len(plan.segments), 3)
         self.assertIsNotNone(plan.quote)
@@ -615,30 +596,24 @@ class DegradeHourlyTest(BuilderTestCase):
                 self.assertTrue(any(
                     "ひとこと" in w and "この部分だけ飛ばします" in w for w in plan.warnings))
 
-    def test_unexpected_exception_in_choice_mode_keeps_the_other_parts(self):
-        # mode="choice"（次の版で削除予定）の分岐も、部品ごとに守られていること。
-        self.config.data["extra_segment"]["mode"] = "choice"
-        builder = self.make_builder(rng=FixedRandom(0.99))
+    def test_weather_and_quote_both_failing_keep_the_time_signal_and_the_announcement(self):
+        # 天気とひとこと、どちらも想定外の例外を出しても、時報音と時刻
+        # アナウンスは残る。部品ごとに別々の警告が積まれる（1 つめの失敗が
+        # 2 つめの組み立てを巻き込まない）。
+        builder = self.make_builder(weather=ExplodingWeather(RuntimeError("想定外")))
         builder.quotes = ExplodingQuotes(RuntimeError("想定外"))
-        plan = builder.build_hourly(11)
+        plan = builder.build_hourly(12)
         self.assert_time_signal_first(plan)
-        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
+        self.assertEqual(plan.spoken, ["正午をお知らせしたのだ。"])
         self.assertEqual(len(plan.segments), 2)
-        self.assertTrue(plan.warnings)
-
-    def test_unexpected_exception_in_extra_selection_keeps_the_other_parts(self):
-        # weather_probability が数値でない（設定ミス）と choose_extra が ValueError。
-        self.config.data["extra_segment"]["mode"] = "choice"
-        self.config.data["extra_segment"]["weather_probability"] = "たくさん"
-        plan = self.make_builder().build_hourly(11)
-        self.assert_time_signal_first(plan)
-        self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
-        self.assertEqual(len(plan.segments), 2)
-        self.assertTrue(plan.warnings)
+        self.assertIsNone(plan.quote)
+        self.assertEqual(builder.quotes.calls, 1)
+        self.assertTrue(any("天気予報の組み立てに失敗しました" in w for w in plan.warnings))
+        self.assertTrue(any("ひとことの組み立てに失敗しました" in w for w in plan.warnings))
 
     def test_guarded_failures_are_logged_with_a_traceback(self):
         builder = self.make_builder(weather=ExplodingWeather(RuntimeError("想定外")))
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             builder.build_hourly(12)
         self.assertTrue(any("天気予報" in line for line in captured.output))
         self.assertTrue(any("RuntimeError" in line for line in captured.output))
@@ -656,7 +631,7 @@ class DegradeHourlyTest(BuilderTestCase):
     def test_a_typo_in_announce_template_falls_back_to_the_default_wording(self):
         # {hours} は存在しない置換名（正しくは {hour} / {hour_reading}）。
         self.config.data["time_signal"]["announce_template"] = "{period}{hours}をお知らせしました。"
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             plan = self.make_builder().build_hourly(11)
         self.assert_time_signal_first(plan)
         self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
@@ -714,7 +689,7 @@ class DegradeHourlyTest(BuilderTestCase):
             handle.write(b"RIFF")
         with mock.patch("chime.timesignal.ensure_time_signal",
                         side_effect=OSError("ディスクがいっぱい")):
-            with logs_enabled("chime.sequence", "ERROR"):
+            with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR"):
                 plan = self.make_builder().build_hourly(11)
         self.assert_time_signal_first(plan)
         self.assertEqual(plan.segments[0].path, self.time_signal)
@@ -727,7 +702,7 @@ class DegradeHourlyTest(BuilderTestCase):
         self.assertFalse(os.path.exists(self.time_signal))
         with mock.patch("chime.timesignal.ensure_time_signal",
                         side_effect=OSError("書き込めません")):
-            with logs_enabled("chime.sequence", "ERROR") as captured:
+            with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
                 plan = self.make_builder().build_hourly(11)
         self.assertFalse(any("時報音" in label for label in self.labels(plan)))
         self.assertIn("午前11時をお知らせしたのだ。", plan.spoken)
@@ -757,7 +732,7 @@ class DegradeHourlyTest(BuilderTestCase):
     def test_time_signal_generation_failure_is_logged_as_an_error(self):
         with mock.patch("chime.timesignal.ensure_time_signal",
                         side_effect=OSError("書き込めません")):
-            with logs_enabled("chime.sequence", "ERROR") as captured:
+            with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
                 self.make_builder().build_hourly(11)
         self.assertTrue(any("書き込めません" in line for line in captured.output))
 
@@ -771,7 +746,7 @@ class DegradeClosingTest(BuilderTestCase):
 
     def test_music_still_plays_when_the_announcement_is_missing(self):
         os.remove(self.announce_path())
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             plan = self.make_builder().build_closing()
         self.assertEqual(len(plan.segments), 1)
         self.assertIn("蛍の光", plan.segments[0].label)
@@ -782,7 +757,7 @@ class DegradeClosingTest(BuilderTestCase):
 
     def test_announcement_still_plays_when_the_music_is_missing(self):
         os.remove(self.music_path())
-        with logs_enabled("chime.sequence", "ERROR") as captured:
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
             plan = self.make_builder().build_closing()
         self.assertEqual(len(plan.segments), 1)
         self.assertIn("閉館アナウンス", plan.segments[0].label)
@@ -841,12 +816,9 @@ class BuildMinimalTest(BuilderTestCase):
         from datetime import datetime
         from zoneinfo import ZoneInfo
 
-        from chime.scheduler import Event
-
         moment = datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
         key = "hourly:12" if kind == "hourly" else "closing"
-        return Event(key=key, kind=kind, hour=12, minute=0,
-                     at=moment, play_at=moment, prepare_at=moment)
+        return make_event(moment, key=key, kind=kind, hour=12)
 
     def test_hourly_is_the_time_signal_only(self):
         weather = StubWeather()
@@ -946,6 +918,60 @@ class BuildDispatchTest(BuilderTestCase):
         broken = event.__class__(**dict(event.__dict__, kind="mystery"))
         with self.assertRaises(ValueError):
             self.make_builder().build(broken)
+
+
+class SpokenPhrasesArePrerecordedTest(BuilderTestCase):
+    """``SequenceBuilder`` が読み上げうる文言は、すべて作り置きの列挙に入っていること。
+
+    Pi には実行時の音声合成が無く、声は文言の完全一致で作り置きから引く。
+    列挙（``chime.phrases.collect_phrases``）から漏れた文言は、その文だけ無音に
+    なる。組み立て側（``sequence.py``）が列挙と違う読み方をしたり、新しい
+    読み上げを足したりしても、ここで気づけるようにする。
+    """
+
+    #: フィクスチャ（open_meteo.json）の日付。今日の日付に依らず同じ文言にする。
+    FIXTURE_TODAY = date(2026, 8, 26)
+
+    def test_every_spoken_text_is_in_the_prerecorded_set(self):
+        # どの時刻でも天気が流れるようにし、閉館の追加アナウンスも入れて、
+        # 読み上げの経路を全部通す。
+        self.config.data["extra_segment"]["weather_hours"] = list(range(10, 17))
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        # 列挙はひとことの置き場所（quotes.file）を config の base_dir から引く。
+        # このテストの base_dir は一時フォルダなので、リポジトリを指す config に
+        # 作り直す（中身の設定は同じ）。
+        enumerate_config = Config(self.config.data, base_dir=REPO_ROOT)
+        prerecorded = set(phrases.collect_phrases(enumerate_config, include_quotes=True))
+
+        weather = WeatherService(self.config.section("weather"))
+        payload = load_fixture("open_meteo.json")
+        spoken = set()
+        labels = []
+        with mock.patch("chime.weather.urllib.request.urlopen",
+                        return_value=urlopen_response(payload)):
+            builder = self.make_builder(weather=weather,
+                                        today_provider=lambda: self.FIXTURE_TODAY)
+            plans = []
+            for hour in range(10, 17):
+                # ひとことは乱数で選ぶので、何度か組み立てて取りこぼしを減らす。
+                for _ in range(5):
+                    plans.append(builder.build_hourly(hour))
+            plans.append(builder.build_closing())
+
+        for plan in plans:
+            self.assertEqual(plan.warnings, [])
+            spoken.update(plan.spoken)
+            labels.extend(self.labels(plan))
+
+        # 空振りの確認: 天気・ひとこと・閉館の追加アナウンスまで実際に読んでいる。
+        self.assertTrue(any("天気予報" in label for label in labels))
+        self.assertTrue(any("ひとこと" in label for label in labels))
+        self.assertIn("追加アナウンス「本日もご利用ありがとうございました。」", labels)
+        self.assertIn("午後よじをお知らせしたのだ。", spoken)
+
+        self.assertEqual(sorted(spoken - prerecorded), [])
+        # 合成に渡した文言も同じ（読み上げとして積まれなかった文言が無い）。
+        self.assertEqual(sorted(set(self.tts.texts) - prerecorded), [])
 
 
 if __name__ == "__main__":

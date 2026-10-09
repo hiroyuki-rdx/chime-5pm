@@ -27,6 +27,11 @@ class QuoteError(RuntimeError):
     """ひとことを選べなかった場合に送出する。"""
 
 
+def _fallback_quotes() -> Dict[str, Any]:
+    """内蔵の予備だけの定義を返す。呼び出しごとに別のリストを作る（共有しない）。"""
+    return {"general": list(FALLBACK_QUOTES), "by_hour": {}}
+
+
 def load_quotes(path: str) -> Dict[str, Any]:
     """ひとこと定義ファイルを読み込む。
 
@@ -44,13 +49,21 @@ def load_quotes(path: str) -> Dict[str, Any]:
             logger.warning("ひとことファイルが見つかりません: %s（内蔵の予備を使います）", path)
         else:
             logger.error("ひとことファイルを読めません（内蔵の予備を使います）: %s", exc)
-        return {"general": list(FALLBACK_QUOTES), "by_hour": {}}
+        return _fallback_quotes()
+    return _normalize_quotes(data, path)
 
+
+def _normalize_quotes(data: Any, path: str) -> Dict[str, Any]:
+    """読み込んだ JSON を ``{"general": [...], "by_hour": {...}}`` に整える。
+
+    ファイルは読まない（``path`` はログ用）。形式が不正な部分は警告を出して
+    捨て、1 件も使えなければ内蔵の予備を返す。
+    """
     if isinstance(data, list):
         data = {"general": data, "by_hour": {}}
     if not isinstance(data, Mapping):
         logger.error("ひとことファイルの形式が不正です: %s", path)
-        return {"general": list(FALLBACK_QUOTES), "by_hour": {}}
+        return _fallback_quotes()
 
     general_raw = data.get("general", [])
     if isinstance(general_raw, list):
@@ -71,7 +84,7 @@ def load_quotes(path: str) -> Dict[str, Any]:
 
     if not general and not by_hour:
         logger.warning("ひとことが 1 件も定義されていません: %s", path)
-        general = list(FALLBACK_QUOTES)
+        return _fallback_quotes()
     return {"general": general, "by_hour": by_hour}
 
 
@@ -85,22 +98,13 @@ class QuotePicker:
         self.rng = rng or random.Random()
         self._data = load_quotes(path)
 
-    def reload(self) -> None:
-        self._data = load_quotes(self.path)
-
     def candidates(self, hour: Optional[int] = None) -> List[str]:
         """対象時刻で使えるひとことの一覧を返す。"""
         quotes: List[str] = list(self._data.get("general", []))
         if hour is not None:
             quotes.extend(self._data.get("by_hour", {}).get(str(int(hour)), []))
-        # 重複を除きつつ順序を保つ
-        seen = set()
-        unique: List[str] = []
-        for quote in quotes:
-            if quote and quote not in seen:
-                seen.add(quote)
-                unique.append(quote)
-        return unique
+        # 空文字列と重複を除きつつ順序を保つ（dict は挿入順を保つ）
+        return list(dict.fromkeys(quote for quote in quotes if quote))
 
     def pick(self, hour: Optional[int] = None,
              recent: Sequence[str] = ()) -> str:

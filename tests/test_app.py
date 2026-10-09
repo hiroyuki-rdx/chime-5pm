@@ -5,27 +5,18 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
-import wave
 from datetime import date, datetime, timedelta
 from unittest import mock
+
+from tests.support import RecordingPlayer, block_network, logs_enabled, make_event, make_wav
 
 from chime.app import ChimeApp
 from chime.audio import Player
 from chime.config import DEFAULT_CONFIG, Config
-from chime.scheduler import Event
+from chime.scheduler import Event, Scheduler
 from chime.sequence import PlaybackPlan
 from chime.audio import Segment
-
-
-class RecordingPlayer(Player):
-    name = "recording"
-
-    def __init__(self, settings=None):
-        super().__init__(settings or {})
-        self.played = []
-
-    def play_one(self, segment):
-        self.played.append(segment.path)
+from chime.state import State
 
 
 class StubBuilder:
@@ -59,21 +50,13 @@ class StubBuilder:
         return PlaybackPlan(event=event, segments=list(self.minimal_segments))
 
 
-def make_wav(path: str) -> str:
-    with wave.open(path, "wb") as handle:
-        handle.setnchannels(1)
-        handle.setsampwidth(2)
-        handle.setframerate(8000)
-        handle.writeframes(b"\x00\x00" * 80)
-    return path
-
-
 class AppTestCase(unittest.TestCase):
     def setUp(self):
+        block_network(self)
         self.tmp = tempfile.TemporaryDirectory()
         self.root = self.tmp.name
         os.makedirs(os.path.join(self.root, "assets"), exist_ok=True)
-        self.wav = make_wav(os.path.join(self.root, "assets", "beep.wav"))
+        self.wav = make_wav(os.path.join(self.root, "assets", "beep.wav"), seconds=0.01)
 
         config = Config(DEFAULT_CONFIG, base_dir=self.root)
         config.data["audio"]["gap_ms"] = 0
@@ -87,8 +70,7 @@ class AppTestCase(unittest.TestCase):
 
     def past_event(self, seconds_ago: float = 5.0) -> Event:
         moment = self.app.now() - timedelta(seconds=seconds_ago)
-        return Event(key="hourly:10", kind="hourly", hour=10, minute=0,
-                     at=moment, play_at=moment, prepare_at=moment)
+        return make_event(moment)
 
 
 class RunEventTest(AppTestCase):
@@ -105,8 +87,7 @@ class RunEventTest(AppTestCase):
 
     def test_stop_request_cancels_playback(self):
         moment = self.app.now() + timedelta(hours=1)
-        event = Event(key="hourly:10", kind="hourly", hour=10, minute=0,
-                      at=moment, play_at=moment, prepare_at=moment)
+        event = make_event(moment)
         self.app.stop_event.set()
         self.app.run_event(event)
         self.assertEqual(self.player.played, [])
@@ -131,16 +112,34 @@ class RunEventDegradeTest(AppTestCase):
         self.assertTrue(self.app.state.is_fired(event.key, event.day))
 
     def test_build_failure_is_logged_with_a_traceback(self):
-        import logging
-
         self.app.builder = StubBuilder([], explode=True)
-        logging.disable(logging.NOTSET)
-        try:
+        with logs_enabled():
             with self.assertLogs("chime.app", level="ERROR") as captured:
                 self.app.run_event(self.past_event())
-        finally:
-            logging.disable(logging.CRITICAL)
         self.assertTrue(any("組み立て失敗" in line for line in captured.output))
+
+    def test_build_failure_log_is_an_error_with_a_fixed_message_and_traceback(self):
+        self.app.builder = StubBuilder([], explode=True)
+        with logs_enabled(), self.assertLogs("chime.app", level="ERROR") as captured:
+            self.app.run_event(self.past_event())
+        self.assertEqual(len(captured.records), 1)
+        record = captured.records[0]
+        self.assertEqual(record.levelname, "ERROR")
+        self.assertEqual(
+            record.getMessage(),
+            "再生内容の組み立てに失敗しました（最小の内容で鳴らします）: 組み立て失敗")
+        self.assertIsNotNone(record.exc_info)
+
+    def test_a_failing_minimal_plan_escapes_run_event_and_marks_nothing(self):
+        # 最小プランの組み立てまで失敗した場合、例外は run_event の外へ出る
+        # （常駐ループ側が受け止めて、その回を再生済みにする）。
+        self.app.builder = StubBuilder([], explode=True, explode_minimal=True)
+        event = self.past_event()
+        with self.assertRaises(RuntimeError):
+            self.app.run_event(event)
+        self.assertEqual(self.app.builder.built_minimal, [event])
+        self.assertEqual(self.player.played, [])
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
 
     def test_a_successful_build_does_not_use_the_minimal_plan(self):
         self.app.run_event(self.past_event())
@@ -217,14 +216,120 @@ class RunEventDegradeTest(AppTestCase):
 
     def test_a_stop_request_before_playback_remembers_nothing(self):
         moment = self.app.now() + timedelta(hours=1)
-        event = Event(key="hourly:10", kind="hourly", hour=10, minute=0,
-                      at=moment, play_at=moment, prepare_at=moment)
+        event = make_event(moment)
         self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")],
                                        quote="テストのひとこと")
         self.app.stop_event.set()
         self.app.run_event(event)
         self.assertEqual(self.app.state.recent_quotes(), [])
         self.assertFalse(self.app.state.is_fired(event.key, event.day))
+
+
+class PendingEventHelpersTest(AppTestCase):
+    """``_is_fired`` / ``_next_pending_event``: 選ぶときも再確認も同じ基準。"""
+
+    def test_is_fired_reflects_the_state(self):
+        event = self.past_event()
+        self.assertFalse(self.app._is_fired(event))
+        self.app.state.mark_fired(event.key, event.day)
+        self.assertTrue(self.app._is_fired(event))
+
+    def test_is_fired_is_per_key_and_day(self):
+        event = self.past_event()
+        self.app.state.mark_fired(event.key, event.day)
+        other_hour = make_event(event.at, key="hourly:11", hour=11)
+        self.assertFalse(self.app._is_fired(other_hour))
+
+    def test_is_fired_reads_the_state_at_call_time(self):
+        event = self.past_event()
+        self.app.state.mark_fired(event.key, event.day)
+        self.app.state = State(os.path.join(self.root, "swapped_state.json"))
+        self.assertFalse(self.app._is_fired(event))
+
+    def test_next_pending_event_passes_is_fired_as_the_only_keyword(self):
+        sentinel = object()
+        calls = []
+
+        def fake_next(*args, **kwargs):
+            calls.append((args, kwargs))
+            return sentinel
+
+        self.app.scheduler.next_event = fake_next
+        self.assertIs(self.app._next_pending_event(), sentinel)
+        self.assertEqual(calls, [((), {"is_fired": self.app._is_fired})])
+
+    def test_next_pending_event_reads_the_scheduler_at_call_time(self):
+        event = self.past_event()
+        self.app.scheduler = mock.Mock()
+        self.app.scheduler.next_event.return_value = event
+        self.assertIs(self.app._next_pending_event(), event)
+        self.app.scheduler.next_event.assert_called_once_with(is_fired=self.app._is_fired)
+
+    def test_next_pending_event_skips_an_event_already_fired(self):
+        wednesday = datetime(2026, 8, 26, 9, 0, tzinfo=self.app.tzinfo)
+        self.app.scheduler = Scheduler(DEFAULT_CONFIG["schedule"], self.app.tzinfo, 3.0,
+                                       clock=lambda: wednesday)
+        first = self.app._next_pending_event()
+        self.assertEqual(first.key, "hourly:10")
+        self.app.state.mark_fired(first.key, first.day)
+        self.assertEqual(self.app._next_pending_event().key, "hourly:11")
+
+    def test_next_pending_event_is_none_when_nothing_is_scheduled(self):
+        self.app.scheduler.next_event = lambda is_fired=None: None
+        self.assertIsNone(self.app._next_pending_event())
+
+
+class BuildPlanTest(AppTestCase):
+    """``_build_plan``: 組み立てに失敗したら最小のプランに落とす。"""
+
+    def test_returns_the_built_plan_without_the_fallback(self):
+        event = self.past_event()
+        plan = self.app._build_plan(event)
+        self.assertIs(plan.event, event)
+        self.assertEqual([segment.path for segment in plan.segments], [self.wav])
+        self.assertEqual(self.app.builder.built, [event])
+        self.assertEqual(self.app.builder.built_minimal, [])
+
+    def test_returns_the_minimal_plan_when_building_fails(self):
+        minimal = Segment(self.wav, label="時報音だけ")
+        self.app.builder = StubBuilder([], explode=True, minimal_segments=[minimal])
+        event = self.past_event()
+        plan = self.app._build_plan(event)
+        self.assertEqual(plan.segments, [minimal])
+        self.assertIsNone(plan.quote)
+        self.assertEqual((self.app.builder.built, self.app.builder.built_minimal),
+                         ([event], [event]))
+
+    def test_logs_the_failure_once_as_an_error_with_a_traceback(self):
+        self.app.builder = StubBuilder([], explode=True)
+        with logs_enabled(), self.assertLogs("chime.app", level="ERROR") as captured:
+            self.app._build_plan(self.past_event())
+        self.assertEqual(len(captured.records), 1)
+        self.assertEqual(
+            captured.records[0].getMessage(),
+            "再生内容の組み立てに失敗しました（最小の内容で鳴らします）: 組み立て失敗")
+        self.assertIsNotNone(captured.records[0].exc_info)
+
+    def test_does_not_log_when_building_succeeds(self):
+        with mock.patch("chime.app.logger") as log:
+            self.app._build_plan(self.past_event())
+        self.assertEqual(log.mock_calls, [])
+
+    def test_a_failing_minimal_plan_propagates(self):
+        self.app.builder = StubBuilder([], explode=True, explode_minimal=True)
+        with self.assertRaises(RuntimeError) as caught:
+            self.app._build_plan(self.past_event())
+        self.assertEqual(str(caught.exception), "最小プランも組み立て失敗")
+
+    def test_only_exception_subclasses_are_caught(self):
+        class Interrupting(StubBuilder):
+            def build(self, event):
+                raise KeyboardInterrupt
+
+        self.app.builder = Interrupting([])
+        with self.assertRaises(KeyboardInterrupt):
+            self.app._build_plan(self.past_event())
+        self.assertEqual(self.app.builder.built_minimal, [])
 
 
 class RunForeverTest(AppTestCase):
@@ -264,6 +369,45 @@ class RunForeverTest(AppTestCase):
         self.assertTrue(self.app.state.is_fired(event.key, event.day),
                         "失敗した回は再生済みとして記録し、無限リトライにしない")
 
+    def test_next_event_gets_only_the_is_fired_keyword_and_reads_the_live_state(self):
+        """予定の選び直しは ``is_fired`` をキーワードだけで渡し、記録は呼ぶ時点の
+        ``self.state`` を見る（構築後に差し替えても追従する）。"""
+        event = self.past_event()
+        calls = []
+
+        def fake_next(*args, **kwargs):
+            calls.append((args, sorted(kwargs)))
+            if kwargs["is_fired"](event):
+                self.app.stop_event.set()
+                return None
+            return event
+
+        self.app.state = State(os.path.join(self.root, "swapped_state.json"))
+        self.app.scheduler.next_event = fake_next
+        self.assertEqual(self.app.run_forever(), 0)
+        # 1 周目: 選ぶ・再確認、2 周目: 再生済みなので選んで None（停止）。
+        self.assertEqual(calls, [((), ["is_fired"])] * 3)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+    def test_a_changed_schedule_during_the_wait_is_recalculated(self):
+        """待機中に予定が変わったら、再生せず選び直す。"""
+        first, second = self.past_event(10.0), self.past_event(5.0)
+        # 1 周目: 選ぶ(first)・再確認(second ≠ first で選び直し)。
+        # 2 周目: 選ぶ(second)・再確認(second で再生)。3 周目: None で停止。
+        answers = iter([first, second, second, second, None])
+
+        def fake_next(is_fired=None):
+            answer = next(answers)
+            if answer is None:
+                self.app.stop_event.set()
+            return answer
+
+        self.app.scheduler.next_event = fake_next
+        self.assertEqual(self.app.run_forever(), 0)
+        self.assertEqual(self.app.builder.built, [second])
+        self.assertTrue(self.app.state.is_fired(second.key, second.day))
+
     def test_stop_before_start(self):
         self.app.stop_event.set()
         self.app.scheduler.next_event = lambda is_fired=None: self.past_event()
@@ -272,6 +416,9 @@ class RunForeverTest(AppTestCase):
 
 
 class TimezoneTest(unittest.TestCase):
+    def setUp(self):
+        block_network(self)
+
     def test_now_uses_configured_timezone(self):
         with tempfile.TemporaryDirectory() as tmp:
             app = ChimeApp(Config(DEFAULT_CONFIG, base_dir=tmp), backend="mock")
@@ -297,6 +444,22 @@ class TimezoneTest(unittest.TestCase):
             app = ChimeApp(config, backend="mock")
             self.assertIsNone(app.tzinfo)
             self.assertIsInstance(app.now(), datetime)
+
+
+    def test_unknown_timezone_logs_an_error_naming_the_zone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(dict(DEFAULT_CONFIG, timezone="Mars/Olympus"), base_dir=tmp)
+            with logs_enabled(), self.assertLogs("chime.app", level="ERROR") as captured:
+                ChimeApp(config, backend="mock")
+        self.assertEqual(len(captured.records), 1)
+        self.assertTrue(captured.records[0].getMessage().startswith(
+            "タイムゾーン 'Mars/Olympus' を解決できません（OS のローカル時刻を使用します）: "))
+
+    def test_a_known_timezone_is_resolved_without_a_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(dict(DEFAULT_CONFIG, timezone="Asia/Tokyo"), base_dir=tmp)
+            app = ChimeApp(config, backend="mock")
+        self.assertEqual(str(app.tzinfo), "Asia/Tokyo")
 
 
 class PlayerSelectionTest(AppTestCase):
@@ -349,6 +512,16 @@ class PlayReturnValueTest(AppTestCase):
         plan = PlaybackPlan(event=None, segments=[Segment(self.wav, label="テスト音")])
         self.assertFalse(self.app.play(plan))
 
+    def test_unexpected_exception_is_logged_with_a_traceback(self):
+        self.app._player = ExplodingPlayer({})
+        plan = PlaybackPlan(event=None, segments=[Segment(self.wav, label="テスト音")])
+        with logs_enabled(), self.assertLogs("chime.app", level="ERROR") as captured:
+            self.assertFalse(self.app.play(plan))
+        record = captured.records[0]
+        self.assertEqual(record.getMessage(),
+                         "再生中に予期しないエラーが発生しました: 想定外の再生エラー")
+        self.assertIsNotNone(record.exc_info)
+
     def test_dry_run_returns_true_even_with_no_segments(self):
         """``--dry-run`` は再生をスキップするだけで失敗ではないため、
         セグメントが 0 件でも True を返す。"""
@@ -387,6 +560,9 @@ class PlayReturnValueTest(AppTestCase):
 class StateFileTest(unittest.TestCase):
     """``--dry-run`` の ChimeApp は、実機の state.json を作らず・書き換えない。"""
 
+    def setUp(self):
+        block_network(self)
+
     def make_app(self, tmp, dry_run):
         config = Config(DEFAULT_CONFIG, base_dir=tmp)
         config.data["state"]["file"] = os.path.join(tmp, "state", "state.json")
@@ -419,11 +595,10 @@ class StateFileTest(unittest.TestCase):
     def test_dry_run_run_event_does_not_create_the_state_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             app, state_file = self.make_app(tmp, dry_run=True)
-            wav = make_wav(os.path.join(tmp, "beep.wav"))
+            wav = make_wav(os.path.join(tmp, "beep.wav"), seconds=0.01)
             app.builder = StubBuilder([Segment(wav, label="テスト音")], quote="テストのひとこと")
             moment = app.now() - timedelta(seconds=5)
-            app.run_event(Event(key="hourly:10", kind="hourly", hour=10, minute=0,
-                                at=moment, play_at=moment, prepare_at=moment))
+            app.run_event(make_event(moment))
             self.assertFalse(os.path.exists(state_file))
 
     def test_a_normal_app_does_write_the_state_file(self):

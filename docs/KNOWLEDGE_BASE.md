@@ -133,6 +133,14 @@ sudo systemctl restart campus_chime.service
 python3 campus_chime.py --test-hourly 12
 ```
 
+**v6.0.0 へ更新したときは、設定の古い行を消す。** v6.0.0 で廃止した設定（天気の取得先の切り替え、天気かひとことを選ぶ抽選方式）が `config.json` に残っていると、起動時に警告が出る。値は無視されるので放送は止まらないが、次で警告が出た行を確認し、`config.json` から消す。
+
+```bash
+journalctl -u campus_chime.service --since "5 min ago" | grep 廃止
+```
+
+警告は「`config.json` の `extra_segment.mode` は v6.0.0 で廃止しました（…）。この行は無視します。消してください。」の形で、廃止した 8 キーのうち残っているものだけが出る（一覧は SPECIFICATION.md 3.4 章）。廃止した `mode="choice"` を使っていた場合は、天気を流したい時刻を `extra_segment.weather_hours` で指定する（例 `{ "extra_segment": { "weather_hours": [10, 12, 14, 16] } }`）。天気を流す時刻でも、ひとことは毎回流れる。
+
 **無音になる文言があったら、その文言の作り置きが無い。** 読み上げ音声は文言との
 完全一致で引いているため、文言（語尾・ひとこと・天気の地点や読み上げ項目）を変えたのに
 PC 側で作り直していないと、変えた分だけ無音になる（放送本体は止まらない）。`git pull` だけでは
@@ -256,7 +264,7 @@ sudo chown -R pi:pi /home/pi/campus-chime
 
 ### 4-7. 天気予報が古い／いつも同じ
 
-天気予報は既定で有効です（取得先の既定は Open-Meteo）。取得結果は 60 分キャッシュされます。すぐに反映したい場合はサービスを再起動してください。
+天気予報は既定で有効です（取得先は Open-Meteo）。取得結果は 60 分キャッシュされます。すぐに反映したい場合はサービスを再起動してください。
 
 ```json
 { "weather": { "cache_minutes": 30 } }
@@ -330,3 +338,5 @@ sudo iw dev wlan0 set power_save off   # 省電力による切断を防ぐ（応
 | `~/steam5pm` という設置パス | v1.x のドキュメント表記。systemd ユニットと食い違い、導入失敗の原因だった。`/home/pi/campus-chime` に統一 |
 | 1 秒ごとの時刻ポーリング | 次イベントまでの分割待機に置き換え（CPU 負荷と時刻補正追従の両立） |
 | Open JTalk による実行時音声合成（フォールバック） | 作り置き・VOICEVOX のどちらにも無い文言を合成する最終手段だったが、**フォールバックがあるせいで、壊れていても「それらしく」鳴ってしまう**（作り置き不足・古い `config.json` の握りつぶしが、いずれも「別人の男性音声」としてしか発覚しなかった）。v5.0.0 でコードごと削除し、フォールバックが尽きた文言は無音にする方針に変えた（放送本体は止めない） |
+| 気象庁（jma）の天気取得（`weather.provider` / `weather.jma` / `weather.max_weather_chars`） | v3.0.0 で導入し（当時は既定）、v4.0.0 で既定を Open-Meteo に変更、v5.3.0 で廃止を予告（起動時に警告）、**v6.0.0 で廃止**。気象庁の予報文は自由文で語彙が閉じず、作り置きできない。実行時合成を持たない Pi では、その文が**無音**になり天気が流れなかった。Open-Meteo は天気コード（28 語）で語彙が閉じ、全パターンを作り置きできる。残っていた設定は無視される（SPECIFICATION.md 3.4 章） |
+| おまけの抽選方式（`extra_segment.mode="choice"` と、`weather_probability` / `always_weather_hours` / `always_quote_hours` / `fallback_to_quote`） | v3.0.0 の「天気かひとことをランダムに 1 つ流す」方式。v4.0.0 で「天気 → ひとこと」の両方を流す方式（`mode="both"`）を既定にして残し、v5.3.0 で廃止を予告、**v6.0.0 で廃止**。天気は `extra_segment.weather_hours` の時刻に流し、ひとことは毎回 1 つ流す方式に置き換わった（抽選は無い）。残っていた設定は無視される。天気を流す時刻は `weather_hours` で指定する |

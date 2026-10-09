@@ -48,17 +48,27 @@ Pi の ``config.json`` で文言を足している（地点を増やした、ひ
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
 import time
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from chime import timesignal, weather  # noqa: E402
-from chime.config import BASE_DIR, DEFAULT_CONFIG, Config, ConfigError, load_config  # noqa: E402
-from chime.quotes import load_quotes  # noqa: E402
-from chime.tts import TTSError, VoicevoxEngine, _digest  # noqa: E402
+from chime.config import Config, ConfigError, load_config  # noqa: E402
+from chime.jsonfile import JsonFileError, read_json, write_json_atomic  # noqa: E402
+from chime.phrases import (  # noqa: E402
+    collect_phrases, find_stale_entries, phrases_in_use, phrases_to_generate, phrases_to_keep)
+from chime.tts import (  # noqa: E402
+    MANIFEST_FILENAME, TTSError, VoicevoxEngine, prerecorded_filename)
+
+# 文言の列挙は ``chime.phrases`` に移した（pygame を引き込まずに使えるよう、
+# 再生系を import しないモジュールにしてある）。CI やテストが従来どおり
+# ``from generate_voicevox import collect_phrases`` で引けるよう、再公開しておく。
+__all__ = [
+    "collect_phrases", "find_stale_entries", "main", "phrases_in_use",
+    "phrases_to_generate", "phrases_to_keep", "wait_for_engine",
+]
 
 #: 起動待ち中に疎通確認を再試行する間隔（秒）。
 _POLL_INTERVAL_SECONDS = 3.0
@@ -90,107 +100,13 @@ def wait_for_engine(engine: VoicevoxEngine, wait_seconds: float) -> bool:
             return True
 
 
-def _unique(phrases) -> list:
-    """空でない文言を、最初に現れた順のまま重複なしで返す。"""
-    seen, unique = set(), []
-    for phrase in phrases:
-        if phrase and phrase not in seen:
-            seen.add(phrase)
-            unique.append(phrase)
-    return unique
-
-
-def collect_phrases(config, include_quotes: bool) -> list:
-    """事前生成する文言を集める。
-
-    天気予報の文言（``chime.weather.prerecord_phrases``）は
-    ``include_quotes`` の指定に関わらず常に含める。天気だけ作り置きが
-    無いと、Pi 上で天気の文だけ無音になってしまうため。
-    ``weather.enabled`` が False の場合も同様に含める
-    （あとで有効化したときに作り置きが無くて困るより、常に列挙しておく
-    ほうが安全という判断）。
-    """
-    settings = config.section("time_signal")
-    hourly = config.section("schedule.hourly")
-    phrases = [
-        timesignal.announce_text(hour, settings)
-        for hour in range(int(hourly.get("start_hour", 10)),
-                          int(hourly.get("end_hour", 16)) + 1)
-    ]
-
-    extra_text = str(config.get("closing.extra_text", "") or "")
-    if extra_text:
-        phrases.append(extra_text)
-
-    if include_quotes:
-        quotes = load_quotes(config.path("quotes.file"))
-        phrases.extend(quotes.get("general", []))
-        for values in quotes.get("by_hour", {}).values():
-            phrases.extend(values)
-
-    phrases.extend(weather.prerecord_phrases(config.section("weather")))
-    return _unique(phrases)
-
-
-def phrases_in_use(config) -> list:
-    """現在使われている全文言（ひとことを含む）を返す。
-
-    ``--prune`` の判定に使う。ひとことを今回作り直さない
-    （``--include-quotes`` を付けない）場合でも、ひとことは使われているので、
-    その音声を消してはならない。
-    """
-    return collect_phrases(config, include_quotes=True)
-
-
-def default_config() -> Config:
-    """既定設定だけの :class:`Config`（現地の ``config.json`` は読まない）。"""
-    return Config(DEFAULT_CONFIG, base_dir=BASE_DIR)
-
-
-def phrases_to_generate(config, include_quotes: bool) -> list:
-    """生成する文言。``config`` の文言に、既定設定の文言を足したもの（和集合）。
-
-    ``config.json`` の配列は既定値を丸ごと置き換える（地点に京都だけを書くと
-    既定の大津が外れる）。``--config`` で渡した設定の文言だけを作ると、
-    同梱の作り置きにある文言が抜けてしまうため、既定設定の文言は常に含める。
-    順序は ``config`` の文言が先で、重複は除く。
-    """
-    return _unique(collect_phrases(config, include_quotes)
-                   + collect_phrases(default_config(), include_quotes))
-
-
-def phrases_to_keep(config) -> list:
-    """``--prune`` で残す文言。``config`` の使用中の文言に、既定設定の分を足したもの。"""
-    return _unique(phrases_in_use(config) + phrases_in_use(default_config()))
-
-
-def find_stale_entries(manifest: dict, keep_phrases) -> list:
-    """``manifest`` のうち、``keep_phrases`` に含まれないエントリを列挙する。
-
-    実際の削除は行わない（呼び出し側が ``--prune`` のときだけ削除に使う）。
-    削除前に「何が消えるか」を確認できるよう、判定と実行を分けている。
-    """
-    keep = set(keep_phrases)
-    return [(phrase, filename) for phrase, filename in manifest.items() if phrase not in keep]
-
-
-def main(argv=None) -> int:
-    # --config だけ先に読み、その設定から他のオプションの既定値を決める
-    # （それ以外のオプションは、ここでは読み飛ばす）。
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--config")
-    pre_args, _ = pre_parser.parse_known_args(argv)
-
-    try:
-        config = load_config(pre_args.config)
-    except ConfigError as exc:
-        print("設定エラー: {0}".format(exc), file=sys.stderr)
-        return 2
+def _build_parser(config: Config, config_path: Optional[str]) -> argparse.ArgumentParser:
+    """コマンドライン引数の定義。他のオプションの既定値は ``config`` から決める。"""
     voicevox = config.section("tts.voicevox")
 
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--config", metavar="PATH", default=pre_args.config,
+    parser.add_argument("--config", metavar="PATH", default=config_path,
                         help="設定ファイル（Pi の config.json を PC に持ってきて指定する。"
                              "その設定の文言に既定設定の文言を足して生成する。"
                              "既定: リポジトリ直下の config.json があれば読み込む）")
@@ -212,64 +128,49 @@ def main(argv=None) -> int:
                              "対応する WAV を削除する（--include-quotes の有無に"
                              "関わらず、ひとことは残す。既定 off。誤って消さないよう"
                              "明示的に指定した場合のみ動く）")
-    args = parser.parse_args(argv)
+    return parser
 
-    engine = VoicevoxEngine({
-        "base_url": args.base_url,
-        "speaker": args.speaker,
-        "timeout_seconds": 60.0,
-        # 起動待ちで繰り返す疎通確認は、実行時（既定 2 秒）より少し長めの
-        # タイムアウトにしておく。--wait による再試行が全体の待ち時間を
-        # 確保するので、ここは 1 回あたりの応答揺らぎを吸収する程度でよい。
-        "probe_timeout_seconds": 5.0,
-    }, config.base_dir)
-    if not wait_for_engine(engine, args.wait):
-        print("VOICEVOX ENGINE に接続できません: {0}".format(args.base_url), file=sys.stderr)
-        if args.wait > 0:
-            print("{0:.0f} 秒待ちましたが応答がありませんでした。".format(args.wait),
-                  file=sys.stderr)
-        print("次を確認してください。", file=sys.stderr)
-        print("  - 疎通確認: curl -s {0}/version".format(args.base_url), file=sys.stderr)
-        print("  - Docker Desktop（Windows）を使っている場合、WSL2 から 127.0.0.1 では"
-              " VOICEVOX ENGINE に届かないことがあります。"
-              "--base-url でホストの IP を指定してください"
-              "（例: --base-url http://<ホストのIP>:50021）。", file=sys.stderr)
-        return 1
 
-    os.makedirs(args.out, exist_ok=True)
-    manifest_path = os.path.join(args.out, "manifest.json")
-    manifest = {}
-    if os.path.exists(manifest_path):
-        with open(manifest_path, "r", encoding="utf-8") as handle:
-            manifest = json.load(handle)
+def _report_engine_unreachable(args: argparse.Namespace) -> None:
+    """VOICEVOX ENGINE に繋がらなかったときの案内を stderr に出す。"""
+    print("VOICEVOX ENGINE に接続できません: {0}".format(args.base_url), file=sys.stderr)
+    if args.wait > 0:
+        print("{0:.0f} 秒待ちましたが応答がありませんでした。".format(args.wait),
+              file=sys.stderr)
+    print("次を確認してください。", file=sys.stderr)
+    print("  - 疎通確認: curl -s {0}/version".format(args.base_url), file=sys.stderr)
+    print("  - Docker Desktop（Windows）を使っている場合、WSL2 から 127.0.0.1 では"
+          " VOICEVOX ENGINE に届かないことがあります。"
+          "--base-url でホストの IP を指定してください"
+          "（例: --base-url http://<ホストのIP>:50021）。", file=sys.stderr)
 
-    phrases = phrases_to_generate(config, args.include_quotes)
-    print("{0} 件の文言を生成します（話者 {1}）。".format(len(phrases), args.speaker))
 
-    stale = find_stale_entries(manifest, phrases_to_keep(config))
-    if args.prune:
-        if not args.config:
-            print("警告: --config なしで --prune を指定しています。"
-                  "Pi の config.json で足した文言（地点など）は、"
-                  "--config を付けないと消えます。", file=sys.stderr)
-        for phrase, filename in stale:
-            path = os.path.join(args.out, filename)
-            if os.path.exists(path):
-                os.remove(path)
-                print("  prune {0} -> {1}".format(phrase, filename))
-            else:
-                print("  prune {0} -> {1}（ファイルなし）".format(phrase, filename))
-            del manifest[phrase]
-        print("{0} 件の古いエントリを削除しました。".format(len(stale)))
-    elif stale:
-        print("{0} 件の古いエントリが残っています（--prune を付けると削除されます）。"
-              .format(len(stale)))
+def _prune(manifest: Dict[str, str], stale: List[Tuple[str, str]],
+           out_dir: str, has_config: bool) -> None:
+    """古いエントリ（``stale``）の WAV を消し、``manifest`` からも外す。"""
+    if not has_config:
+        print("警告: --config なしで --prune を指定しています。"
+              "Pi の config.json で足した文言（地点など）は、"
+              "--config を付けないと消えます。", file=sys.stderr)
+    for phrase, filename in stale:
+        path = os.path.join(out_dir, filename)
+        if os.path.exists(path):
+            os.remove(path)
+            print("  prune {0} -> {1}".format(phrase, filename))
+        else:
+            print("  prune {0} -> {1}（ファイルなし）".format(phrase, filename))
+        del manifest[phrase]
+    print("{0} 件の古いエントリを削除しました。".format(len(stale)))
 
+
+def _synthesize_all(engine: VoicevoxEngine, phrases: List[str], out_dir: str,
+                    manifest: Dict[str, str], force: bool) -> int:
+    """``phrases`` を合成して ``manifest`` に登録する。失敗した件数を返す。"""
     failures = 0
     for phrase in phrases:
-        filename = "{0}.wav".format(_digest(phrase))
-        path = os.path.join(args.out, filename)
-        if os.path.exists(path) and not args.force:
+        filename = prerecorded_filename(phrase)
+        path = os.path.join(out_dir, filename)
+        if os.path.exists(path) and not force:
             manifest[phrase] = filename
             print("  skip {0}".format(phrase))
             continue
@@ -283,10 +184,64 @@ def main(argv=None) -> int:
             continue
         manifest[phrase] = filename
         print("  OK   {0} -> {1}".format(phrase, filename))
+    return failures
 
-    with open(manifest_path, "w", encoding="utf-8") as handle:
-        json.dump(manifest, handle, ensure_ascii=False, indent=2, sort_keys=True)
-        handle.write("\n")
+
+def main(argv=None) -> int:
+    # --config だけ先に読み、その設定から他のオプションの既定値を決める
+    # （それ以外のオプションは、ここでは読み飛ばす）。
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config")
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    try:
+        config = load_config(pre_args.config)
+    except ConfigError as exc:
+        print("設定エラー: {0}".format(exc), file=sys.stderr)
+        return 2
+
+    args = _build_parser(config, pre_args.config).parse_args(argv)
+
+    engine = VoicevoxEngine({
+        "base_url": args.base_url,
+        "speaker": args.speaker,
+        "timeout_seconds": 60.0,
+        # 起動待ちで繰り返す疎通確認は、実行時（既定 2 秒）より少し長めの
+        # タイムアウトにしておく。--wait による再試行が全体の待ち時間を
+        # 確保するので、ここは 1 回あたりの応答揺らぎを吸収する程度でよい。
+        "probe_timeout_seconds": 5.0,
+    })
+    if not wait_for_engine(engine, args.wait):
+        _report_engine_unreachable(args)
+        return 1
+
+    os.makedirs(args.out, exist_ok=True)
+    manifest_path = os.path.join(args.out, MANIFEST_FILENAME)
+    manifest = {}
+    if os.path.exists(manifest_path):
+        # 厳密に読む。実行時の PrerecordedEngine のように壊れた目録を空として
+        # 扱うと、このあとの書き出しで既存の登録がすべて消えてしまうため、
+        # 読めなければ何も合成せず・何も書かずに止める。
+        try:
+            manifest = read_json(manifest_path)
+        except JsonFileError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+    phrases = phrases_to_generate(config, args.include_quotes)
+    print("{0} 件の文言を生成します（話者 {1}）。".format(len(phrases), args.speaker))
+
+    stale = find_stale_entries(manifest, phrases_to_keep(config))
+    if args.prune:
+        _prune(manifest, stale, args.out, bool(args.config))
+    elif stale:
+        print("{0} 件の古いエントリが残っています（--prune を付けると削除されます）。"
+              .format(len(stale)))
+
+    failures = _synthesize_all(engine, phrases, args.out, manifest, args.force)
+
+    # 一時ファイル経由で置き換えるので、途中で止まっても manifest が書きかけにならない。
+    write_json_atomic(manifest_path, manifest, sort_keys=True)
     print("manifest を書き出しました: {0}".format(manifest_path))
 
     if failures:

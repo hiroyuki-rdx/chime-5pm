@@ -31,6 +31,16 @@ logger = logging.getLogger(__name__)
 MAX_LOOKAHEAD_DAYS = 30
 
 
+def hourly_hours(hourly: Mapping[str, Any]) -> range:
+    """時報の ``start_hour``〜``end_hour``（両端を含む）を返す。
+
+    ``skip_hours``・曜日・0〜23 の範囲外は取り除かない。作り置きの文言を
+    数える側（``chime.phrases``）は、休みにしている時刻の文言も用意しておく
+    ため。鳴らす時刻を決める ``Scheduler`` は、これに自分で絞り込みをかける。
+    """
+    return range(int(hourly.get("start_hour", 10)), int(hourly.get("end_hour", 16)) + 1)
+
+
 @dataclass(frozen=True)
 class Event:
     """1 回分の再生イベント。"""
@@ -38,7 +48,6 @@ class Event:
     key: str
     kind: str
     hour: int
-    minute: int
     at: datetime
     play_at: datetime
     prepare_at: datetime
@@ -81,37 +90,54 @@ class Scheduler:
             key=key,
             kind=kind,
             hour=moment.hour,
-            minute=moment.minute,
             at=moment,
             play_at=play_at,
             prepare_at=play_at - timedelta(seconds=self.prepare_lead),
         )
 
+    @staticmethod
+    def _runs_on(section: Mapping[str, Any], day: date) -> bool:
+        """設定の節（時報・閉館放送）が有効で、その日の曜日に稼働するか。
+
+        無効な節の ``weekdays`` は読まない。無効にした節に壊れた値が残っていても
+        例外にしないため（``enabled`` を先に見て、``and`` で打ち切る）。
+        """
+        return bool(section.get("enabled", True)
+                    and day.weekday() in set(section.get("weekdays", [])))
+
+    def _hourly_events(self, day: date) -> List[Event]:
+        """指定日の時報。``skip_hours`` と 0〜23 の範囲外の時刻は鳴らさない。"""
+        hourly = self.settings.get("hourly", {}) or {}
+        if not self._runs_on(hourly, day):
+            return []
+
+        minute = int(hourly.get("minute", 0))
+        hours = hourly_hours(hourly)
+        skip = {int(h) for h in hourly.get("skip_hours", []) or []}
+        events: List[Event] = []
+        for hour in hours:
+            if hour in skip or not 0 <= hour <= 23:
+                continue
+            moment = datetime(day.year, day.month, day.day, hour, minute,
+                              tzinfo=self.tzinfo)
+            events.append(self._make_event("hourly", "hourly:{0:02d}".format(hour),
+                                           moment, self.pip_lead))
+        return events
+
+    def _closing_events(self, day: date) -> List[Event]:
+        """指定日の閉館放送（先行なし: 再生開始は ``at`` と同じ）。"""
+        closing = self.settings.get("closing", {}) or {}
+        if not self._runs_on(closing, day):
+            return []
+
+        moment = datetime(day.year, day.month, day.day,
+                          int(closing.get("hour", 16)), int(closing.get("minute", 57)),
+                          tzinfo=self.tzinfo)
+        return [self._make_event("closing", "closing", moment, 0.0)]
+
     def events_for_date(self, day: date) -> List[Event]:
         """指定日のイベントを再生開始時刻順に返す。"""
-        events: List[Event] = []
-
-        hourly = self.settings.get("hourly", {}) or {}
-        if hourly.get("enabled", True) and day.weekday() in set(hourly.get("weekdays", [])):
-            minute = int(hourly.get("minute", 0))
-            start = int(hourly.get("start_hour", 10))
-            end = int(hourly.get("end_hour", 16))
-            skip = {int(h) for h in hourly.get("skip_hours", []) or []}
-            for hour in range(start, end + 1):
-                if hour in skip or not 0 <= hour <= 23:
-                    continue
-                moment = datetime(day.year, day.month, day.day, hour, minute,
-                                  tzinfo=self.tzinfo)
-                events.append(self._make_event("hourly", "hourly:{0:02d}".format(hour),
-                                               moment, self.pip_lead))
-
-        closing = self.settings.get("closing", {}) or {}
-        if closing.get("enabled", True) and day.weekday() in set(closing.get("weekdays", [])):
-            moment = datetime(day.year, day.month, day.day,
-                              int(closing.get("hour", 16)), int(closing.get("minute", 57)),
-                              tzinfo=self.tzinfo)
-            events.append(self._make_event("closing", "closing", moment, 0.0))
-
+        events = self._hourly_events(day) + self._closing_events(day)
         events.sort(key=lambda event: event.play_at)
         return events
 

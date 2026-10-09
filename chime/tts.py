@@ -36,7 +36,13 @@ class TTSError(RuntimeError):
     """音声合成に失敗した場合に送出する。"""
 
 
-def _digest(*parts: str) -> str:
+#: 作り置きの目録（文言 → ファイル名）のファイル名。``assets/voice/`` 直下に置く。
+#: 実行時（:class:`PrerecordedEngine`）と生成側（``scripts/generate_voicevox.py``）が
+#: 同じ名前で読み書きするので、ここ 1 か所に定義する。
+MANIFEST_FILENAME = "manifest.json"
+
+
+def digest(*parts: str) -> str:
     # 空白区切りだと voice_id と text の境界がずれた組み合わせ
     # （例: ("A", "B C") と ("A B", "C")）が同じ文字列になり、
     # キャッシュキーが衝突しうる。通常のテキストに現れない制御文字で区切る。
@@ -44,14 +50,22 @@ def _digest(*parts: str) -> str:
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:20]
 
 
+def prerecorded_filename(text: str) -> str:
+    """作り置きの WAV のファイル名（``digest(文言) + ".wav"``）。
+
+    実行時の照合（:class:`PrerecordedEngine`）と生成側が同じ規則で名前を
+    決める。ずれると、ファイルがあっても引けずにその文だけ無音になる。
+    """
+    return digest(text) + ".wav"
+
+
 class TTSEngine:
     """音声合成エンジンの基底クラス。"""
 
     name = "base"
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str) -> None:
+    def __init__(self, settings: Mapping[str, Any]) -> None:
         self.settings = dict(settings)
-        self.base_dir = base_dir
 
     def voice_id(self) -> str:
         """キャッシュキーに含める、声色を識別する文字列。"""
@@ -73,15 +87,15 @@ class PrerecordedEngine(TTSEngine):
 
     name = "prerecorded"
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str, directory: str) -> None:
-        super().__init__(settings, base_dir)
+    def __init__(self, settings: Mapping[str, Any], directory: str) -> None:
+        super().__init__(settings)
         self.directory = directory
         self._manifest: Optional[Dict[str, str]] = None
 
     def manifest(self) -> Dict[str, str]:
         """``manifest.json``（文言 → ファイル名）を読み込む。"""
         if self._manifest is None:
-            path = os.path.join(self.directory, "manifest.json")
+            path = os.path.join(self.directory, MANIFEST_FILENAME)
             data: Dict[str, str] = {}
             try:
                 loaded = read_json(path)
@@ -104,7 +118,7 @@ class PrerecordedEngine(TTSEngine):
         candidates = []
         if filename:
             candidates.append(os.path.join(self.directory, filename))
-        candidates.append(os.path.join(self.directory, _digest(text) + ".wav"))
+        candidates.append(os.path.join(self.directory, prerecorded_filename(text)))
         for candidate in candidates:
             if os.path.exists(candidate):
                 return candidate
@@ -119,8 +133,8 @@ class VoicevoxEngine(TTSEngine):
 
     name = "voicevox"
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str) -> None:
-        super().__init__(settings, base_dir)
+    def __init__(self, settings: Mapping[str, Any]) -> None:
+        super().__init__(settings)
         self.base_url = str(self.settings.get("base_url", "")).rstrip("/")
         self.speaker = int(self.settings.get("speaker", 3))
         self.timeout = float(self.settings.get("timeout_seconds", 20.0))
@@ -174,10 +188,9 @@ class VoicevoxEngine(TTSEngine):
 class TTSService:
     """エンジンの選択・フォールバック・キャッシュを束ねる。"""
 
-    def __init__(self, settings: Mapping[str, Any], base_dir: str,
+    def __init__(self, settings: Mapping[str, Any],
                  cache_dir: str, prerecorded_dir: str) -> None:
         self.settings = dict(settings)
-        self.base_dir = base_dir
         self.cache_dir = cache_dir
         self.prerecorded_dir = prerecorded_dir
         self.engines: List[TTSEngine] = self._build_engines()
@@ -187,9 +200,9 @@ class TTSService:
         for name in self.settings.get("engines", []):
             name = str(name)
             if name == "prerecorded":
-                engines.append(PrerecordedEngine({}, self.base_dir, self.prerecorded_dir))
+                engines.append(PrerecordedEngine({}, self.prerecorded_dir))
             elif name == "voicevox":
-                engines.append(VoicevoxEngine(self.settings.get("voicevox", {}), self.base_dir))
+                engines.append(VoicevoxEngine(self.settings.get("voicevox", {})))
             else:
                 logger.warning("未知の TTS エンジン '%s' は無視します。", name)
         return engines
@@ -241,43 +254,56 @@ class TTSService:
                     errors.append(engine.name + ": 利用不可")
                     unavailable.append(engine.name)
                     continue
-
-                existing = engine.lookup(text)
-                if existing:
-                    logger.debug("既存音声を使用[%s]: %s", engine.name, existing)
-                    return existing
-
-                cached = self._cache_path(engine, text)
-                if os.path.exists(cached):
-                    logger.debug("キャッシュを使用[%s]: %s", engine.name, cached)
-                    return cached
-
-                os.makedirs(self.cache_dir, exist_ok=True)
-                # pid だけでは同一プロセス内の並行呼び出しで一時ファイル名が
-                # 衝突しうるため、スレッド ID も加えて一意にする。
-                temp_path = "{0}.{1}.{2}.tmp".format(
-                    cached, os.getpid(), threading.get_ident())
-                try:
-                    engine.synthesize(text, temp_path)
-                    os.replace(temp_path, cached)
-                except Exception:
-                    # 合成が失敗した場合、書きかけの一時ファイルを残さない。
-                    if os.path.exists(temp_path):
-                        try:
-                            os.remove(temp_path)
-                        except OSError:
-                            pass
-                    raise
-                logger.info("音声合成[%s]: %s", engine.name, text)
-                return cached
+                return self._synthesize_with(engine, text)
             except TTSError as exc:
                 errors.append("{0}: {1}".format(engine.name, exc))
             except Exception as exc:  # pragma: no cover - 想定外は次のエンジンへ
                 errors.append("{0}: 予期しないエラー: {1}".format(engine.name, exc))
 
+        raise self._failure(errors, unavailable)
+
+    def _synthesize_with(self, engine: TTSEngine, text: str) -> str:
+        """1 つのエンジンで WAV を用意してパスを返す（既存・キャッシュ・合成の順）。
+
+        失敗は例外のまま呼び出し元に渡す（次のエンジンへ進む判断は ``synthesize``）。
+        """
+        existing = engine.lookup(text)
+        if existing:
+            logger.debug("既存音声を使用[%s]: %s", engine.name, existing)
+            return existing
+
+        cached = self._cache_path(engine, text)
+        if os.path.exists(cached):
+            logger.debug("キャッシュを使用[%s]: %s", engine.name, cached)
+            return cached
+
+        # 合成できない prerecorded（このあと TTSError になる）の取りこぼしでも、
+        # ここまで進むのでキャッシュ用ディレクトリは作られる。従来どおりの挙動で、
+        # tests/test_tts.py で固定している。
+        os.makedirs(self.cache_dir, exist_ok=True)
+        # pid だけでは同一プロセス内の並行呼び出しで一時ファイル名が
+        # 衝突しうるため、スレッド ID も加えて一意にする。
+        temp_path = "{0}.{1}.{2}.tmp".format(
+            cached, os.getpid(), threading.get_ident())
+        try:
+            engine.synthesize(text, temp_path)
+            os.replace(temp_path, cached)
+        except Exception:
+            # 合成が失敗した場合、書きかけの一時ファイルを残さない。
+            if os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            raise
+        logger.info("音声合成[%s]: %s", engine.name, text)
+        return cached
+
+    def _failure(self, errors: List[str], unavailable: List[str]) -> TTSError:
+        """全エンジンが失敗したときの :class:`TTSError` を組み立てて返す（送出は呼び出し側）。"""
         detail = " / ".join(errors)
         if self._prerecorded_engine() is None:
-            raise TTSError("音声合成に失敗しました（" + detail + "）")
+            return TTSError("音声合成に失敗しました（" + detail + "）")
         # 主な原因は「作り置きに無い」こと。Pi では VOICEVOX ENGINE が動いて
         # いないのが正常なので、そちらは補足に留める。
         if "prerecorded" in unavailable:
@@ -288,7 +314,7 @@ class TTSService:
             summary = "作り置き（assets/voice/）にこの文言がありません"
         if "voicevox" in unavailable:
             summary += "（VOICEVOX ENGINE も使えません。Pi ではこれが正常）"
-        raise TTSError("{0}。エンジンごとの詳細: {1}".format(summary, detail))
+        return TTSError("{0}。エンジンごとの詳細: {1}".format(summary, detail))
 
     def _cache_path(self, engine: TTSEngine, text: str) -> str:
-        return os.path.join(self.cache_dir, _digest(engine.voice_id(), text) + ".wav")
+        return os.path.join(self.cache_dir, digest(engine.voice_id(), text) + ".wav")

@@ -14,24 +14,28 @@ import math
 import os
 import struct
 import wave
-from typing import Any, Dict, Mapping
+from typing import Any, Dict, List, Mapping, Tuple
 
 logger = logging.getLogger(__name__)
 
 _MAX_AMPLITUDE = 32767
 
 
-def lead_seconds(settings: Mapping[str, Any]) -> float:
-    """短音の総時間（＝長音が鳴るまでの秒数）を返す。"""
+def _pip_timing(settings: Mapping[str, Any]) -> Tuple[int, float]:
+    """``(短音の回数, 短音の間隔 ms)`` を返す。
+
+    WAV の合成（長音までの長さ）と :func:`lead_seconds`（再生の前倒し）が
+    別々に読むと、設定の読み違いで長音が正時からずれるため、同じ関数から読む。
+    """
     count = int(settings.get("short_pip_count", 3))
     interval_ms = float(settings.get("pip_interval_ms", 1000))
+    return count, interval_ms
+
+
+def lead_seconds(settings: Mapping[str, Any]) -> float:
+    """短音の総時間（＝長音が鳴るまでの秒数）を返す。"""
+    count, interval_ms = _pip_timing(settings)
     return count * interval_ms / 1000.0
-
-
-def total_seconds(settings: Mapping[str, Any]) -> float:
-    """時報音全体の長さ（秒）を返す。"""
-    long_ms = float(settings.get("long_pip", {}).get("duration_ms", 1000))
-    return lead_seconds(settings) + long_ms / 1000.0
 
 
 def _tone(frequency: float, duration_ms: float, sample_rate: int, volume: float,
@@ -54,17 +58,11 @@ def _tone(frequency: float, duration_ms: float, sample_rate: int, volume: float,
     return samples
 
 
-def generate_time_signal(path: str, settings: Mapping[str, Any],
-                         mixer: Mapping[str, Any]) -> str:
-    """時報音の WAV を生成して保存し、そのパスを返す。"""
-    sample_rate = int(mixer.get("frequency", 44100))
-    channels = int(mixer.get("channels", 2))
-    channels = 2 if channels >= 2 else 1
-
+def _synthesize(settings: Mapping[str, Any], sample_rate: int) -> List[int]:
+    """時報音全体（短音 × 回数 ＋ 長音）のモノラルサンプル列を合成する。"""
     volume = float(settings.get("volume", 0.6))
     envelope_ms = float(settings.get("envelope_ms", 5))
-    count = int(settings.get("short_pip_count", 3))
-    interval_ms = float(settings.get("pip_interval_ms", 1000))
+    count, interval_ms = _pip_timing(settings)
     short: Dict[str, Any] = dict(settings.get("short_pip", {}))
     long: Dict[str, Any] = dict(settings.get("long_pip", {}))
 
@@ -88,8 +86,14 @@ def generate_time_signal(path: str, settings: Mapping[str, Any],
         frames.extend(short_samples)
         frames.extend([0] * (slot - len(short_samples)))
     frames.extend(long_samples)
+    return frames
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)) or ".", exist_ok=True)
+
+def _write_wav(path: str, frames: List[int], sample_rate: int, channels: int) -> None:
+    """モノラルのサンプル列を 16bit PCM の WAV として保存する（全チャンネル同じ音）。"""
+    # abspath は必ず絶対パスを返すので、dirname が空になることは無い（相対パスの
+    # ファイル名だけでも作業ディレクトリが入る）。
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     packed = bytearray()
     for sample in frames:
         clipped = max(-_MAX_AMPLITUDE, min(_MAX_AMPLITUDE, sample))
@@ -100,6 +104,17 @@ def generate_time_signal(path: str, settings: Mapping[str, Any],
         handle.setsampwidth(2)
         handle.setframerate(sample_rate)
         handle.writeframes(bytes(packed))
+
+
+def generate_time_signal(path: str, settings: Mapping[str, Any],
+                         mixer: Mapping[str, Any]) -> str:
+    """時報音の WAV を生成して保存し、そのパスを返す。"""
+    sample_rate = int(mixer.get("frequency", 44100))
+    channels = int(mixer.get("channels", 2))
+    channels = 2 if channels >= 2 else 1
+
+    frames = _synthesize(settings, sample_rate)
+    _write_wav(path, frames, sample_rate, channels)
 
     logger.info("時報音を生成しました: %s (%.2f秒 / %dHz / %dch)",
                 path, len(frames) / sample_rate, sample_rate, channels)
@@ -117,14 +132,13 @@ def ensure_time_signal(path: str, settings: Mapping[str, Any],
 def hour_parts(hour: int, settings: Mapping[str, Any]) -> Dict[str, Any]:
     """テンプレートへ渡す 12 時間表記の部品を返す。"""
     hour = int(hour) % 24
-    if hour == 0:
-        period, hour12 = settings.get("period_am", "午前"), 0
-    elif hour < 12:
-        period, hour12 = settings.get("period_am", "午前"), hour
-    elif hour == 12:
-        period, hour12 = settings.get("period_pm", "午後"), 12
+    if hour < 12:
+        period = settings.get("period_am", "午前")
     else:
-        period, hour12 = settings.get("period_pm", "午後"), hour - 12
+        period = settings.get("period_pm", "午後")
+    # 0 時は 0 のまま（12 にしない）。hour_readings の "0"（れいじ）を引くため。
+    # 12 時は 12、13 時以降は 12 を引く。
+    hour12 = hour if hour <= 12 else hour - 12
 
     # 読み上げエンジンは「4時」を「よんじ」、「7時」を「ななじ」、
     # 「9時」を「きゅうじ」、「0時」を「ぜろじ」と誤読する
