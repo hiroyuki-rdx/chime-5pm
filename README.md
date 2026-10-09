@@ -109,7 +109,8 @@ v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです�
 ├── scripts/
 │   ├── setup.sh               #   導入スクリプト（冪等）
 │   ├── generate_voicevox.py   #   VOICEVOX で定型文を事前生成
-│   └── dump_example_config.py #   config.example.json の再生成
+│   ├── dump_example_config.py #   config.example.json の再生成
+│   └── tag_releases.py        #   版のタグ付け（GitHub Actions が実行）
 ├── tests/                     # ユニットテスト（外部依存なし）
 └── docs/
     ├── REQUIREMENTS.md        # 要件定義書（何を・なぜ作るか）
@@ -277,6 +278,10 @@ sudo systemctl is-enabled campus_chime.service
 ```bash
 python3 -m unittest discover -s tests -t . -v
 ```
+
+### 版のタグ
+
+`main` にマージされると、GitHub Actions（`.github/workflows/tag.yml`）が版のタグ（`v5.2.0` 以降）を自動で付けます。手でタグを作る必要はありません。PR は「Create a merge commit」（または「Squash and merge」）でマージしてください。「Rebase and merge」では、タグが PR の版を上げたコミットに付いてしまいます。
 
 ## 11. ドキュメント
 

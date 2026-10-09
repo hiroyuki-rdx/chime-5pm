@@ -34,6 +34,16 @@
   既定値、廃止したキーが現行の設定として書かれていないこと
 - 読み上げの部品が「欠けてもよい」扱い（その 1 文だけ無音で、放送は止めない）であることの回帰テスト
 
+### 追加（開発）
+
+- 版のタグ（`vX.Y.Z`）を GitHub Actions が自動で付ける（`.github/workflows/tag.yml`・
+  `scripts/tag_releases.py`）。`main` にマージされるたびに、その版を入れた PR のマージコミット
+  （`chime/__init__.py` の版が最初にその版になり、`CHANGELOG.md` にその版の見出しがあるコミット）に
+  注釈付きタグを付ける。対象は 5.2.0 以降で、この版のマージで v5.2.0・v5.3.0・v6.0.0 がそろう。
+  既にあるタグは動かさない。付けられなかった版は Actions の画面に警告として出る。
+  PR は「Create a merge commit」でマージする（「Rebase and merge」ではタグが PR の途中の
+  コミットに付く）
+
 ### 内部の整理（動作は変わらない）
 
 - 読み上げうる全文言の列挙を `scripts/generate_voicevox.py` から新しい `chime/phrases.py` に移した。

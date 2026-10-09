@@ -1,0 +1,53 @@
+# 版のタグ（vX.Y.Z）は、main に push があるたびにここで付ける。
+#
+# PR を作る側（作業ブランチにしか push できない人や自動化）はタグを作れないため、
+# リリースのタグは main の側で付ける。タグは、その版が chime/__init__.py に
+# 最初に現れた main の first-parent のコミット（＝その版を入れた PR の
+# マージコミット）に付ける。既にあるタグは動かさない・消さない。
+# 詳しくは scripts/tag_releases.py のドキュメントを参照。
+#
+# PR は「Create a merge commit」（または「Squash and merge」）でマージすること。
+# 「Rebase and merge」や fast-forward でマージすると、PR の中のコミットがそのまま
+# main の first-parent に並ぶため、タグが PR の最終状態ではなく、PR の中で版を
+# 上げたコミットに付いてしまう。
+name: タグ付け
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# 続けてマージしても、タグ付けは 1 つずつ順に行う。途中で取り消さない。
+# 列は ref ごとに分ける（main への push と、main での手動実行は同じ列に並ぶ。別の
+# ブランチでの手動実行が、待っている main の実行を押しのけることはない）。待ち行列では
+# 古い待ちが新しい待ちに置き換わるが、毎回全履歴を見るので取りこぼさない。
+concurrency:
+  group: tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: 版のタグを付ける
+    runs-on: ubuntu-latest
+    # workflow_dispatch で別のブランチを選んでも、そのブランチのコミットには
+    # タグを付けない（main のコミットにだけ付ける）。
+    if: github.ref == 'refs/heads/main'
+    steps:
+      # 版が最初に現れたコミットを探すため、全履歴と既存のタグが要る。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 5.2.0 より前の履歴は経緯が複雑なため、タグを付ける対象は 5.2.0 以降にする。
+      - name: タグを付けて push する
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python scripts/tag_releases.py --since 5.2.0 --push

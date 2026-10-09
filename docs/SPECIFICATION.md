@@ -49,6 +49,8 @@
 | `tests/` | 新規追加 | NFR-07 |
 | `scripts/` | 新規追加 | 導入手順の自動化・音声事前生成 |
 | `.github/workflows/ci.yml` | 新規追加 | NFR-07 |
+| `.github/workflows/tag.yml` | 新規追加 | `main` へのマージで版のタグを自動で付けるため（10.1 章） |
+| `scripts/tag_releases.py` | 新規追加 | 版のタグ付けの本体。`CHANGELOG.md` の版見出しのリンク（`releases/tag/vX.Y.Z`）の行き先を用意するため |
 | `docs/LEGACY_SYSTEM_SHUTDOWN.md` | **削除** | `weather.py` は OS ごと廃止されるため、停止手順が不要になる |
 
 ---
@@ -648,12 +650,17 @@ python3 -m unittest discover -s tests -t . -v
 | `tests/test_phrases.py` | 全文言の列挙（既定設定・現地設定での件数とハッシュの固定、`--config` の文言と既定の文言の和集合、`--prune` で残す文言、時報・閉館・ひとこと各列挙の振る舞い、`chime/phrases.py` が再生系を import しないこと） |
 | `tests/test_generate_voicevox.py` | 作り置き生成スクリプトの CLI 側（`--config` の文言を既定の文言に足して生成すること、`--prune` の実行、合成に失敗した文言を manifest に書かないこと、列挙の関数を `chime/phrases.py` から再公開していること） |
 | `tests/test_setup_script.py` | 導入スクリプト（`scripts/setup.sh`）。`--help` / `-h` が先頭のコメントブロックだけを表示すること（`set -euo pipefail` まで出さない）、不明なオプションが副作用（apt・systemd など）の前に終了コード 2 で止まること、新規に作る `config.json` の雛形が正しい JSON で、設定項目を持たず、既定値と同じ値を 1 つも写さない（起動時に丸ごとコピーの警告が出ない）こと。副作用のあるコマンドは偽物に差し替えて実行する |
+| `tests/test_tag_releases.py` | 版のタグ付け（`scripts/tag_releases.py` と `.github/workflows/tag.yml`）。使い捨ての git リポジトリで、first-parent 上で `__version__` がその版になった最初のコミット（版を出した PR のマージコミット）に版のタグが付くこと、`CHANGELOG.md` に `## [X.Y.Z]` の見出しが無い版には付けないこと、`--since` より古い版には付けないこと、タグが注釈付きであること、何度実行しても結果が変わらず既存のタグを動かさないこと（別のコミットを指す既存のタグは警告だけ）、GitHub Actions 上では警告が注釈として出ること、`--dry-run` が何も作らないこと、`--push` が bare リポジトリのリモートへ届くことと push の失敗が終了コード 1 になり手で push するコマンドが表示されること、タグを 1 つ作れなくても残りは作って push し終了コード 1 になること、git が読めないオブジェクトがあると終了コード 1 でタグを 1 つも付けないこと、付けられなかった版（見出しが無い・先頭の版が読めない）が警告になること、浅い clone・git のリポジトリでない場所・不正な `--since` が終了コード 2 になること、`tag.yml` の静的な検査（トリガー、ジョブ単位の `main` 限定の条件、ワークフロー全体の `permissions` が 1 つだけであること、認証情報や権限を上書きする設定が無いこと、`fetch-depth: 0`、ref ごとの `concurrency` グループ） |
 | `tests/test_voice_assets.py` | 同梱の音声の健全性（`assets/voice/` の manifest と WAV の欠け・余り・形式、既定の設定が読み上げる全文言が manifest にあること、`announce.wav` と `hotaru.mp3`。VOICEVOX は使わずファイルだけを調べる） |
 | `tests/test_docs.py` | 文書の記載と実装の一致（文書中の `--say` の例が作り置きにあること、README・要求定義書・仕様書の版が `chime/__init__.py` の `__version__` と一致すること、`CHANGELOG.md` の先頭の版が `__version__` と一致すること、文書に書いた作り置きの件数・天気コードの語数がコードから数えた値と一致すること、廃止したキーが「廃止」の語なしに現行の設定として書かれていないこと） |
 
 CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自動実行する（`test` ジョブ。「CLI が起動すること」の `--test-hourly 12` は、実際の通信をしないよう `--config tests/fixtures/offline_config.json`（天気を無効にした設定）を渡す）。別ジョブ（`lint`。Python 3.11 のみ）で `pyflakes`（版を固定してインストールする）を `python -m pyflakes chime scripts tests campus_chime.py` で実行する。ワークフロー全体の権限は `contents: read` だけで、同じ ref の古い実行は新しい実行が始まると止める（`concurrency`）。この環境には音声合成エンジンを一切導入しないため、「合成エンジンが一つも使えない」状態がそのまま再現される。別ジョブ（`prerecorded-only`）で、時報の定型文・ひとこと・天気予報の全文言（`chime/phrases.py` の `collect_phrases()` が列挙する語彙）を `--say ... --dry-run` で 1 件ずつ流し、無音になったことを示す警告（`を合成できませんでした`）が 1 件も出ないことを確認する。これにより、作り置き（`assets/voice/`）だけで全文言を賄えていることを回帰的に検証する（v4.x まではここで `open_jtalk` を導入し実際の音声合成を検証していたが、v5.0.0 でそのエンジンをコードごと削除したため不要になった）。
 
 手元で `prerecorded-only` ジョブと同じ検証をするには、`.github/workflows/ci.yml` のコマンドをそのまま実行する（`cache/tts/` を消してから実行すると、キャッシュ済みの合成結果に隠れず確実に検証できる）。
+
+版のタグは、別のワークフロー（`.github/workflows/tag.yml`、名前は「タグ付け」）が付ける。`main` への push のたびに（手動実行の `workflow_dispatch` も `main` だけ）、`github-actions[bot]` として `python scripts/tag_releases.py --since 5.2.0 --push` を実行する。タグを push するため、権限に `contents: write` を持つのはこのワークフローだけで、`ci.yml` は `contents: read` のままにしてある。履歴をたどるので、取得は `fetch-depth: 0`（全履歴）にする（浅い clone ではスクリプトが終了コード 2 で止まる）。スクリプトは `main` を first-parent でたどり、`chime/__init__.py` の `__version__` がその版になった**最初のコミット**（版を出した PR のマージコミット）に、`vX.Y.Z` の注釈付きタグ（メッセージはタグ名）を付ける。ただし `CHANGELOG.md` にその版の見出し（`## [X.Y.Z]`）が無いコミットには付けない。既存のタグは動かさず、消しもしない（別のコミットを指すタグがあっても警告するだけ）ので、何度実行しても結果は変わらない。タグを付けるのは 5.2.0 以降の版だけで、この下限はスクリプトに埋め込まず、ワークフローが `--since 5.2.0` で渡す。実行は `concurrency`（グループ `tag-${{ github.ref }}`、つまり ref ごと）で 1 つずつ順に行い、実行中のものを取り消さない。`main` への push と `main` での手動実行は同じグループに並ぶので順に実行され、別のブランチでの手動実行（`main` ではないのでタグは付けずに終わる）が、待っている `main` の実行を押しのけることはない。PR は「Create a merge commit」（または「Squash and merge」）でマージする。「Rebase and merge」やファストフォワードでは、マージコミットができず、PR の版を上げたコミットがそのまま `main` の first-parent に載るため、タグがそのコミットに付いてしまう。
+
+付けられなかった版（`__version__` がその版なのに `CHANGELOG.md` に `## [X.Y.Z]` の見出しが無い場合と、ref の先頭で `__version__` を読み取れない場合）は、警告として報告する（Actions の画面では注釈になる）。実行は緑のまま終わる。1 つのタグの作成に失敗しても、残りのタグは作って push し、実行は赤（終了コード 1）で終わる。git が履歴やオブジェクトを読めない（clone が壊れている・途中までしかない）ときは、何もタグを付けず、実行は赤で終わる。
 
 ### 10.2 実機での確認
 
@@ -691,6 +698,8 @@ CI（`.github/workflows/ci.yml`）で Python 3.9 / 3.11 / 3.13 に対して自�
 | 時報音の再生成（時報音の設定を変えたとき） | `python3 campus_chime.py --generate-assets` |
 
 > **運用上の注意:** **16:55〜17:02（閉館放送の前後）は、更新・再起動・停止をしない。** 待機中は停止要求にすぐ応じるが、再生中は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了する（4.10 章。今後の版で改善予定）。
+
+> **版のタグ:** `main` にマージすると、GitHub Actions が版のタグ（`v5.2.0` 以降）を自動で付ける（10.1 章）。手でタグを作る必要はなく、`CHANGELOG.md` の版見出しのリンク（`releases/tag/vX.Y.Z`）は v5.2.0 から先がこのタグに解決する。
 
 ---
 
