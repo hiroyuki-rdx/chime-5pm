@@ -10,6 +10,7 @@ import urllib.error
 import wave
 from unittest import mock
 
+from chime import config as chime_config
 from chime.audio import Player
 from chime.scheduler import Event
 
@@ -61,6 +62,40 @@ KYOTO_ONLY = {
         },
     },
 }
+
+
+# -- 開発者の手元の config.json ---------------------------------------------------
+#: 差し替える前の ``chime.config.local_config_path``（本物の動作を確かめるテスト用）。
+REAL_LOCAL_CONFIG_PATH = chime_config.local_config_path
+
+#: 「現地設定は無い」ことを表す、存在しないパス。
+NO_LOCAL_CONFIG = os.path.join(FIXTURES, "no-local-config", "config.json")
+
+
+def _local_config_path_for_tests(base_dir: str = chime_config.BASE_DIR) -> str:
+    """リポジトリ直下だけ「現地設定なし」にし、ほかのフォルダは本物の場所を返す。"""
+    if os.path.abspath(base_dir) == chime_config.BASE_DIR:
+        return NO_LOCAL_CONFIG
+    return REAL_LOCAL_CONFIG_PATH(base_dir)
+
+
+def isolate_local_config() -> None:
+    """リポジトリ直下の ``config.json`` を、テストが読まないようにする。
+
+    開発者が手元に置いた ``config.json``（Git 管理外）を ``load_config`` が自動で
+    読むため、CLI や生成スクリプトを ``--config`` なしで動かすテストは、その内容に
+    左右されて落ちていた（例: ``start_hour`` を 9 にしていると時刻アナウンスの
+    件数が変わる）。``chime.config.local_config_path`` の差し替えで、リポジトリ
+    直下だけ「無い」ことにする。``base_dir`` に一時フォルダを渡すテストは、その
+    フォルダの ``config.json`` を従来どおり読む。
+
+    このモジュールを import したときに 1 度だけ呼ぶ（プロセス全体に効く。
+    ``tests/__init__.py`` のログ抑制と同じ扱い）。何度呼んでも結果は同じ。
+    """
+    chime_config.local_config_path = _local_config_path_for_tests
+
+
+isolate_local_config()
 
 
 # -- ログ ------------------------------------------------------------------------

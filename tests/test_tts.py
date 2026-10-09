@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -14,7 +15,7 @@ from unittest import mock
 from tests.support import VOICE_DIR, logs_enabled
 
 from chime.tts import (PrerecordedEngine, TTSEngine, TTSError,
-                       TTSService, VoicevoxEngine, digest)
+                       TTSService, VoicevoxEngine, digest, normalize_phrase)
 
 
 class FakeEngine(TTSEngine):
@@ -685,6 +686,91 @@ class EngineConfigurationTest(unittest.TestCase):
             mocked.return_value.__enter__.return_value.status = 200
             self.assertTrue(engine.available())
         self.assertEqual(mocked.call_args.kwargs.get("timeout"), 9.5)
+
+
+#: 50021 番に HTTP ではないもの（別のサービスなど）が居座っているときに ``http.client`` が
+#: 投げる例外。どれも ``OSError`` の仲間ではない（``RemoteDisconnected`` だけは仲間）。
+NON_HTTP_ANSWERS = [
+    http.client.BadStatusLine("SSH-2.0-OpenSSH_9.2"),
+    http.client.RemoteDisconnected("Remote end closed connection without response"),
+    http.client.IncompleteRead(b"", 10),
+    http.client.LineTooLong("header line"),
+]
+
+
+class VoicevoxNonHttpAnswerTest(unittest.TestCase):
+    """HTTP ではないものが答えたとき、VOICEVOX ENGINE は「使えない」になる（落ちない）。
+
+    ``urllib`` は ``OSError`` だけを ``URLError`` に包む。``BadStatusLine`` などの
+    ``http.client.HTTPException`` はそのまま出てくるので、受けないと起動時の疎通確認
+    （``describe``）ごと落ちていた。
+    """
+
+    URL = "http://127.0.0.1:50021"
+
+    def engine(self):
+        return VoicevoxEngine({"base_url": self.URL})
+
+    def test_available_is_false(self):
+        for error in NON_HTTP_ANSWERS:
+            with self.subTest(type(error).__name__):
+                with mock.patch("chime.tts.urllib.request.urlopen", side_effect=error):
+                    self.assertFalse(self.engine().available())
+
+    def test_describe_reports_the_engine_as_unavailable(self):
+        service = TTSService({"engines": ["voicevox"], "voicevox": {"base_url": self.URL}},
+                             "cache", "voice")
+        with mock.patch("chime.tts.urllib.request.urlopen",
+                        side_effect=http.client.BadStatusLine("garbage")):
+            self.assertEqual(service.describe(), "voicevox(利用不可)")
+
+    def test_the_reason_is_logged_at_debug(self):
+        with mock.patch("chime.tts.urllib.request.urlopen",
+                        side_effect=http.client.BadStatusLine("garbage")):
+            with logs_enabled(), self.assertLogs("chime.tts", level="DEBUG") as captured:
+                self.assertFalse(self.engine().available())
+        self.assertEqual([record.levelname for record in captured.records], ["DEBUG"])
+        self.assertIn("BadStatusLine", captured.records[0].getMessage())
+
+    def test_synthesize_turns_it_into_a_tts_error(self):
+        # 合成の途中で同じことが起きても、事前生成スクリプトが TTSError として
+        # 数えられるよう、通信の失敗と同じ扱いにする。
+        for error in NON_HTTP_ANSWERS:
+            with self.subTest(type(error).__name__):
+                with tempfile.TemporaryDirectory() as directory:
+                    out_path = os.path.join(directory, "out.wav")
+                    with mock.patch("chime.tts.urllib.request.urlopen", side_effect=error):
+                        with self.assertRaises(TTSError):
+                            self.engine().synthesize("こんにちは", out_path)
+                    self.assertFalse(os.path.exists(out_path))
+
+
+class NormalizePhraseTest(unittest.TestCase):
+    """作り置きを引く前の文言の整え方。実行時の照合・列挙・生成が同じ関数を使う。"""
+
+    def test_strips_surrounding_whitespace(self):
+        self.assertEqual(normalize_phrase("  こんにちは\n"), "こんにちは")
+        self.assertEqual(normalize_phrase("\u3000全角の空白も落とす\u3000"), "全角の空白も落とす")
+
+    def test_keeps_inner_whitespace(self):
+        self.assertEqual(normalize_phrase(" a  b "), "a  b")
+
+    def test_nothing_becomes_an_empty_string(self):
+        for value in (None, "", "   ", "\n\t"):
+            with self.subTest(value=value):
+                self.assertEqual(normalize_phrase(value), "")
+
+    def test_the_service_looks_up_with_the_same_normalisation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            voice = os.path.join(directory, "voice")
+            os.makedirs(voice)
+            path = os.path.join(voice, digest("こんにちは") + ".wav")
+            with open(path, "wb") as handle:
+                handle.write(b"RIFF")
+            service = TTSService({"engines": ["prerecorded"]}, os.path.join(directory, "c"), voice)
+            raw = "\u3000こんにちは \n"
+            self.assertEqual(service.prerecorded_lookup(raw), path)
+            self.assertEqual(service.prerecorded_lookup(normalize_phrase(raw)), path)
 
 
 if __name__ == "__main__":

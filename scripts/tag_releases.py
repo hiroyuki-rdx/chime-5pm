@@ -38,6 +38,15 @@ push もしない）::
 版を読めなかった・見出しが無くてタグを付けなかった、といった取りこぼしは
 警告で知らせる（終了コードは変わらない）。
 
+push は ``git push --porcelain`` で 1 回にまとめて行い、タグごとの結果（送れた・
+送り先に既にあった・断られた）を読み取って知らせる。GitHub は、``.github/workflows``
+の中身が既定ブランチと違うコミットを指すタグを、``GITHUB_TOKEN``（``workflows``
+権限を付けられない）での push では受け付けない。古い版のタグがこれに当たり、人が
+手元から 1 回だけ送るほかない。この断り方は GitHub の仕様で、実行の失敗ではないので、
+タグごとの警告（手元で作って送るコマンドつき）で知らせ、終了コードには響かせない。
+それ以外の断り方や、タグごとの結果が得られない失敗（送り先が無い・認証など）は、
+これまでどおり失敗として知らせる。
+
 終了コード: 0 = 正常（付けるものが無かった場合や、警告だけの場合を含む）、
 1 = git の実行（履歴の読み取り・タグの作成・push）に失敗、2 = 使い方や環境の問題
 （git リポジトリでない・浅いクローン・ref が無い・引数が不正）。
@@ -51,11 +60,12 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 __all__ = [
-    "GitError", "VERSION_RE", "first_appearances", "has_changelog_entry", "main",
-    "parse_version", "read_file_at", "tag_commit", "version_key",
+    "GitError", "NEEDS_WORKFLOWS", "PUSHED", "PushOutcome", "REJECTED", "UP_TO_DATE",
+    "VERSION_RE", "first_appearances", "has_changelog_entry", "main", "parse_push_porcelain",
+    "parse_version", "push_status", "read_file_at", "tag_commit", "version_key",
 ]
 
 #: ``__version__ = "5.3.0"`` の行（引用符は ' でも " でもよい）。X.Y.Z の数字だけを取り出す。
@@ -69,9 +79,34 @@ _VERSION_ONLY_RE = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 VERSION_FILE = "chime/__init__.py"
 CHANGELOG_FILE = "CHANGELOG.md"
 
+#: ``git push --porcelain`` の結果の行の先頭の 1 字。送れた（空白・``+``・``*``・``-``）、
+#: 送り先に既にあった（``=``）、断られた（``!``）。
+_PUSH_FLAGS = " +-*!="
+
+#: GitHub が ``GITHUB_TOKEN``（GitHub App）の push を断るときの理由に入っている語句。
+#: ``refusing to allow a GitHub App to create or update workflow `.github/workflows/ci.yml`
+#: without `workflows` permission``。人の OAuth トークンの ``workflow`` スコープの断り
+#: （``without `workflow` scope``）は別の話なので拾わない。
+_WORKFLOWS_PERMISSION_RE = re.compile(r"\bworkflows`?\s+permission", re.IGNORECASE)
+
+#: タグ 1 つの push の結果（:func:`push_status` の戻り値）。
+PUSHED = "pushed"                    # 送り先に届いた
+UP_TO_DATE = "up-to-date"            # 送り先に既に同じものがあった
+NEEDS_WORKFLOWS = "needs-workflows"  # GitHub が ``workflows`` 権限が無いことを理由に断った
+REJECTED = "rejected"                # それ以外の理由で断られた（結果が得られなかった場合を含む）
+
 
 class GitError(RuntimeError):
     """git の実行に失敗した。"""
+
+
+class PushOutcome(NamedTuple):
+    """``git push --porcelain`` が出す、ref 1 つ分の結果の行。"""
+
+    flag: str      # 先頭の 1 字（空白・``+``・``-``・``*``・``!``・``=``）
+    ref: str       # 送り先の ref（``refs/tags/v5.2.0``）
+    summary: str   # ``[new tag]``・``[up to date]``・``[remote rejected]`` など
+    reason: str    # 括弧の中の説明（断られた理由など）。無ければ空文字
 
 
 def parse_version(text: str) -> Optional[str]:
@@ -82,6 +117,40 @@ def parse_version(text: str) -> Optional[str]:
     """
     match = VERSION_RE.search(text)
     return match.group(1) if match else None
+
+
+def parse_push_porcelain(text: str) -> List[PushOutcome]:
+    """``git push --porcelain`` の標準出力から、ref ごとの結果の行を読み取る。
+
+    結果の行は ``<flag> TAB <from>:<to> TAB <summary> [(<reason>)]``（git-push(1) の
+    OUTPUT）。送り先を示す ``To …`` の行や末尾の ``Done`` など、形の違う行は飛ばす。
+    ``<reason>`` は、``<summary>`` の後ろの括弧の中身（括弧の入れ子があっても、最後の
+    閉じ括弧までを 1 つとして取る）。
+    """
+    outcomes = []
+    for line in text.split("\n"):
+        parts = line.rstrip("\r").split("\t", 2)
+        if len(parts) != 3 or len(parts[0]) != 1 or parts[0] not in _PUSH_FLAGS:
+            continue
+        flag, refs, rest = parts
+        if ":" not in refs:
+            continue
+        summary, reason = rest, ""
+        if rest.endswith(")") and " (" in rest:
+            summary, _, reason = rest[:-1].partition(" (")
+        outcomes.append(PushOutcome(flag, refs.split(":", 1)[1], summary, reason))
+    return outcomes
+
+
+def push_status(outcome: PushOutcome) -> str:
+    """結果の行を、:data:`PUSHED`・:data:`UP_TO_DATE`・:data:`NEEDS_WORKFLOWS`・:data:`REJECTED` に分ける。
+
+    ``NEEDS_WORKFLOWS`` は、断られた行（``!``）の理由に ``workflows`` 権限が無いという
+    GitHub の断り文句があるときだけ。断られていない行に同じ文句があっても数えない。
+    """
+    if outcome.flag == "!":
+        return NEEDS_WORKFLOWS if _WORKFLOWS_PERMISSION_RE.search(outcome.reason) else REJECTED
+    return UP_TO_DATE if outcome.flag == "=" else PUSHED
 
 
 def version_key(version: str) -> Tuple[int, int, int]:
@@ -275,15 +344,101 @@ def _warn(message: str) -> None:
         print("警告: " + message, file=sys.stderr)
 
 
-def _push_tags(repo: str, remote: str, tags: List[str]) -> Optional[str]:
-    """``tags`` を 1 回の ``git push`` でまとめて送る。失敗したら git のメッセージを返す。"""
+def _push_tags(repo: str, remote: str, tags: List[str]) -> "subprocess.CompletedProcess[str]":
+    """``tags`` を 1 回の ``git push --porcelain`` でまとめて送り、git の結果をそのまま返す。
+
+    ``--porcelain`` は、ref ごとの結果を機械で読める形で標準出力に出す
+    （:func:`parse_push_porcelain`）。
+    """
     refspecs = ["refs/tags/{0}".format(tag) for tag in tags]
     # 認証を求められても対話で待たずに失敗させる（Actions や cron で固まらないように）。
     env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
-    result = _git(repo, "push", remote, *refspecs, env=env)
-    if result.returncode != 0:
-        return _detail(result)
-    return None
+    return _git(repo, "push", "--porcelain", remote, *refspecs, env=env)
+
+
+def _sort_by_status(tags: List[str], result: "subprocess.CompletedProcess[str]"
+                    ) -> Tuple[Dict[str, List[str]], Dict[str, PushOutcome]]:
+    """``tags`` を push の結果ごとに分ける。``(状態ごとのタグ, ref ごとの結果の行)`` を返す。
+
+    結果の行が無いタグは、git が成功したなら送れたものとし（読み取れない出力でも
+    成功と言えるように）、失敗したなら ``REJECTED``（送れたとは言えない）にする。
+    """
+    found = {outcome.ref: outcome for outcome in parse_push_porcelain(result.stdout)}
+    groups: Dict[str, List[str]] = {PUSHED: [], UP_TO_DATE: [], NEEDS_WORKFLOWS: [], REJECTED: []}
+    for tag in tags:
+        outcome = found.get("refs/tags/{0}".format(tag))
+        if outcome is not None:
+            groups[push_status(outcome)].append(tag)
+        else:
+            groups[PUSHED if result.returncode == 0 else REJECTED].append(tag)
+    return groups, found
+
+
+def _workflows_message(repo: str, remote: str, tag: str, reason: str) -> str:
+    """GitHub が ``workflows`` 権限を理由に断ったタグについて、人がすることを書いた警告。
+
+    Actions の注釈は 1 行なので、手元で打つコマンドは ``&&`` でつないだ 1 行にする
+    （``git fetch`` が失敗したのに続きを実行しないように）。
+    """
+    sha = tag_commit(repo, tag) or "<コミットの sha>"
+    name = shlex.quote(remote)
+    return ("{0} は GitHub Actions からは作れません（この実行の失敗ではありません）。"
+            "コミット {1} のワークフローのファイル（.github/workflows）が既定ブランチと違うため、"
+            "GitHub は Actions のトークン（GITHUB_TOKEN）によるこのタグの作成を断ります"
+            "（GitHub の返答: {2}）。人が自分のマシンで 1 回だけ作って送ってください: "
+            "git fetch {3} && git tag -a {0} {4} -m {0} && git push {3} {0}"
+            .format(tag, sha[:7], reason, name, sha))
+
+
+def _outcome_text(outcome: PushOutcome) -> str:
+    """結果の行を読みやすい形にする（``[rejected] (already exists)``）。"""
+    if outcome.reason:
+        return "{0} ({1})".format(outcome.summary, outcome.reason)
+    return outcome.summary
+
+
+def _report_refused(remote: str, tags: List[str], found: Dict[str, PushOutcome],
+                    result: "subprocess.CompletedProcess[str]") -> None:
+    """送れなかった ``tags`` を失敗として知らせる（標準エラー）。送り直すコマンドも示す。"""
+    for tag in tags:
+        outcome = found.get("refs/tags/{0}".format(tag))
+        if outcome is not None:
+            print("{0} は {1} に受け付けられませんでした: {2}"
+                  .format(tag, remote, _outcome_text(outcome)), file=sys.stderr)
+    print("タグを {0} に push できませんでした: {1}".format(remote, _detail(result)),
+          file=sys.stderr)
+    print("タグはこのリポジトリには作ってあります（{0}）。".format(", ".join(tags)),
+          file=sys.stderr)
+    print("手で送るには: git push {0} {1}".format(
+        shlex.quote(remote), " ".join("refs/tags/{0}".format(tag) for tag in tags)),
+        file=sys.stderr)
+
+
+def _push_and_report(repo: str, remote: str, created: List[str]) -> int:
+    """``created`` を push し、タグごとの結果を知らせる。失敗があれば 1、なければ 0 を返す。
+
+    GitHub が ``workflows`` 権限を理由に断ったタグは、警告で知らせるだけで失敗にしない
+    （人が手元から送るほかなく、この実行ではどうにもならないため）。それ以外の断り方、
+    結果が得られなかったタグ、結果の読み取れない git の失敗は、失敗として知らせる。
+    """
+    result = _push_tags(repo, remote, created)
+    groups, found = _sort_by_status(created, result)
+    if groups[PUSHED]:
+        print("{0} 件のタグを {1} に push しました（{2}）。"
+              .format(len(groups[PUSHED]), remote, ", ".join(groups[PUSHED])))
+    if groups[UP_TO_DATE]:
+        print("{0} は {1} に既にあります（送る必要はありませんでした）。"
+              .format(", ".join(groups[UP_TO_DATE]), remote))
+    for tag in groups[NEEDS_WORKFLOWS]:
+        _warn(_workflows_message(repo, remote, tag, found["refs/tags/{0}".format(tag)].reason))
+
+    refused = groups[REJECTED]
+    if not refused and result.returncode != 0 and not groups[NEEDS_WORKFLOWS]:
+        refused = list(created)   # git は失敗と言うのに、理由が読み取れない
+    if refused:
+        _report_refused(remote, refused, found, result)
+        return 1
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -397,19 +552,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     if args.push and created:
-        failure = _push_tags(args.repo, args.remote, created)
-        if failure is not None:
-            print("タグを {0} に push できませんでした: {1}".format(args.remote, failure),
-                  file=sys.stderr)
-            print("タグはこのリポジトリには作ってあります（{0}）。"
-                  .format(", ".join(created)), file=sys.stderr)
-            print("手で送るには: git push {0} {1}".format(
-                shlex.quote(args.remote),
-                " ".join("refs/tags/{0}".format(tag) for tag in created)), file=sys.stderr)
-            exit_code = 1
-        else:
-            print("{0} 件のタグを {1} に push しました（{2}）。"
-                  .format(len(created), args.remote, ", ".join(created)))
+        exit_code = max(exit_code, _push_and_report(args.repo, args.remote, created))
     return exit_code
 
 

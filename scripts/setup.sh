@@ -3,9 +3,13 @@
 # Raspberry Pi OS Lite 上でキャンパス時報システムを導入する。
 # 何度実行しても同じ結果になる（冪等）よう作ってある。
 #
-#   bash scripts/setup.sh              # 依存導入 → 音源生成 → サービス登録
+#   bash scripts/setup.sh              # 依存導入 → 音源生成 → 設置状態の点検 → サービス登録
 #   bash scripts/setup.sh --no-apt     # apt を実行しない
 #   bash scripts/setup.sh --no-service # systemd への登録を行わない
+#
+# サービスの再起動に成功したら、そのときのコミットを cache/deployed_commit に記録する
+# （scripts/update.sh が、サービスに反映済みの版かどうかを判断するのに使う）。
+# 設定ファイル（config.json）を読めないときは、サービスを再起動せず、終了コード 1 で終わる。
 #
 set -euo pipefail
 
@@ -28,6 +32,30 @@ done
 
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m警告: %s\033[0m\n' "$*" >&2; }
+alert() { printf '\033[1;31m!! %s\033[0m\n' "$*" >&2; }
+
+# サービスに反映した版（いまの HEAD のコミット）を cache/deployed_commit に記録する。
+# scripts/update.sh は、これといまの HEAD を見比べて、サービスが古い版のままかを判断する。
+# サービスの再起動に成功したときだけ呼ぶ。書くのは実行している利用者（sudo は使わない）で、
+# 一時ファイルに書いてから置き換える。失敗しても導入は止めない（update.sh が続きを行うだけ）。
+# root で実行しているときは書かない。cache/ を root 所有で作ると、サービス（pi）が
+# 再生済みの記録を書けなくなるため。
+record_deployed_commit() {
+  local commit
+  if [ "$(id -u)" -eq 0 ]; then
+    warn "root で実行しているため、サービスに反映した版の記録（cache/deployed_commit）は書きません。"
+    return 0
+  fi
+  if ! commit="$(git -C "${REPO_DIR}" rev-parse HEAD 2>/dev/null)"; then
+    warn "git でいまのコミットを調べられないため、サービスに反映した版の記録（cache/deployed_commit）は書きません。"
+    return 0
+  fi
+  if ! { mkdir -p "${REPO_DIR}/cache" \
+         && printf '%s\n' "${commit}" > "${REPO_DIR}/cache/deployed_commit.tmp" \
+         && mv -f "${REPO_DIR}/cache/deployed_commit.tmp" "${REPO_DIR}/cache/deployed_commit"; } 2>/dev/null; then
+    warn "サービスに反映した版の記録（cache/deployed_commit）を書けませんでした。放送には影響しません（次の update.sh は、念のため続きの反映を行います）。"
+  fi
+}
 
 log "設置パスの確認"
 echo "リポジトリ: ${REPO_DIR}"
@@ -81,7 +109,13 @@ EOF
 fi
 
 log "時報音の生成と、時刻アナウンスの音声の確認"
-if ! python3 "${REPO_DIR}/campus_chime.py" --generate-assets; then
+generate_status=0
+python3 "${REPO_DIR}/campus_chime.py" --generate-assets || generate_status=$?
+if [ "${generate_status}" -eq 2 ]; then
+  # 終了コード 2 は、設定ファイル（config.json）を読めないとき。作り置きが無いのではないので、
+  # PC で作り直す案内は出さない（直らない）。理由は、次の点検が表示する。
+  warn "設定ファイル（config.json）を読めないため、時報音の生成と音声の確認ができませんでした。上の表示のとおり直してください。"
+elif [ "${generate_status}" -ne 0 ]; then
   warn "時刻アナウンスの音声を用意できませんでした。時報音（ポ・ポ・ポ・ポーン）は鳴りますが、読み上げが出ません。"
   warn "config.json が古い場合もあります（起動時に「既定値と同じ値を N 項目」の警告が出るなら該当します。"
   warn "その場合は PC で作り直しても直りません。docs/SETUP.md の 10-7 を参照）。"
@@ -95,19 +129,55 @@ if ! python3 "${REPO_DIR}/campus_chime.py" --generate-assets; then
   warn "詳しい手順は docs/SETUP.md の 8 章を参照してください。"
 fi
 
-log "動作確認（音は鳴りません）"
-python3 "${REPO_DIR}/campus_chime.py" --schedule 5
+# 終了コード: 0 = 問題なし、1 = NG あり（放送の一部が鳴らない）、2 = 設定ファイルを読めない。
+# 2 のときだけは、サービスを再起動しない（読めない設定で再起動すると、起動できないまま
+# 再起動を繰り返す）。
+log "設置状態の点検（音は鳴りません）"
+check_status=0
+python3 "${REPO_DIR}/campus_chime.py" --check || check_status=$?
+if [ "${check_status}" -eq 2 ]; then
+  warn "設定ファイル（config.json）を読めませんでした。上の表示のとおり直してください。"
+elif [ "${check_status}" -ne 0 ]; then
+  warn "点検で NG が見つかりました。上の表示の『直し方』に従ってください（このまま続けます）。"
+fi
 
+log "動作確認（音は鳴りません）"
+if [ "${check_status}" -eq 2 ]; then
+  echo "設定ファイルを読めないため、省略します。"
+else
+  python3 "${REPO_DIR}/campus_chime.py" --schedule 5
+fi
+
+restart_withheld=0
 if [ "${DO_SERVICE}" -eq 1 ]; then
   log "systemd への登録"
   sudo cp "${REPO_DIR}/${SERVICE_NAME}" "/etc/systemd/system/${SERVICE_NAME}"
   sudo systemctl daemon-reload
   sudo systemctl enable "${SERVICE_NAME}"
-  sudo systemctl restart "${SERVICE_NAME}"
-  sleep 2
+  if [ "${check_status}" -eq 2 ]; then
+    restart_withheld=1
+    alert "サービスを再起動していません（設定ファイルを読めないため）。今動いている分は、そのまま動き続けます。"
+    warn "config.json を直したあと、もう一度 bash scripts/setup.sh --no-apt を実行してください。"
+  else
+    sudo systemctl restart "${SERVICE_NAME}"
+    sleep 2
+    record_deployed_commit
+  fi
   sudo systemctl status "${SERVICE_NAME}" --no-pager || true
 else
   echo "--no-service が指定されたため、systemd への登録を省略します。"
+fi
+
+# 設定ファイルを読めないまま「完了」と言わない。終了コード 1 で終わる（update.sh はこれで失敗と
+# 分かる）。サービスを触らない指定（--no-service）でも同じ。
+if [ "${check_status}" -eq 2 ]; then
+  log "導入は途中です"
+  if [ "${restart_withheld}" -eq 1 ]; then
+    alert "サービスを再起動していません。config.json を直して、もう一度 bash scripts/setup.sh --no-apt を実行してください。"
+  else
+    alert "設定ファイル（config.json）を読めないため、導入は終わっていません。config.json を直して、もう一度 bash scripts/setup.sh --no-apt --no-service を実行してください。"
+  fi
+  exit 1
 fi
 
 log "完了"

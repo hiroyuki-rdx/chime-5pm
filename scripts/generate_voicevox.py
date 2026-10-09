@@ -163,6 +163,31 @@ def _prune(manifest: Dict[str, str], stale: List[Tuple[str, str]],
     print("{0} 件の古いエントリを削除しました。".format(len(stale)))
 
 
+def _remove_quietly(path: str) -> None:
+    """``path`` を消す。無い・消せないときは何もしない（後始末用）。"""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _synthesize_to(engine: VoicevoxEngine, phrase: str, path: str) -> None:
+    """``phrase`` の WAV を ``path`` へ作る。途中で止まっても欠けた WAV を ``path`` に残さない。
+
+    同じディレクトリの一時ファイルに書いてから ``os.replace`` で置き換える。
+    ``path`` に書きかけが残ると、次の実行で「生成済み」として飛ばされ、欠けた声が
+    そのまま使われてしまうため。失敗・中断（Ctrl-C を含む）では一時ファイルを消す。
+    ``--force`` で作り直すときも、置き換えるまで元の WAV は残る。
+    """
+    temp_path = "{0}.{1}.tmp".format(path, os.getpid())
+    try:
+        engine.synthesize(phrase, temp_path)
+        os.replace(temp_path, path)
+    except BaseException:
+        _remove_quietly(temp_path)
+        raise
+
+
 def _synthesize_all(engine: VoicevoxEngine, phrases: List[str], out_dir: str,
                     manifest: Dict[str, str], force: bool) -> int:
     """``phrases`` を合成して ``manifest`` に登録する。失敗した件数を返す。"""
@@ -175,7 +200,7 @@ def _synthesize_all(engine: VoicevoxEngine, phrases: List[str], out_dir: str,
             print("  skip {0}".format(phrase))
             continue
         try:
-            engine.synthesize(phrase, path)
+            _synthesize_to(engine, phrase, path)
         except TTSError as exc:
             # 合成できなかった文言は manifest に書かない（WAV が無いのに
             # エントリだけが manifest に残ってしまうため）。
