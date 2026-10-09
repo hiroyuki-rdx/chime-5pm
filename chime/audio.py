@@ -24,6 +24,11 @@ from . import env
 
 logger = logging.getLogger(__name__)
 
+# pygame は import しただけで、標準出力に版数と宣伝のバナーを出す。
+# ``--print-config`` などの JSON 出力に混ざって壊すので、import の前に消しておく。
+# 利用者が自分で設定していれば、その値を尊重する（上書きしない）。
+os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+
 try:  # pragma: no cover - 実機以外では未導入が正常
     import pygame
 except ImportError:  # pragma: no cover

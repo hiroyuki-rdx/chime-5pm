@@ -105,6 +105,8 @@ System clock synchronized: yes
 - タイムゾーンが違う場合: `sudo timedatectl set-timezone Asia/Tokyo`
 - `synchronized: no` の場合: ネットワーク接続を確認し、1〜2 分待って再確認
 
+本体を導入したあとは、`python3 campus_chime.py --status` の「時刻の同期」でも確かめられます（6-2）。
+
 ---
 
 ## 4. 音を出せるようにする
@@ -179,8 +181,11 @@ bash scripts/setup.sh
 3. タイムゾーンと NTP 同期の確認
 4. 空の `config.json`（変えたい項目だけを書くための上書きファイル）を作成（既にあれば触りません）
 5. 時報音（`assets/generated/time_signal.wav`）の生成と、時刻アナウンスの音声（作り置き）の確認
-6. 予定表の表示
-7. systemd への登録・有効化・起動
+6. 設置状態の点検（`--check`。音は鳴らず、何も書きません。NG があれば「直し方」を表示して先へ進みます）
+7. 予定表の表示
+8. systemd への登録・有効化・起動。再起動に成功したら、そのときのコミットを `cache/deployed_commit` に記録します（`update.sh` が、サービスが最新のコードで動いているかを見分けるのに使います）
+
+6 で `config.json` を読めなかったとき（`--check` の終了コードが 2）だけは、7 を省き、8 でサービスを再起動しません（読めない設定で再起動すると、起動できないまま再起動を繰り返すため）。このときは最後に「導入は途中です」と表示して**終了コード 1** で終わります。サービスの登録を省く `--no-service` を付けても、同じく終了コード 1 で終わります（「完了」とは表示しません）。`config.json` を直して、もう一度実行してください。
 
 **このスクリプトは何度実行しても安全です**（`config.json` を上書きしません）。
 
@@ -213,13 +218,62 @@ python3 campus_chime.py --test
 - [ ] 蛍の光がだんだん大きくなる（2 秒フェードイン）
 - [ ] **音飛び・ぶつ切れがない**
 
-### 6-2. サービスの状態を見る
+### 6-2. 状態を見る・設置状態を点検する
 
 ```bash
-sudo systemctl status campus_chime.service
+python3 campus_chime.py --status
 ```
 
-`Active: active (running)` になっていれば常駐しています。
+```
+campus-chime 6.1.0 (a1b2c3d)
+
+現在時刻        2026-08-26 20:07:15 JST
+時刻の同期      同期済み（NTP）
+サービス        動作中（active）
+自動起動        有効（再起動後も自動で始まります）（enabled）
+再生方法        pygame
+作り置きの音声  138 件すべてそろっています
+
+直近の放送（新しい順）
+  （記録はまだありません）
+
+次の予定
+  - 時報 2026-08-27 10:00:00（再生開始 09:59:57）
+  - 時報 2026-08-27 11:00:00（再生開始 10:59:57）
+  - 時報 2026-08-27 12:00:00（再生開始 11:59:57）
+
+気になる点は見つかりませんでした。
+```
+
+末尾が「気になる点は見つかりませんでした。」なら、常駐していて、時刻が同期していて、作り置きの声もそろっています（終了コード 0）。「要確認:」と出たら、その行のとおりに確かめてください（終了コード 1）。「自動起動」は、「無効」でも「要確認」にならないので、「有効」になっていることを自分の目で確かめてください（電源を入れ直したときに自動で始まるかどうか）。1 行目の版とコミットは、手元のコードのものです（更新が途中で止まった Pi では、サービスがその版で動いているとは限りません。9 章 A を参照）。「直近の放送」は、常駐が実際に放送した結果で、放送が済むと並びます（`--test-hourly` などの試し鳴らしは残りません）。
+
+続けて、設置状態を点検します（音は鳴らず、何も書きません）。
+
+```bash
+python3 campus_chime.py --check
+```
+
+```
+== 設定 ==
+  OK    読み込んだ設定  既定値 → /home/pi/campus-chime/config.json
+  OK    設定の書き方    問題は見つかりませんでした
+
+== 作り置きの音声 ==
+  OK    作り置き  138 件すべてそろっています（時刻アナウンス 7/7・ひとこと 57/57・天気 74/74）
+
+== 音源 ==
+  OK    閉館アナウンス  assets/announce.wav
+  OK    蛍の光          assets/hotaru.mp3
+  OK    時報音          assets/generated/time_signal.wav
+
+== 書き込み ==
+  OK    cache/      書き込めます
+  OK    cache/tts/  まだありません（合成した音声を保存するときに作ります）
+
+結果: すべて OK です。
+```
+
+`NG` の行には必ず「直し方」が付きます（警告と情報にも付くことがあります）。`NG` が 1 件でもあれば終了コード 1 で、警告と情報だけなら 0 です。警告と情報は放送を止めません。`cache/tts/` が「まだありません」でも正常です（Pi では音声の合成もキャッシュも発生しません）。音源のファイルは、空でないか、最後まで読めるかまで確かめるので、電源断などで途中までしか書けなかったファイルも `NG` になります（WAV は音のデータを最後まで読み、MP3 は先頭の形と大きさを見たうえで、MPEG のフレームをファイルの終わりまで 1 つずつたどって、最後のフレームが切れていないか、途中に MP3 でないデータが挟まっていないか、ID3 タグのあとにフレームが無い（電源断で、タグまでしか書けなかった）ものでないかを確かめます）。`tts.engines` から `prerecorded` を外すと、声がそろっていても Pi は作り置きを使わず読み上げがすべて無音になるので、「作り置き」の行が `NG`、`--status` の末尾が「要確認」になります（PC で VOICEVOX ENGINE だけを使う開発用の設定です。Pi では戻してください）。状態の保存先（`state.file`）を `/tmp` のような sticky ビットのフォルダに置き、フォルダも既存の `state.json` も別の利用者の持ち物だと、置き換えて保存できないので `NG` です（既定の `cache/` には当てはまりません）。読み方は [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) 3-6 を参照してください。サービスのログまで見たいときは `sudo systemctl status campus_chime.service` も使えます。
 
 ### 6-3. 予定を確認する
 
@@ -251,8 +305,11 @@ journalctl -u campus_chime.service -f
 ```bash
 sudo reboot
 # 再接続して
-sudo systemctl status campus_chime.service
+cd /home/pi/campus-chime
+python3 campus_chime.py --status
 ```
+
+「サービス」が「動作中」、「自動起動」が「有効」なら成功です（起動の直後は、時刻の同期が済むまで 1〜2 分かかります）。
 
 ---
 
@@ -263,9 +320,12 @@ sudo systemctl status campus_chime.service
 ```bash
 cd /home/pi/campus-chime
 nano config.json
+python3 campus_chime.py --check      # 書き間違いの点検（鳴らさない）
 sudo systemctl restart campus_chime.service
 python3 campus_chime.py --schedule   # 反映されたか確認
 ```
+
+`--check` の「設定」の節は、知らないキー（綴りの違い。近いキーがあれば「もしかして …?」と出します）・廃止したキー・範囲外や型違いの値・存在しないタイムゾーン名などを見つけます。結果は 2 通りです。**NG** は、サービスがその値では動けないもの（存在しないタイムゾーン名、1 秒未満の待機時間、読めない数値など）で、サービスの起動時にその項目**だけ**を既定値へ置き換えて動かします（放送は止まらず、ログに ERROR で残ります）。**警告**は、サービスが動けはするが、書いた意図とは違う動きになるもの（鳴らない時刻、曜日の書き間違い、`null` にした節など）で、**置き換えずに、書いたとおりに動きます**。警告の行は、「直し方」を見て自分で直してください（どの値が NG で、どの値が警告かは、[SPECIFICATION.md](SPECIFICATION.md) 3.5 章にあります）。`config.json` が JSON として読めないとき（引用符やカンマの書き間違い、UTF-8 以外での保存）は、原因を日本語で表示して終了コード 2 になります。読めないまま再起動するとサービスが起動できないので、直してから再起動してください。
 
 > `config.json` は Git 管理外です。`git pull` で更新しても、現地の設定は消えません。
 
@@ -431,10 +491,10 @@ python3 campus_chime.py --test-hourly 15   # 確認
 
 **ログに「v6.0.0 で廃止しました」と出たら**
 
-v6.0.0 で廃止した設定が `config.json` に残っていると、起動のたびに警告が出ます。値は無視されて放送は止まりませんが、警告に出た行は `config.json` から消してください。
+v6.0.0 で廃止した設定が `config.json` に残っていると、起動のたびに警告が出ます。値は無視されて放送は止まりませんが、警告に出た行は `config.json` から消してください。残っている行は、次で「警告」として出ます（「直し方: この行を消してください」）。
 
 ```bash
-journalctl -u campus_chime.service --since "5 min ago" | grep 廃止
+python3 campus_chime.py --check
 ```
 
 - 廃止した 5 項目 `extra_segment.mode` / `weather_probability` / `always_weather_hours` / `always_quote_hours` / `fallback_to_quote` は、天気を流す時刻を `extra_segment.weather_hours` で指定する方式に置き換わりました
@@ -518,12 +578,11 @@ Pi の `config.json` を渡す場合は、この例にも `--config pi-config.js
 生成した音声を WSL2 側でその場で試聴する場合は、既定では音が鳴りません。`--backend pygame` を明示してください（詳しくは「10-6. WSL2 で試すと音が鳴らない」参照）。
 
 3. 生成された `assets/voice/` を commit して push
-4. Pi 側で反映
+4. Pi 側で反映（9 章 A）
 
 ```bash
 cd /home/pi/campus-chime
-git pull
-sudo systemctl restart campus_chime.service
+bash scripts/update.sh
 python3 campus_chime.py --test-hourly
 ```
 
@@ -542,7 +601,7 @@ python3 campus_chime.py --test-hourly
 
 | 変えたもの | 必要な作業 |
 |---|---|
-| コード・設定値（時刻、曜日、音量など） | **A だけ**（Pi で pull して再起動） |
+| コード・設定値（時刻、曜日、音量など） | **A だけ**（Pi で `bash scripts/update.sh`） |
 | **読み上げる文言** | **B → A の順**（PC で音声を作り直してから Pi へ） |
 
 「読み上げる文言を変えた」には次が含まれます。うっかり踏みやすいのは**天気の地点**です。
@@ -561,7 +620,51 @@ python3 campus_chime.py --test-hourly
 
 ### A. Pi 側で反映する
 
-> **16:55〜17:02（閉館放送の前後）は、更新も再起動もしないでください。** 放送中にサービスを再起動しても再生は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了します（今後の版で改善予定）。
+> **16:55〜17:02（閉館放送の前後）は、更新も再起動もしないでください。** `update.sh` は放送の時間帯が終わるまで待ってから再起動するので、この時間帯に実行すると、`update.sh` は最大約 6 分（放送の時間帯の余裕を含む、待つ上限です。閉館放送そのものの長さではありません）待つことがあります。手で再起動した場合は、放送中でも再生は止まらず、蛍の光の途中なら systemd が約 90 秒後に強制終了します（今後の版で改善予定）。
+
+`pi` ユーザーで（`sudo` は付けずに）実行します。
+
+```bash
+cd /home/pi/campus-chime
+```
+
+```bash
+bash scripts/update.sh
+```
+
+`scripts/update.sh` は、次を順に行います（何度実行しても安全で、`config.json` は上書きしません）。
+
+1. いまの版（`campus-chime 版 (コミット)`）を表示し、Git 管理下のファイルが手元で書き換わっていないか確認する
+2. `git pull --ff-only` で最新版を取り込む。すでに最新版なら、サービスに反映した版の記録（`cache/deployed_commit`。`setup.sh` が再起動に成功したときに書く）を見る。いまの版と同じなら `--status` を表示して終わる。**合っていない・無いときは、前回の更新が途中で止まったとみて、警告して続きを行う**
+3. 放送の時間帯なら、終わるまで待つ（`python3 campus_chime.py --wait-idle`）
+4. `bash scripts/setup.sh --no-apt` を実行する（時報音の生成、時刻アナウンスの音声の確認、設置状態の点検、サービスの登録し直しと再起動。apt は実行しません）
+5. 「旧い版 → 新しい版」と、いまの状態（`--status`）を表示し、元の版へ戻す手順を表示する（コードが更新されたときだけ）
+
+放送の時間帯は、各放送の準備を始める少し前（10 秒前）から、時報は再生開始の 90 秒後、閉館放送は 300 秒後までです。待つのは最大 360 秒です。
+
+次のときは、理由を表示して終了します。表示に従って直してから、もう一度実行してください。上の 8 つは、**何も変えずに**止まります（権限またはディスクの問題で `git pull` が失敗したときだけは、取り込みが途中まで進んでいることがあります。次の実行で「手元の変更」として案内が出るので、その表示に従ってください）。
+
+| 止まる理由 | 対処 |
+|---|---|
+| root で実行した（`sudo` を付けた） | `pi` ユーザーで、`sudo` なしで実行する |
+| Git 管理下のファイルが手元で書き換わっている | 表示された `git restore --source=HEAD --staged --worktree -- <ファイル>` で元に戻す（`git add` 済みの変更も戻る。`config.json` は Git 管理外なので対象外。2.23 より前の古い git には `git restore` が無いので、`git checkout HEAD -- <ファイル>` を使う） |
+| `git` が手元の変更を調べられない（フォルダの持ち主が違うなど） | 表示された理由に従う。`pi` ユーザーで実行しているか確かめ、リポジトリが root で作られていたら `sudo chown -R pi:pi /home/pi/campus-chime` で持ち主を戻す |
+| ブランチではなく特定のコミットを見ている（detached HEAD） | 更新するブランチ（通常は `main`）に戻す |
+| `git pull` できない（ネットワークにつながらない、GitHub への接続・認証に失敗した（`publickey` など）、または履歴が GitHub と食い違っている。下の 3 つに当てはまらないときは、ここに入る） | ネットワークを確認して、もう一度試す。履歴が GitHub と食い違っているなら、管理者に伝える。放送は今までどおり動いている |
+| `git pull` できない（`git` の表示に `Permission denied`・`insufficient permission` とある。以前に `sudo` で `git` を実行して、リポジトリの中に root のファイルが残っている） | ネットワークの問題ではない。表示される `sudo chown -R pi:pi /home/pi/campus-chime` で持ち主を直して、もう一度実行する。取り込みが途中まで進んでいることがある（次の実行で「手元の変更」として案内が出たら、その表示に従う）。放送は今までどおり動いている |
+| `git pull` できない（`git` の表示に `No space left on device`・`Read-only file system`・`Input/output error`・`Disk quota exceeded` とある。このリポジトリのあるディスク（SD カード）がいっぱいか、エラーのあとで読み取り専用に切り替わっている。権限の語句と一緒に出ても、ディスクの問題として案内する） | ネットワークの問題ではない。表示される `df -h`（空き容量。Use% が 100% に近い、または Avail が 0 ならいっぱいなので、不要なファイルを消して空きを作る）と `dmesg \| tail -n 30`（ディスクのエラー。`I/O error` や `Remounting filesystem read-only` と出ていれば、読み取り専用に切り替わっている。権限が無いと言われたら `sudo dmesg \| tail -n 30`）で確かめる。読み取り専用は再起動で戻ることがあるが、くり返すときは SD カードの交換を考える。直したら、もう一度実行する。取り込みが途中まで進んでいることがある（次の実行で「手元の変更」として案内が出たら、その表示に従う）。放送は今までどおり動いている |
+| `git pull` できない（`git` の表示に `would be overwritten` とある。手元の Git 管理外のファイルが、新しい版のファイルと同じ名前で、上書きされてしまう） | 表示されたファイルが要るなら別の場所へ移し（`mv`）、要らないなら消してから、もう一度実行する。放送は今までどおり動いている |
+| 放送の時間帯が 360 秒待っても終わらない | コードの更新（`git pull`）は済んでいるが、サービスは再起動していない。放送のない時間に、もう一度 `bash scripts/update.sh` を実行する |
+| `config.json` を読めない（`--wait-idle` が終了コード 2） | 放送の時間帯かどうかを調べられないので、サービスは再起動していない。表示された原因（JSON の書き間違い、UTF-8 以外での保存）を直して、もう一度 `bash scripts/update.sh` を実行する。急ぐときも、先に `config.json` を直す（読めないままでは、手で `bash scripts/setup.sh --no-apt` を実行しても、`setup.sh` もサービスを再起動しない） |
+| `setup.sh` が失敗した | サービスは再起動されていないかもしれない。表示を確認して直し、もう一度 `bash scripts/update.sh` を実行する |
+
+下の 3 つは、コードの取り込みが済んだあとに止まるので、サービスは古い版のまま動き続けます（`setup.sh` が失敗したときは、再起動の前に止まったことが多いのですが、再起動されたかは分かりません）。直したあとにもう一度 `bash scripts/update.sh` を実行すると、**すでに最新版でも**、`cache/deployed_commit` がいまの版と合わないので、続きから反映します（記録が無いときも同じです）。`--status` の 1 行目の版は手元のコードのものなので、サービスが新しい版で動いているかの判断には使えません。
+
+元の版へ戻すときは、表示される 2 行（`git reset --hard <元のコミット>` と `bash scripts/setup.sh --no-apt`）を自分で実行します（`update.sh` は戻す操作を実行しません）。この 2 行は、コードを更新した回の終わり（取り込みのあとで止まった回を含む）に表示されます。続きから反映する回（コードがすでに最新のとき）には表示されないので、戻す可能性があるなら、止まった回の表示を控えておいてください。
+
+**手で更新するとき。** 次の 2 つの場合は、手で行えます。
+
+**v6.1.0 より前の版（v6.0.0 以前）から、初めて更新するとき**は、手元にまだ `update.sh` も `--wait-idle` も無い（実行すると `unrecognized arguments` で終了コード 2 になる）ので、一度だけ次の順に実行します。放送の時間帯を待つ仕組みが無いので、**16:55〜17:02（閉館放送の前後）を避けて**ください。
 
 ```bash
 cd /home/pi/campus-chime
@@ -575,25 +678,40 @@ git pull
 bash scripts/setup.sh --no-apt
 ```
 
+`scripts/setup.sh --no-apt` は、時報音の生成、時刻アナウンスの音声の確認、設置状態の点検、サービスの登録し直しと再起動までを行います（`restart` の 1 行は要りません）。これで v6.1.0 以降になるので、次の更新からは `bash scripts/update.sh` で行えます。
+
+**`update.sh` が途中で止まったとき**は、もう一度 `bash scripts/update.sh` を実行するのが簡単です（続きから反映します）。手で進めるなら、コードはもう新しい版なので `--wait-idle` が使えます。放送の時間帯が終わるのを待ってから、導入スクリプトを実行します。
+
+```bash
+cd /home/pi/campus-chime
+```
+
+```bash
+python3 campus_chime.py --wait-idle
+```
+
+```bash
+bash scripts/setup.sh --no-apt
+```
+
 ```bash
 sudo systemctl restart campus_chime.service
 ```
 
-`scripts/setup.sh --no-apt` は、時報音の生成、時刻アナウンスの音声の確認、サービスの登録し直しと再起動を行います（apt は実行しません）。
-何度実行しても安全で、`config.json` は上書きしません。
+`--wait-idle` は、放送の時間帯でなければすぐ終わります。`scripts/setup.sh --no-apt` はサービスの再起動までを行うので、`restart` は念のための 1 行です。
 
 反映されたか確認します。
 
 ```bash
-sudo systemctl status campus_chime.service
+python3 campus_chime.py --status
 ```
 
 ```bash
 python3 campus_chime.py --test-hourly 12
 ```
 
-- [ ] `Active: active (running)` になっている
-- [ ] **読み上げがすべて聞こえる**（無音になっている文言があれば、B が済んでいないか、`config.json` が古い（10-7）のどちらかです）
+- [ ] `--status` の末尾が「気になる点は見つかりませんでした。」で、1 行目の版が更新した版になっている（「自動起動」も「有効」）
+- [ ] **読み上げがすべて聞こえる**（無音になっている文言があれば、B が済んでいないか、`config.json` が古い（10-7）のどちらかです。`--status` の「作り置きの音声」と、`--check` の「作り置き」にも出ます）
 - [ ] 12 時の時報で天気が読み上げられる
 
 ```bash
@@ -602,13 +720,7 @@ python3 campus_chime.py --schedule
 
 - [ ] 翌営業日の予定が並ぶ
 
-自動起動の確認もしておくと安心です（電源を入れ直せば勝手に動く状態かどうか）。
-
-```bash
-sudo systemctl is-enabled campus_chime.service
-```
-
-`enabled` と出れば、電源投入時に自動起動します。実際に再起動して確かめる場合は次のとおりです。
+自動起動も `--status` の「自動起動」が「有効」なら、電源を入れ直せば勝手に動く状態です。実際に再起動して確かめる場合は次のとおりです。
 
 ```bash
 sudo reboot
@@ -617,7 +729,8 @@ sudo reboot
 再接続して、
 
 ```bash
-sudo systemctl status campus_chime.service
+cd /home/pi/campus-chime
+python3 campus_chime.py --status
 ```
 
 ---
@@ -655,11 +768,13 @@ python3 scripts/generate_voicevox.py --include-quotes --prune
 `config.json` で足した文言（地点など）の作り置きも消えるため、足している場合は必ず
 `--config` を付けてください（8 章）。
 
-生成できたか確認します。
+生成できたか確認します（鳴らさず、何も書きません）。Pi の `config.json` を渡したときは、同じ `--config pi-config.json` を付けます。
 
 ```bash
-ls assets/voice/*.wav | wc -l
+python3 campus_chime.py --check
 ```
+
+「作り置きの音声」が「138 件すべてそろっています」（`--config` で文言を足したときは、その分が加わった件数）になれば揃っています。声の無い文言があると NG になり、その文言が一覧で出ます。PC では、時報音が「まだありません」という警告が出ても構いません（放送のときに自動で作られます）。
 
 ```bash
 python3 campus_chime.py --test-hourly 12 --backend pygame
@@ -739,6 +854,8 @@ python3 campus_chime.py --test-hourly --log-level DEBUG
 | `command` | pygame が入っていない | `sudo apt install -y python3-pygame` |
 | `mock` | 再生手段が無い／開発環境と誤判定 | 上記に加え `sudo apt install -y alsa-utils mpg123` |
 
+`python3 campus_chime.py --status` の「再生方法」でも確認できます（実機で `mock` になっていると「← 要確認」が付きます）。
+
 ### 10-3. 手動では鳴るがサービスでは鳴らない
 
 サービスは `pi` ユーザーで動きます。音声デバイスへの権限を確認してください。
@@ -747,6 +864,12 @@ python3 campus_chime.py --test-hourly --log-level DEBUG
 groups pi                    # audio が含まれているか
 sudo usermod -aG audio pi    # 含まれていなければ追加
 sudo systemctl restart campus_chime.service
+```
+
+サービスが放送した結果は、`--status` の「直近の放送」に残ります（失敗・エラー・無音になった文言も出ます。読み方は [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) 3-6）。
+
+```bash
+python3 campus_chime.py --status
 ```
 
 ログも確認します。
@@ -769,13 +892,15 @@ python3 campus_chime.py --test-hourly --log-level DEBUG
 再生バックエンド: pygame / TTS: prerecorded(利用不可), voicevox(利用不可)
 ```
 
-`prerecorded(利用不可)` になっている場合、`assets/voice/` が見つかっていません。`git clone` / `git pull` が完全に終わっているか確認してください。
+`prerecorded(利用不可)` になっている場合、`assets/voice/` が見つかっていません。`git clone` / `git pull` が完全に終わっているか確認してください。作り置きがそろっているかは、次で分かります（鳴らさず、何も書きません）。
 
 ```bash
-ls assets/voice/*.wav | wc -l
+python3 campus_chime.py --check
 ```
 
-**138 件**あるか確認してください（無ければ 9 章 A を参照）。Pi 上では VOICEVOX ENGINE を動かさない運用のため、`voicevox(利用不可)` はここでは異常ではありません。
+「作り置きの音声」が「138 件すべてそろっています」になっているか確認してください。フォルダが無ければ「フォルダ assets/voice が見つかりません」と NG が出ます（9 章 A を参照）。Pi 上では VOICEVOX ENGINE を動かさない運用のため、`voicevox(利用不可)` はここでは異常ではありません。
+
+`TTS:` の行に `prerecorded` が無い（`voicevox(利用不可)` だけ、または `（エンジンなし）`）場合は、`config.json` の `tts.engines` から `prerecorded` が外れています。Pi では作り置きだけが声の元なので、読み上げがすべて無音になります。`--check` の「作り置き」が `NG`、「設定」に警告が出て、`--status` の末尾も「要確認」になります。`tts.engines` の行を `config.json` から消す（既定は `["prerecorded", "voicevox"]`）か、`"prerecorded"` を足してください。
 
 一部の文言だけ聞こえない場合は「10-7. 読み上げが無音になる」を参照してください。
 
@@ -798,15 +923,9 @@ python3 campus_chime.py --test-hourly 12 --dry-run
 警告の文言ごとの意味は次のとおりです。
 
 - **「天気予報機能が無効化されています」** — `weather.enabled` が `false` です。多くは古い `config.json` が原因なので、「10-7. 読み上げが無音になる」の手順で作り直してください。
-- **「全地点で失敗」** — 通信できていません。`python3 campus_chime.py --weather` で地点ごとの理由を確認し、`timedatectl` で時刻同期（`System clock synchronized: yes`）も確認してください。
+- **「全地点で失敗」** — 通信できていません。`python3 campus_chime.py --weather` で地点ごとの理由を確認し、`python3 campus_chime.py --status` の「時刻の同期」（「同期済み（NTP）」になっているか）も確認してください。
 
-`weather.enabled` だけを直接見ることもできます。
-
-```bash
-python3 campus_chime.py --print-config | python3 -c "import json,sys; print(json.load(sys.stdin)['weather']['enabled'])"
-```
-
-`False` の場合は `config.json` が古い可能性が高いです。「10-7. 読み上げが無音になる」を参照してください。
+古い `config.json` かどうかは、`python3 campus_chime.py --check` で分かります。「設定」に「既定値と同じ値です」という情報が並んでいれば、`config.json` が古い可能性が高いです。「10-7. 読み上げが無音になる」を参照してください。
 
 なお 12 時以外に天気が流れないのは**異常ではありません**。既定は 12 時の 1 回だけです（7 章「天気予報の時刻を変える」参照）。
 
@@ -862,40 +981,57 @@ python3 campus_chime.py --test-hourly 12 --dry-run
   警告: 天気予報を取得できませんでした: 天気予報機能が無効化されています。
 ```
 
-サービス運用中は journalctl の ERROR ログでも同じ内容が確認できます。
+サービスが実際に放送した回で無音になった文言は、`--status` の「直近の放送」に残ります（「一部のみ」の行の「無音: 「…」」。読み方は [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) 3-6）。
 
 ```bash
-journalctl -u campus_chime.service -n 50 --no-pager | grep 合成できませんでした
+python3 campus_chime.py --status
 ```
+
+放送ごとの詳しい理由（音声合成の失敗のエラー）は、journal の ERROR ログ（`journalctl -u campus_chime.service -p err`）に残っています。
 
 **切り分け 1: 作り置きがあるか**
 
 ```bash
-ls assets/voice/*.wav | wc -l
+python3 campus_chime.py --check
 ```
 
-**138 件**あるか確認してください。少なければ `git pull` が届いていないか、作り置きを作り直していません（9 章 B 参照）。
+「作り置きの音声」が「138 件すべてそろっています」であることを確認してください。声の無い文言は NG として一覧で出ます（先頭の 10 件まで）。出たのが特定の文言だけなら、その文言を変えたのに作り置きを作り直していません（9 章 B 参照）。「フォルダ … が見つかりません」なら、`git pull` が届いていません。
 
 **切り分け 2: `config.json` が古くないか（今回の原因）**
 
-起動時のログに次の警告が出ていれば該当します。**これが一番確実な判定です**（文言以外が古い場合も拾えます）。
+同じ `--check` の出力で判定できます。**これが一番確実な判定です**（文言以外が古い場合も拾えます）。「設定」に「既定値と同じ値です」という情報が並び、「作り置きの音声」で時刻アナウンスがそろっていなければ該当します。次は古い `config.json` の例です（「情報」の行は多数並ぶため、先頭の 5 件のあとは「（ほか）情報があと N 件あります」とまとめられます）。
 
-```bash
-journalctl -u campus_chime.service -n 50 | grep 既定値
 ```
+== 設定 ==
+  OK    読み込んだ設定              既定値 → /home/pi/campus-chime/config.json
+  情報  timezone                    timezone は既定値（"Asia/Tokyo"）と同じ値です  [/home/pi/campus-chime/config.json]
+                                    直し方: 書かなくても同じ動作です。残すと、将来その既定値が変わっても古い値のままになります
+  情報  logging.level               logging.level は既定値（"INFO"）と同じ値です  [/home/pi/campus-chime/config.json]
+                                    直し方: 書かなくても同じ動作です。残すと、将来その既定値が変わっても古い値のままになります
+  （同じ形の「情報」が続く）
+  情報  （ほか）                    情報があと 62 件あります
+  OK    設定の書き方                問題は見つかりませんでした
+
+== 作り置きの音声 ==
+  NG    作り置き  138 件中 7 件の声がありません（時刻アナウンス 0/7・ひとこと 57/57・天気 74/74）。その文は無音になります
+                  「午前10時をお知らせしました。」
+                  「午前11時をお知らせしました。」
+                  「正午をお知らせしました。」
+                  「午後1時をお知らせしました。」
+                  「午後2時をお知らせしました。」
+                  「午後3時をお知らせしました。」
+                  「午後4時をお知らせしました。」
+                  直し方: PC で作り直して commit し、この Pi で git pull する（docs/SETUP.md 8 章）
+```
+
+この場合の「直し方」（PC で作り直す）は当てはまりません。作り置きは揃っていて、`config.json` が古い文言で上書きしているためです。以下で `config.json` を作り直してください。起動時のログにも、同じ指摘が WARNING で出ます。
 
 ```
 WARNING ... config.json は既定値と同じ値を 76 項目書いています。既定値の丸ごとコピーの
         可能性があります。この状態だと、更新しても新しい既定値が届きません…
 ```
 
-読み上げの文言が古いかどうかだけを見るなら、次でも分かります。
-
-```bash
-grep -c "お知らせしました" config.json
-```
-
-なお、旧版の既定値を丸ごと写した `config.json` には、v6.0.0 で廃止した項目も含まれています。その場合は起動時に「廃止しました」の警告も並びます（放送は止まりません。作り直せば消えます）。
+なお、旧版の既定値を丸ごと写した `config.json` には、v6.0.0 で廃止した項目も含まれています。その場合は「設定」に「廃止しました」の警告も並びます（放送は止まりません。作り直せば消えます）。
 
 いずれかに当てはまれば、以下で作り直してください。**現地で変えていた設定は、`config.json.old` をそのまま書き戻したり丸ごと写したりせず、その項目だけを書いた新しい `config.json` を作って戻してください**（書き方は 7 章「設定を変える」参照）。`config.json` は無くても動作し、無ければ全項目が最新の既定値になります。
 
@@ -907,9 +1043,10 @@ mv config.json config.json.old
 sudo systemctl restart campus_chime.service
 ```
 
-そのうえで確認します。
+そのうえで確認します。`--check` の「設定」が「問題は見つかりませんでした」、「作り置きの音声」が「すべてそろっています」になっていれば直っています。
 
 ```bash
+python3 campus_chime.py --check
 python3 campus_chime.py --test-hourly 12
 ```
 
@@ -937,9 +1074,9 @@ python3 campus_chime.py --test-hourly 12
 - [ ] `python3 campus_chime.py --test-hourly` で時報・読み上げ・おまけが鳴る
 - [ ] `python3 campus_chime.py --test` で閉館アナウンスと蛍の光が鳴る
 - [ ] 音飛び・カクつきがない
-- [ ] `sudo systemctl status campus_chime.service` が `active (running)`
-- [ ] `sudo systemctl is-enabled campus_chime.service` が `enabled`
-- [ ] 再起動後も自動で `active (running)` になる
+- [ ] `python3 campus_chime.py --check` の末尾が「結果: すべて OK です。」（警告だけなら内容を確かめる）
+- [ ] `python3 campus_chime.py --status` の末尾が「気になる点は見つかりませんでした。」で、「サービス」が「動作中」、「自動起動」が「有効」
+- [ ] 再起動後も `--status` の「サービス」が「動作中」になる
 - [ ] `python3 campus_chime.py --schedule` に翌営業日の予定が並ぶ
 - [ ] スピーカーの音量が実際の運用位置で適切
 - [ ] 実際の正時（例: 14:00）に立ち会って放送を確認した

@@ -142,6 +142,7 @@
     "extra_text": ""
   },
   "state": {
-    "file": "cache/state.json"
+    "file": "cache/state.json",
+    "history_file": "cache/history.jsonl"
   }
 }

@@ -17,7 +17,7 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest import mock
 
-from tests.support import KYOTO_ONLY, MANIFEST_PATH, REPO_ROOT
+from tests.support import KYOTO_ONLY, MANIFEST_PATH, REPO_ROOT, write_quotes
 
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
@@ -26,7 +26,7 @@ import generate_voicevox  # noqa: E402
 from chime import phrases, weather  # noqa: E402
 from chime.config import DEFAULT_CONFIG, Config, deep_merge  # noqa: E402
 from chime.quotes import load_quotes  # noqa: E402
-from chime.tts import TTSError, prerecorded_filename  # noqa: E402
+from chime.tts import TTSError, TTSService, prerecorded_filename  # noqa: E402
 
 
 class ReexportTest(unittest.TestCase):
@@ -396,6 +396,144 @@ class MainTest(unittest.TestCase):
         self.assertEqual(lines[failed + 1], "5 秒待ちましたが応答がありませんでした。")
         self.assertEqual(lines[failed + 2], "次を確認してください。")
         self.assertFalse(os.path.exists(self.out))
+
+    # -- 前後に空白のある文言 --------------------------------------------------
+    def test_phrases_with_surrounding_whitespace_are_generated_the_way_the_runtime_looks_them_up(self):
+        # 実行時は前後の空白を落としてから作り置きを引く。空白つきのキーで作ると、
+        # その文言は永久に引けず、その文だけ無音になる。
+        raw_quote = "  ひとことなのだ。\n"
+        raw_closing = "\u3000本日もありがとうございました。 "
+        quotes = write_quotes(self.tmp, {"general": [raw_quote, "ひとことなのだ。", "   "]})
+        config_path = self.write_config({"quotes": {"file": quotes},
+                                         "closing": {"extra_text": raw_closing}})
+
+        code, _, _ = self.run_main("--config", config_path, "--include-quotes")
+        self.assertEqual(code, 0)
+
+        manifest = self.read_manifest()
+        self.assertEqual([key for key in manifest if key != key.strip() or not key], [])
+        self.assertIn("ひとことなのだ。", manifest)
+        self.assertIn("本日もありがとうございました。", manifest)
+        self.assertEqual(manifest["ひとことなのだ。"], prerecorded_filename("ひとことなのだ。"))
+        # 合成にも整えた文言を渡す（重複して 2 回作らない）
+        self.assertEqual(self.synthesized.count("ひとことなのだ。"), 1)
+        self.assertEqual([text for text in self.synthesized if text != text.strip()], [])
+
+        service = TTSService({"engines": ["prerecorded"]}, os.path.join(self.tmp, "cache"), self.out)
+        for raw in (raw_quote, raw_closing):
+            self.assertIsNotNone(service.prerecorded_lookup(raw), repr(raw))
+
+    def test_a_manifest_key_with_whitespace_from_an_older_run_is_stale(self):
+        # 以前の生成が空白つきのキーで作っていた場合、そのキーは実行時には引かれない。
+        # --prune で消え、整えたキーのほうが作られる。
+        raw = "  ひとことなのだ。 "
+        quotes = write_quotes(self.tmp, {"general": [raw]})
+        config_path = self.write_config({"quotes": {"file": quotes}})
+        self.seed([raw])
+
+        code, _, _ = self.run_main("--config", config_path, "--include-quotes", "--prune")
+        self.assertEqual(code, 0)
+        manifest = self.read_manifest()
+        self.assertNotIn(raw, manifest)
+        self.assertEqual(manifest["ひとことなのだ。"], prerecorded_filename("ひとことなのだ。"))
+
+    # -- WAV の書き出し（途中で止まっても欠けたファイルを残さない） --------------
+    def leftovers(self):
+        return [name for name in os.listdir(self.out) if name.endswith(".tmp")]
+
+    def test_the_engine_writes_to_a_temporary_file_next_to_the_final_one(self):
+        written = []
+
+        def record(text, out_path):
+            written.append((text, out_path))
+            self.fake_synthesize(text, out_path)
+
+        self.engine.synthesize.side_effect = record
+        code, _, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertTrue(written)
+        for text, out_path in written:
+            final = self.phrase_file(text)
+            self.assertNotEqual(out_path, final, "最終のパスへ直接書いている")
+            # 同じディレクトリに置く（別のファイルシステムだと置き換えが原子的にならない）
+            self.assertEqual(os.path.dirname(out_path), os.path.dirname(final))
+            self.assertTrue(os.path.exists(final))
+            self.assertFalse(os.path.exists(out_path))
+        self.assertEqual(self.leftovers(), [])
+
+    def interrupt_at(self, phrase, error):
+        """``phrase`` を書きかけたところで ``error`` を送出する合成。"""
+        def synthesize(text, out_path):
+            if text == phrase:
+                with open(out_path, "wb") as handle:
+                    handle.write(b"RI")
+                raise error
+            self.fake_synthesize(text, out_path)
+        self.engine.synthesize.side_effect = synthesize
+
+    def test_an_interrupted_run_leaves_no_truncated_wav(self):
+        # Ctrl-C や書き込み先の容量不足で止まっても、書きかけの WAV が最終のパスに
+        # 残らない（残ると、次の実行で「生成済み」として飛ばされ、壊れた声が使われる）。
+        phrase = self.otsu
+        for label, error in (("Ctrl-C", KeyboardInterrupt()), ("容量不足", OSError("disk full"))):
+            with self.subTest(label):
+                self.interrupt_at(phrase, error)
+                with self.assertRaises(type(error)):
+                    self.run_main()
+                self.assertFalse(os.path.exists(self.phrase_file(phrase)))
+                self.assertEqual(self.leftovers(), [])
+
+    def test_a_run_after_an_interruption_makes_the_phrase_again(self):
+        phrase = self.otsu
+        self.interrupt_at(phrase, KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_main()
+
+        self.engine.synthesize.side_effect = self.fake_synthesize
+        self.synthesized.clear()
+        code, stdout, _ = self.run_main()
+        self.assertEqual(code, 0)
+        self.assertIn(phrase, self.synthesized)
+        self.assertNotIn("  skip {0}\n".format(phrase), stdout)
+        with open(self.phrase_file(phrase), "rb") as handle:
+            self.assertEqual(handle.read(), b"RIFF")
+
+    def test_a_synthesis_that_fails_after_writing_leaves_nothing(self):
+        phrase = self.otsu
+        self.interrupt_at(phrase, TTSError("途中で失敗"))
+        code, _, stderr = self.run_main()
+        self.assertEqual(code, 1)
+        self.assertIn("  NG   {0}: 途中で失敗".format(phrase), stderr)
+        self.assertFalse(os.path.exists(self.phrase_file(phrase)))
+        self.assertEqual(self.leftovers(), [])
+        self.assertNotIn(phrase, self.read_manifest())
+
+    def test_an_interrupted_forced_run_keeps_the_previous_wav(self):
+        phrase = self.otsu
+        self.seed([])
+        with open(self.phrase_file(phrase), "wb") as handle:
+            handle.write(b"OLD")
+        self.interrupt_at(phrase, KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_main("--force")
+        with open(self.phrase_file(phrase), "rb") as handle:
+            self.assertEqual(handle.read(), b"OLD")
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_failure_to_move_the_wav_into_place_leaves_no_temporary_file(self):
+        phrase = self.otsu
+        real_replace = os.replace
+
+        def replace(source, destination):
+            if os.path.basename(destination) == prerecorded_filename(phrase):
+                raise OSError("置き換えられない")
+            real_replace(source, destination)
+
+        with mock.patch("os.replace", replace):
+            with self.assertRaises(OSError):
+                self.run_main()
+        self.assertFalse(os.path.exists(self.phrase_file(phrase)))
+        self.assertEqual(self.leftovers(), [])
 
     # -- manifest の書式 -----------------------------------------------------
     def test_the_manifest_is_written_sorted_and_indented_with_a_trailing_newline(self):
