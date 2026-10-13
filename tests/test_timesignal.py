@@ -7,6 +7,8 @@ import tempfile
 import unittest
 import wave
 
+from unittest import mock
+
 from chime import timesignal
 from chime.config import DEFAULT_CONFIG
 
@@ -123,6 +125,84 @@ class AnnounceTextTest(unittest.TestCase):
         ]
         self.assertEqual([timesignal.announce_text(hour, SETTINGS) for hour in range(24)],
                          expected)
+
+
+class AnnounceTextFallbackTest(unittest.TestCase):
+    """設定が欠けても、既定設定と同じ文言になる（作り置きに当たる）。
+
+    以前は文言の予備が ``announce_text`` の中に別に書かれていて、既定設定
+    （``DEFAULT_CONFIG["time_signal"]``）の言い回しと食い違っていた
+    （「…お知らせしました。」と、``hour_readings`` が空）。``"time_signal": null`` や
+    キーの欠けた設定だと、作り置きに無い文言になって Pi では無音だった。
+    """
+
+    def default_texts(self):
+        return [timesignal.announce_text(hour, SETTINGS) for hour in range(24)]
+
+    def test_an_empty_section_gives_the_default_phrases(self):
+        # ``"time_signal": null`` は ``Config.section`` を通ると空の辞書になる。
+        self.assertEqual([timesignal.announce_text(hour, {}) for hour in range(24)],
+                         self.default_texts())
+
+    def test_none_gives_the_default_phrases(self):
+        self.assertEqual([timesignal.announce_text(hour, None) for hour in range(24)],
+                         self.default_texts())
+
+    def test_each_missing_key_falls_back_to_the_default(self):
+        for key in ("announce_template", "noon_template", "use_noon_template",
+                    "period_am", "period_pm", "hour_readings"):
+            with self.subTest(key=key):
+                settings = {name: value for name, value in SETTINGS.items() if name != key}
+                self.assertEqual(
+                    [timesignal.announce_text(hour, settings) for hour in range(24)],
+                    self.default_texts())
+
+    def test_a_null_value_falls_back_to_the_default(self):
+        for key in ("announce_template", "noon_template", "use_noon_template",
+                    "period_am", "period_pm", "hour_readings"):
+            with self.subTest(key=key):
+                settings = dict(SETTINGS, **{key: None})
+                self.assertEqual(
+                    [timesignal.announce_text(hour, settings) for hour in range(24)],
+                    self.default_texts())
+
+    def test_the_noon_phrase_is_the_default_one(self):
+        self.assertEqual(timesignal.announce_text(12, {}), "正午をお知らせしたのだ。")
+
+    def test_the_misread_hours_are_still_written_in_kana_without_settings(self):
+        self.assertEqual(timesignal.hour_parts(16, {})["hour_reading"], "よじ")
+        self.assertEqual(timesignal.announce_text(16, {}), "午後よじをお知らせしたのだ。")
+        self.assertEqual(timesignal.announce_text(0, {}), "午前れいじをお知らせしたのだ。")
+
+    def test_the_fallback_follows_the_default_config(self):
+        # 値の写しではなく、``DEFAULT_CONFIG`` そのものを読む（既定を変えれば追随する）。
+        with mock.patch.dict(DEFAULT_CONFIG["time_signal"], {
+                "announce_template": "{period}{hour}時なのだ。",
+                "noon_template": "お昼なのだ。",
+                "period_pm": "PM",
+                "hour_readings": {"3": "さんじ"}}):
+            self.assertEqual(timesignal.announce_text(12, {}), "お昼なのだ。")
+            self.assertEqual(timesignal.announce_text(15, {}), "PM3時なのだ。")
+            self.assertEqual(timesignal.hour_parts(15, {})["hour_reading"], "さんじ")
+
+    def test_a_value_that_is_set_wins_over_the_default(self):
+        settings = {"hour_readings": {}, "period_am": "AM", "use_noon_template": False,
+                    "announce_template": "{period}{hour_reading}です。"}
+        # 空の hour_readings は「どの時刻もかな書きにしない」という指定として尊重する。
+        self.assertEqual(timesignal.announce_text(16, settings), "午後4時です。")
+        self.assertEqual(timesignal.announce_text(9, settings), "AM9時です。")
+        self.assertEqual(timesignal.announce_text(12, settings), "午後12時です。")
+
+    def test_hour_readings_that_is_not_a_mapping_falls_back_to_the_default(self):
+        self.assertEqual(timesignal.hour_parts(16, {"hour_readings": ["4"]})["hour_reading"],
+                         "よじ")
+
+    def test_the_settings_are_not_modified(self):
+        settings = {}
+        timesignal.announce_text(16, settings)
+        self.assertEqual(settings, {})
+        self.assertEqual(SETTINGS["hour_readings"],
+                         {"0": "れいじ", "4": "よじ", "7": "しちじ", "9": "くじ"})
 
 
 class LeadTimeTest(unittest.TestCase):

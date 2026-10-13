@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import wave
 from unittest import mock
 
-from tests.support import RecordingPlayer, logs_enabled, make_wav
+from tests.support import REPO_ROOT, RecordingPlayer, logs_enabled, make_wav
 
 from chime import audio
 from chime.audio import (CommandPlayer, MockPlayer, PlaybackError, Player, PygamePlayer,
@@ -389,6 +391,78 @@ class CreatePlayerTest(unittest.TestCase):
 class PygameAvailabilityTest(unittest.TestCase):
     def test_available_reflects_import(self):
         self.assertEqual(PygamePlayer.available(), audio.pygame is not None)
+
+
+#: 本物の pygame と同じ振る舞いをする偽物。import すると、環境変数
+#: ``PYGAME_HIDE_SUPPORT_PROMPT`` が（値に関わらず）設定されていなければ、
+#: 標準出力にバナーを出す。
+FAKE_PYGAME = (
+    "import os\n"
+    "if 'PYGAME_HIDE_SUPPORT_PROMPT' not in os.environ:\n"
+    "    print('pygame 9.9.9 (SDL 2.0.0, Python 3)')\n"
+    "    print('Hello from the pygame community. https://www.pygame.org/contribute.html')\n"
+)
+
+BANNER_MARKER = "Hello from the pygame community"
+
+
+class PygameBannerTest(unittest.TestCase):
+    """``import chime.audio`` が pygame のバナーを標準出力に出さないこと。
+
+    バナーは ``--print-config`` の JSON 出力に混ざって壊す。import の順序が
+    問題なので、新しいインタプリタ（子プロセス）で import して標準出力を調べる。
+    pygame は偽物（上の ``FAKE_PYGAME``）を ``PYTHONPATH`` の先頭に置いて差し替える。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        fake = os.path.join(self.tmp.name, "pygame")
+        os.makedirs(fake)
+        with open(os.path.join(fake, "__init__.py"), "w", encoding="utf-8") as handle:
+            handle.write(FAKE_PYGAME)
+
+    def run_python(self, code, **env_overrides):
+        """``code`` を子プロセスで実行し、``(標準出力, 終了コード)`` を返す。"""
+        env = {key: value for key, value in os.environ.items()
+               if key != "PYGAME_HIDE_SUPPORT_PROMPT"}
+        env["PYTHONPATH"] = os.pathsep.join([self.tmp.name, REPO_ROOT])
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        env.update(env_overrides)
+        result = subprocess.run([sys.executable, "-c", code], env=env, cwd=self.tmp.name,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                universal_newlines=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def test_the_fake_pygame_prints_the_banner_unless_told_not_to(self):
+        # 対照: この偽物が、変数なしの import でバナーを出すこと（出さなければ、
+        # 下のテストは何も確かめていない）。
+        self.assertIn(BANNER_MARKER, self.run_python("import pygame"))
+        self.assertEqual(self.run_python("import pygame", PYGAME_HIDE_SUPPORT_PROMPT="1"), "")
+
+    def test_importing_chime_audio_prints_nothing(self):
+        self.assertEqual(self.run_python("import chime.audio"), "")
+
+    def test_the_real_import_picks_up_the_fake_pygame(self):
+        # 偽物が実際に使われている（chime.audio.pygame が偽物のモジュール）。
+        out = self.run_python("import chime.audio; print(chime.audio.pygame.__file__)")
+        self.assertTrue(out.strip().splitlines()[-1].startswith(self.tmp.name), out)
+
+    def test_importing_the_app_and_cli_prints_nothing(self):
+        # chime.audio を引き込む入口（app / cli）からでも同じ。
+        self.assertEqual(self.run_python("import chime.app, chime.cli"), "")
+
+    def test_the_variable_is_set_to_1_when_unset(self):
+        out = self.run_python(
+            "import chime.audio, os; print(os.environ['PYGAME_HIDE_SUPPORT_PROMPT'])")
+        self.assertEqual(out.strip(), "1")
+
+    def test_a_value_the_user_set_is_kept(self):
+        out = self.run_python(
+            "import chime.audio, os; print(os.environ['PYGAME_HIDE_SUPPORT_PROMPT'])",
+            PYGAME_HIDE_SUPPORT_PROMPT="custom")
+        self.assertEqual(out.strip(), "custom")
 
 
 if __name__ == "__main__":

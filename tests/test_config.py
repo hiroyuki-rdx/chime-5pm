@@ -9,9 +9,12 @@ import os
 import tempfile
 import unittest
 
-from tests.support import logs_enabled
+from unittest import mock
 
-from chime.config import (DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, REMOVED_KEYS, Config,
+from tests.support import NO_LOCAL_CONFIG, REAL_LOCAL_CONFIG_PATH, logs_enabled
+
+from chime import config as chime_config
+from chime.config import (BASE_DIR, DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, REMOVED_KEYS, Config,
                           ConfigError, deep_merge, dump_default_config, load_config,
                           redundant_keys, strip_removed_keys)
 
@@ -619,6 +622,96 @@ class LoadConfigTest(unittest.TestCase):
             with self.assertRaises(ConfigError) as caught:
                 load_config(path, base_dir=tmp)
         self.assertEqual(str(caught.exception), "設定ファイルが見つかりません: " + path)
+
+
+class ConfigEqualityTest(unittest.TestCase):
+    """``Config`` は中身（設定値・``base_dir``・読み込んだファイル）で等しさを決める。"""
+
+    def make(self, data=None, base_dir="/opt/chime", sources=("<defaults>",)):
+        return Config(DEFAULT_CONFIG if data is None else data,
+                      base_dir=base_dir, sources=sources)
+
+    def test_same_contents_are_equal(self):
+        self.assertEqual(self.make(), self.make())
+
+    def test_a_different_value_is_not_equal(self):
+        changed = deep_merge(DEFAULT_CONFIG, {"schedule": {"hourly": {"start_hour": 9}}})
+        self.assertNotEqual(self.make(), self.make(changed))
+
+    def test_a_different_base_dir_is_not_equal(self):
+        self.assertNotEqual(self.make(), self.make(base_dir="/srv/chime"))
+
+    def test_different_sources_are_not_equal(self):
+        self.assertNotEqual(self.make(), self.make(sources=("<defaults>", "/etc/chime.json")))
+
+    def test_comparing_with_something_else_is_just_false(self):
+        self.assertNotEqual(self.make(), DEFAULT_CONFIG)
+        self.assertFalse(self.make() == None)  # noqa: E711 - ``==`` そのものを確かめる
+
+    def test_a_config_cannot_be_a_dict_key(self):
+        # 可変の設定を値で比べるので、ハッシュ値は持たない。
+        with self.assertRaises(TypeError):
+            hash(self.make())
+
+
+class LocalConfigIsolationTest(unittest.TestCase):
+    """テストは、開発者の手元のリポジトリ直下の ``config.json`` を読まない。
+
+    ``load_config`` は ``BASE_DIR/config.json`` を自動で読む。それが手元にある
+    開発者の環境では、CLI や生成スクリプトを ``--config`` なしで動かすテストが、
+    その内容（例: ``start_hour`` を 9 にしている）に左右されて落ちていた。
+    ``tests/support.py`` を import すると、リポジトリ直下だけ「現地設定なし」に
+    差し替わる（``isolate_local_config``）。
+    """
+
+    LOCAL = {"schedule": {"hourly": {"start_hour": 9}}}
+
+    def write_local_config(self, directory):
+        with open(os.path.join(directory, "config.json"), "w", encoding="utf-8") as handle:
+            json.dump(self.LOCAL, handle)
+
+    def test_a_config_json_at_the_repo_root_is_not_read(self):
+        # tmp を「リポジトリのルート」とみなす。そこに config.json があっても読まない。
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_local_config(tmp)
+            with mock.patch.object(chime_config, "BASE_DIR", tmp):
+                config = load_config(base_dir=tmp)
+        self.assertEqual(config.sources, ["<defaults>"])
+        self.assertEqual(config.get("schedule.hourly.start_hour"), 10)
+
+    def test_load_config_without_arguments_reads_only_the_defaults(self):
+        config = load_config()
+        self.assertEqual(config.sources, ["<defaults>"])
+        self.assertEqual(config.data, DEFAULT_CONFIG)
+
+    def test_the_isolation_does_not_swallow_an_explicit_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_local_config(tmp)
+            path = os.path.join(tmp, "config.json")
+            config = load_config(path)
+        self.assertEqual(config.sources, ["<defaults>", path])
+        self.assertEqual(config.get("schedule.hourly.start_hour"), 9)
+
+    def test_another_directory_still_reads_its_own_config_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_local_config(tmp)
+            config = load_config(base_dir=tmp)
+        self.assertEqual(config.sources, ["<defaults>", os.path.join(tmp, "config.json")])
+        self.assertEqual(config.get("schedule.hourly.start_hour"), 9)
+
+    def test_the_stand_in_path_for_no_local_config_does_not_exist(self):
+        self.assertFalse(os.path.exists(NO_LOCAL_CONFIG))
+        self.assertEqual(chime_config.local_config_path(BASE_DIR), NO_LOCAL_CONFIG)
+
+
+class LocalConfigPathTest(unittest.TestCase):
+    """本番の ``local_config_path``（テストで差し替える前の本物）は、これまでと同じ場所を返す。"""
+
+    def test_it_is_config_json_under_base_dir(self):
+        self.assertEqual(REAL_LOCAL_CONFIG_PATH("/opt/chime"), "/opt/chime/config.json")
+
+    def test_the_default_base_dir_is_the_repository_root(self):
+        self.assertEqual(REAL_LOCAL_CONFIG_PATH(), os.path.join(BASE_DIR, "config.json"))
 
 
 class NoRuntimeSynthesisFallbackTest(unittest.TestCase):

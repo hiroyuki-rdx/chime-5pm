@@ -70,10 +70,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: 構文チェック
-        run: bash -n scripts/setup.sh
+      # bash -n は、複数のファイルを渡しても 1 つ目しか調べない（2 つ目以降は引数として
+      # 渡されるだけ）。そのため 1 本ずつ実行する。scripts/ に増えたスクリプトも自動で対象になる。
+      - name: 構文チェック（bash -n。1 本ずつ）
+        run: |
+          for f in scripts/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
       - name: shellcheck
-        run: shellcheck scripts/setup.sh
+        run: shellcheck scripts/*.sh
 
   prerecorded-only:
     name: 作り置きだけで全文言を賄えること（音声合成エンジンなし）
@@ -115,3 +121,10 @@ jobs:
             exit 1
           fi
           echo "全 $(wc -l < /tmp/phrases.txt) 件の文言が作り置きだけで合成できました。"
+
+      # 設置状態の点検が、リポジトリに入っているものだけで通ること。この CI には
+      # config.json も時報音（assets/generated/。Git 管理外）も無い。時報音が無いのは
+      # 警告にとどまり（放送のときに自動で作る）、終了コードは 0 のまま。設定の誤り・
+      # 作り置きの欠け・同梱の音源の破損・書き込めない場所があれば NG で 1 になる。
+      - name: 設置状態の点検（--check）が通ること
+        run: python campus_chime.py --check

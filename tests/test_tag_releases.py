@@ -8,6 +8,8 @@
 - 版や見出しを読む関数（``parse_version`` など）の単体テスト
 - 実際の git リポジトリでの ``first_appearances`` と ``main``
   （履歴の読み取りの失敗・タグの作成の失敗・取りこぼしの警告を含む）
+- ``git push --porcelain`` の結果の読み取り（``parse_push_porcelain``）と、タグごとの知らせ方
+  （GitHub が ``workflows`` 権限を理由に断ったタグだけは、失敗にしない）
 - ``.github/workflows/tag.yml`` の中身の静的な確認
 """
 
@@ -37,6 +39,14 @@ CI_WORKFLOW_PATH = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 
 #: コミットとタグの日時（実行した日時に左右されないよう固定する）。
 FIXED_DATE = "2026-09-29T12:00:00+0900"
+
+#: GitHub が ``GITHUB_TOKEN`` によるタグの push を断るときの理由（Actions のログにあったとおり）。
+GITHUB_WORKFLOWS_REASON = ("refusing to allow a GitHub App to create or update workflow "
+                           "`.github/workflows/ci.yml` without `workflows` permission")
+
+#: 似ているが別の断り方（人の OAuth トークンに ``workflow`` スコープが無い）。こちらは失敗のまま扱う。
+GITHUB_OAUTH_REASON = ("refusing to allow an OAuth App to create or update workflow "
+                       "`.github/workflows/ci.yml` without `workflow` scope")
 
 
 # -- 単体テスト（git を使わない） ----------------------------------------------------
@@ -164,6 +174,173 @@ class HasChangelogEntryTest(unittest.TestCase):
 
     def test_empty_text(self):
         self.assertFalse(tag_releases.has_changelog_entry("", "5.3.0"))
+
+
+class ParsePushPorcelainTest(unittest.TestCase):
+    """``parse_push_porcelain``: ``git push --porcelain`` の標準出力を、ref ごとの結果に読む。"""
+
+    #: 実際の Actions のログ（v6.0.0 は届き、v5.2.0 と v5.3.0 は断られた）を、--porcelain の形にしたもの。
+    GITHUB_LOG = (
+        "To https://github.com/hiroyuki-rdx/chime-5pm\n"
+        "*\trefs/tags/v6.0.0:refs/tags/v6.0.0\t[new tag]\n"
+        "!\trefs/tags/v5.2.0:refs/tags/v5.2.0\t[remote rejected] ({0})\n"
+        "!\trefs/tags/v5.3.0:refs/tags/v5.3.0\t[remote rejected] ({0})\n"
+        "Done\n").format(GITHUB_WORKFLOWS_REASON)
+
+    def test_the_log_from_github(self):
+        self.assertEqual(tag_releases.parse_push_porcelain(self.GITHUB_LOG), [
+            tag_releases.PushOutcome("*", "refs/tags/v6.0.0", "[new tag]", ""),
+            tag_releases.PushOutcome("!", "refs/tags/v5.2.0", "[remote rejected]",
+                                     GITHUB_WORKFLOWS_REASON),
+            tag_releases.PushOutcome("!", "refs/tags/v5.3.0", "[remote rejected]",
+                                     GITHUB_WORKFLOWS_REASON),
+        ])
+
+    def test_the_reason_keeps_backticks_and_slashes(self):
+        outcome = tag_releases.parse_push_porcelain(self.GITHUB_LOG)[1]
+        self.assertIn("`.github/workflows/ci.yml`", outcome.reason)
+        self.assertTrue(outcome.reason.endswith("without `workflows` permission"))
+
+    def test_every_kind_of_flag(self):
+        text = ("To /remote.git\n"
+                " \trefs/heads/a:refs/heads/a\t1111111..2222222\n"
+                "+\trefs/heads/b:refs/heads/b\t1111111...2222222 (forced update)\n"
+                "-\t:refs/heads/c\t[deleted]\n"
+                "*\trefs/tags/v1.0.0:refs/tags/v1.0.0\t[new tag]\n"
+                "*\trefs/heads/d:refs/heads/d\t[new branch]\n"
+                "=\trefs/tags/v2.0.0:refs/tags/v2.0.0\t[up to date]\n"
+                "!\trefs/tags/v3.0.0:refs/tags/v3.0.0\t[rejected] (already exists)\n"
+                "Done\n")
+        outcomes = tag_releases.parse_push_porcelain(text)
+        self.assertEqual([(o.flag, o.ref, o.summary, o.reason) for o in outcomes], [
+            (" ", "refs/heads/a", "1111111..2222222", ""),
+            ("+", "refs/heads/b", "1111111...2222222", "forced update"),
+            ("-", "refs/heads/c", "[deleted]", ""),
+            ("*", "refs/tags/v1.0.0", "[new tag]", ""),
+            ("*", "refs/heads/d", "[new branch]", ""),
+            ("=", "refs/tags/v2.0.0", "[up to date]", ""),
+            ("!", "refs/tags/v3.0.0", "[rejected]", "already exists"),
+        ])
+
+    def test_the_destination_is_the_to_side_of_from_colon_to(self):
+        text = "*\trefs/tags/local:refs/tags/remote\t[new tag]\n"
+        self.assertEqual(tag_releases.parse_push_porcelain(text)[0].ref, "refs/tags/remote")
+
+    def test_a_reason_may_contain_parentheses_and_colons(self):
+        text = "!\trefs/tags/v1:refs/tags/v1\t[remote rejected] (denied (code: 403) by hook)\n"
+        outcome = tag_releases.parse_push_porcelain(text)[0]
+        self.assertEqual((outcome.summary, outcome.reason),
+                         ("[remote rejected]", "denied (code: 403) by hook"))
+
+    def test_lines_of_another_shape_are_skipped(self):
+        text = ("To https://example.com/r.git\n"
+                "\n"
+                "Done\n"
+                "error: failed to push some refs to 'https://example.com/r.git'\n"
+                "hint: Updates were rejected\n"
+                "x\trefs/tags/v1:refs/tags/v1\t[new tag]\n"        # 知らない印
+                "**\trefs/tags/v1:refs/tags/v1\t[new tag]\n"       # 印が 2 字
+                "*\trefs/tags/v1\t[new tag]\n"                     # from:to でない
+                "*\trefs/tags/v1:refs/tags/v1\n"                    # 結果の欄が無い
+                "remote: *\trefs/tags/v1:refs/tags/v1\t[new tag]\n")
+        self.assertEqual(tag_releases.parse_push_porcelain(text), [])
+
+    def test_empty_text(self):
+        self.assertEqual(tag_releases.parse_push_porcelain(""), [])
+
+    def test_crlf_line_ends(self):
+        text = self.GITHUB_LOG.replace("\n", "\r\n")
+        outcomes = tag_releases.parse_push_porcelain(text)
+        self.assertEqual(len(outcomes), 3)
+        self.assertEqual(outcomes[1].reason, GITHUB_WORKFLOWS_REASON)
+
+    def test_a_summary_with_no_reason_has_an_empty_reason(self):
+        outcome = tag_releases.parse_push_porcelain("=\trefs/tags/v1:refs/tags/v1\t[up to date]\n")[0]
+        self.assertEqual((outcome.summary, outcome.reason), ("[up to date]", ""))
+
+    def test_real_git_output_is_read(self):
+        """git 本体の出力を読めること（書式が git の版で変わっていないことの確認を兼ねる）。"""
+        if not shutil.which("git"):
+            self.skipTest("git がインストールされていません")
+        with tempfile.TemporaryDirectory(prefix="tag-releases-test-") as tmp:
+            env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+            env.update({"HOME": tmp, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
+                        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+                        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com"})
+            work, remote = os.path.join(tmp, "work"), os.path.join(tmp, "remote.git")
+
+            def git(*args, cwd):
+                return subprocess.run(["git"] + list(args), cwd=cwd, env=env, capture_output=True,
+                                      text=True, encoding="utf-8", check=True).stdout
+
+            os.makedirs(work)
+            os.makedirs(remote)
+            git("init", "-q", "--bare", cwd=remote)
+            git("init", "-q", cwd=work)
+            git("commit", "-q", "--allow-empty", "-m", "1", cwd=work)
+            git("tag", "-a", "v1.0.0", "-m", "v1.0.0", cwd=work)
+            first = git("push", "--porcelain", remote, "refs/tags/v1.0.0", cwd=work)
+            second = git("push", "--porcelain", remote, "refs/tags/v1.0.0", cwd=work)
+        self.assertEqual([(o.flag, o.ref, o.summary) for o in tag_releases.parse_push_porcelain(first)],
+                         [("*", "refs/tags/v1.0.0", "[new tag]")])
+        self.assertEqual([(o.flag, o.ref, o.summary) for o in tag_releases.parse_push_porcelain(second)],
+                         [("=", "refs/tags/v1.0.0", "[up to date]")])
+
+
+class PushStatusTest(unittest.TestCase):
+    """``push_status``: 結果の行を、送れた・既にあった・workflows 権限の断り・それ以外の断りに分ける。"""
+
+    @staticmethod
+    def status(flag: str, reason: str = "", summary: str = "[remote rejected]") -> str:
+        return tag_releases.push_status(
+            tag_releases.PushOutcome(flag, "refs/tags/v1.0.0", summary, reason))
+
+    def test_pushed(self):
+        for flag in (" ", "+", "*", "-"):
+            with self.subTest(flag=flag):
+                self.assertEqual(self.status(flag, summary="[new tag]"), tag_releases.PUSHED)
+
+    def test_up_to_date(self):
+        self.assertEqual(self.status("=", summary="[up to date]"), tag_releases.UP_TO_DATE)
+
+    def test_the_workflows_permission_refusal_from_github(self):
+        self.assertEqual(self.status("!", GITHUB_WORKFLOWS_REASON), tag_releases.NEEDS_WORKFLOWS)
+
+    def test_the_wording_may_vary_a_little(self):
+        for reason in (
+            "refusing to allow a GitHub App to create or update workflow "
+            "`.github/workflows/tag.yml` without `workflows` permission",
+            "refusing to allow a GitHub App to create or update workflow without workflows permission",
+            "Refusing to allow a GitHub App to create or update workflow "
+            "`.github/workflows/ci.yml` without `Workflows` Permission",
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.status("!", reason), tag_releases.NEEDS_WORKFLOWS)
+
+    def test_other_refusals_are_not_the_workflows_permission(self):
+        for reason in (
+            "",
+            "hook declined",
+            "pre-receive hook declined",
+            "already exists",
+            "non-fast-forward",
+            "protected branch hook declined",
+            GITHUB_OAUTH_REASON,                       # 人の OAuth トークンのスコープの話
+            "refusing to update .github/workflows/ci.yml",   # 語句が似ているだけ
+            "workflows are disabled for this repository",
+            "permission denied to workflows",          # 順番が逆
+        ):
+            with self.subTest(reason=reason):
+                self.assertEqual(self.status("!", reason), tag_releases.REJECTED)
+
+    def test_the_phrase_on_a_line_that_was_not_refused_does_not_count(self):
+        for flag in (" ", "+", "*", "-", "="):
+            with self.subTest(flag=flag):
+                self.assertNotIn(self.status(flag, GITHUB_WORKFLOWS_REASON),
+                                 (tag_releases.NEEDS_WORKFLOWS, tag_releases.REJECTED))
+
+    def test_a_local_rejection_is_a_refusal_too(self):
+        self.assertEqual(self.status("!", "already exists", "[rejected]"), tag_releases.REJECTED)
 
 
 # -- git のリポジトリを作って試すテスト ---------------------------------------------------
@@ -791,7 +968,7 @@ class MainTest(GitRepoTestCase):
             self.assertEqual(self.tag_target("v" + version, remote), merge)
             self.assertEqual(self.git("cat-file", "-t", "v" + version, cwd=remote), "tag")
         pushes = self.git_calls(run, "push")
-        self.assertEqual(pushes, [["git", "push", "origin", "refs/tags/v3.0.0",
+        self.assertEqual(pushes, [["git", "push", "--porcelain", "origin", "refs/tags/v3.0.0",
                                    "refs/tags/v5.2.0", "refs/tags/v5.3.0"]])
         self.assertIn("3 件のタグを origin に push しました", stdout)
 
@@ -851,10 +1028,15 @@ class MainTest(GitRepoTestCase):
         remote = self.add_bare_remote()
         self.git("push", "-q", "origin", "main")
         self.git("tag", "v5.3.0", self.merge["3.0.0"], cwd=remote)   # リモートでは別の場所
-        code, _stdout, stderr = self.run_main("--push")
+        code, stdout, stderr = self.run_main("--push")
         self.assertEqual(code, 1)
         self.assertIn("push できませんでした", stderr)
         self.assertEqual(self.tag_target("v5.3.0", remote), self.merge["3.0.0"])
+        # 断られたのは v5.3.0 だけ。ほかの 2 つは届き、その理由はタグごとに知らせる
+        self.assertEqual(self.tags(remote), ["v3.0.0", "v5.2.0", "v5.3.0"])
+        self.assertIn("2 件のタグを origin に push しました（v3.0.0, v5.2.0）。", stdout)
+        self.assertIn("v5.3.0 は origin に受け付けられませんでした: [rejected] (already exists)", stderr)
+        self.assertIn("手で送るには: git push origin refs/tags/v5.3.0\n", stderr)
 
     # -- 作成の失敗 --
 
@@ -1058,7 +1240,8 @@ class TagCreationFailureTest(GitRepoTestCase):
         self.assertEqual(self.tag_target("v5.3.0", self.remote), self.merge["5.3.0"])
         # 作れたものを 1 回の git push でまとめて送る（作れなかったものは含めない）
         self.assertEqual(self.git_calls(run, "push"),
-                         [["git", "push", "origin", "refs/tags/v3.0.0", "refs/tags/v5.3.0"]])
+                         [["git", "push", "--porcelain", "origin",
+                           "refs/tags/v3.0.0", "refs/tags/v5.3.0"]])
         self.assertIn("v3.0.0 を {0} に付けました".format(self.merge["3.0.0"][:7]), stdout)
         self.assertIn("v5.3.0 を {0} に付けました".format(self.merge["5.3.0"][:7]), stdout)
         self.assertIn("2 件のタグを origin に push しました", stdout)
@@ -1121,7 +1304,7 @@ class TagCreationFailureTest(GitRepoTestCase):
         self.assertEqual(self.tags(self.remote), ["v3.0.0", "v5.2.0", "v5.3.0"])
         self.assertEqual(self.tag_target("v5.2.0"), self.merge["5.2.0"])
         self.assertEqual(self.git_calls(run, "push"),
-                         [["git", "push", "origin", "refs/tags/v5.2.0"]])
+                         [["git", "push", "--porcelain", "origin", "refs/tags/v5.2.0"]])
         self.assertIn("v3.0.0 は付いています", stdout)
 
     def test_the_failure_does_not_touch_the_tags_that_already_exist(self):
@@ -1181,7 +1364,8 @@ class PushDiagnosticsTest(GitRepoTestCase):
         self.assertEqual(code, 1)
         # 同じ push を git に直接させて、git の言い分を取る（タグは今できている）
         reason = subprocess.run(
-            ["git", "push", "origin", "refs/tags/v3.0.0", "refs/tags/v5.2.0", "refs/tags/v5.3.0"],
+            ["git", "push", "--porcelain", "origin",
+             "refs/tags/v3.0.0", "refs/tags/v5.2.0", "refs/tags/v5.3.0"],
             cwd=self.repo, capture_output=True, text=True, encoding="utf-8").stderr.strip()
         self.assertIn(missing, reason)   # 送り先が無い、という説明のはず
         self.assertIn("タグを origin に push できませんでした: " + reason, stderr)
@@ -1213,6 +1397,478 @@ class PushDiagnosticsTest(GitRepoTestCase):
         self.assertEqual(pushes[0].kwargs["env"]["GIT_TERMINAL_PROMPT"], "0")
         # このプロセスの環境そのものは書き換えない
         self.assertNotIn("GIT_TERMINAL_PROMPT", os.environ)
+
+
+# -- push の結果をタグごとに知らせる ---------------------------------------------------------
+
+def fake_push(returncode: int, stdout: str = "", stderr: str = ""):
+    """``git push`` の結果だけを決めた値に差し替える（ほかの git は本物を実行する）。
+
+    GitHub の返答は手元の bare リポジトリでは再現できないため、
+    ``--porcelain`` の出力（標準出力）を文字列で与えて、その読み取りを確かめる。
+    """
+    real = tag_releases._git
+
+    def run(repo, *args, **kwargs):
+        if args[:1] == ("push",):
+            return subprocess.CompletedProcess(["git"] + list(args), returncode, stdout, stderr)
+        return real(repo, *args, **kwargs)
+
+    return mock.patch.object(tag_releases, "_git", side_effect=run)
+
+
+def porcelain(*lines: str) -> str:
+    """``git push --porcelain`` の標準出力（先頭の送り先と末尾の ``Done`` つき）。"""
+    return "To https://example.invalid/chime-5pm.git\n" + "".join(lines) + "Done\n"
+
+
+def pushed_line(tag: str) -> str:
+    return "*\trefs/tags/{0}:refs/tags/{0}\t[new tag]\n".format(tag)
+
+
+def current_line(tag: str) -> str:
+    return "=\trefs/tags/{0}:refs/tags/{0}\t[up to date]\n".format(tag)
+
+
+def refused_line(tag: str, reason: str, summary: str = "[remote rejected]") -> str:
+    return "!\trefs/tags/{0}:refs/tags/{0}\t{1} ({2})\n".format(tag, summary, reason)
+
+
+PUSH_ERROR = "error: failed to push some refs to 'https://example.invalid/chime-5pm.git'\n"
+
+
+class PushReportTest(GitRepoTestCase):
+    """push の結果をタグごとに読み取る。GitHub が ``workflows`` 権限で断ったタグだけは失敗にしない。
+
+    GitHub は、既定ブランチと ``.github/workflows`` の中身が違うコミットを指すタグを、
+    ``GITHUB_TOKEN`` の push では受け付けない（``GITHUB_TOKEN`` に ``workflows`` 権限は付けられない）。
+    古い版のタグがこれに当たるため、人が 1 回だけ手元から送るほかない。それを毎回の失敗にしない。
+    """
+
+    MANUAL = "手で送るには: "
+
+    def setUp(self):
+        super().setUp()
+        self.build_history()
+        self.add_bare_remote()
+
+    @staticmethod
+    def warning_lines(text: str) -> List[str]:
+        return [line for line in text.splitlines()
+                if line.startswith("警告: ") or line.startswith("::warning::")]
+
+    def run_on_actions(self, *argv: str) -> Tuple[int, str, str]:
+        with mock.patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}):
+            return self.run_main(*argv)
+
+    # -- GitHub の断り方（workflows 権限）は失敗ではない --
+
+    def test_one_pushed_and_one_refused_for_workflows_is_exit_0_with_a_warning(self):
+        out = porcelain(pushed_line("v5.3.0"), refused_line("v5.2.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            code, stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+        self.assertEqual(code, 0)
+        # 送れたタグを知らせる
+        self.assertIn("1 件のタグを origin に push しました（v5.3.0）。", stdout)
+        # 送れなかったタグは、名前・理由・人が打つコマンドを添えた警告で知らせる
+        warnings = self.warning_lines(stderr)
+        self.assertEqual(len(warnings), 1, stderr)
+        self.assertIn("v5.2.0", warnings[0])
+        self.assertIn("GitHub Actions", warnings[0])
+        self.assertIn("既定ブランチ", warnings[0])
+        self.assertIn("ワークフロー", warnings[0])
+        self.assertIn(GITHUB_WORKFLOWS_REASON, warnings[0])
+        self.assertIn("git fetch origin && git tag -a v5.2.0 {0} -m v5.2.0 && git push origin v5.2.0"
+                      .format(self.merge["5.2.0"]), warnings[0])
+        # 失敗の知らせ（git のメッセージ・手で送るコマンド）は出さない
+        self.assertNotIn("push できませんでした", stderr)
+        self.assertNotIn(self.MANUAL, stdout + stderr)
+        # タグはこのリポジトリには付いたまま
+        self.assertEqual(self.tags(), ["v5.2.0", "v5.3.0"])
+
+    def test_the_warning_is_an_annotation_on_actions_and_nothing_goes_to_stderr(self):
+        out = porcelain(pushed_line("v5.3.0"), refused_line("v5.2.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            code, stdout, stderr = self.run_on_actions("--since", "5.2.0", "--push")
+        self.assertEqual((code, stderr), (0, ""))
+        warnings = self.warning_lines(stdout)
+        self.assertEqual(len(warnings), 1, stdout)
+        self.assertTrue(warnings[0].startswith("::warning::"), warnings[0])
+        self.assertIn("v5.2.0", warnings[0])
+        self.assertIn("git push origin v5.2.0", warnings[0])
+
+    def test_the_first_incident_is_now_green(self):
+        """実際にあった結果（v6.0.0 は届き、v5.2.0 と v5.3.0 は断られた）が、赤くならないこと。"""
+        self.merge_pr(4, "6.0.0", ["3.0.0", "5.2.0", "5.3.0", "6.0.0"])
+        out = porcelain(pushed_line("v6.0.0"),
+                        refused_line("v5.2.0", GITHUB_WORKFLOWS_REASON),
+                        refused_line("v5.3.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            code, stdout, stderr = self.run_on_actions("--since", "5.2.0", "--push")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("1 件のタグを origin に push しました（v6.0.0）。", stdout)
+        warnings = self.warning_lines(stdout)
+        self.assertEqual(len(warnings), 2, stdout)
+        for warning, version in zip(warnings, ("5.2.0", "5.3.0")):
+            sha = self.merge[version]
+            self.assertIn("v" + version, warning)
+            self.assertIn("git tag -a v{0} {1} -m v{0}".format(version, sha), warning)
+        self.assertNotIn("push できませんでした", stdout)
+
+    def test_when_every_tag_is_refused_for_workflows_it_is_still_exit_0(self):
+        out = porcelain(*[refused_line(tag, GITHUB_WORKFLOWS_REASON)
+                          for tag in ("v3.0.0", "v5.2.0", "v5.3.0")])
+        with fake_push(1, out, PUSH_ERROR):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.warning_lines(stderr)), 3, stderr)
+        self.assertNotIn("push しました", stdout)
+        self.assertNotIn(self.MANUAL, stderr)
+
+    def test_each_warning_has_its_own_tag_and_commit(self):
+        out = porcelain(refused_line("v5.2.0", GITHUB_WORKFLOWS_REASON),
+                        refused_line("v5.3.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            _code, _stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+        first, second = self.warning_lines(stderr)
+        self.assertIn(self.merge["5.2.0"], first)
+        self.assertNotIn(self.merge["5.3.0"], first)
+        self.assertIn(self.merge["5.3.0"], second)
+        self.assertNotIn(self.merge["5.2.0"], second)
+
+    def test_the_commands_use_the_remote_that_was_asked_for(self):
+        self.add_bare_remote("upstream", "upstream.git")
+        out = porcelain(refused_line("v5.3.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            _code, _stdout, stderr = self.run_main("--since", "5.3.0", "--push",
+                                                   "--remote", "upstream")
+        self.assertIn("git fetch upstream && git tag -a v5.3.0 {0} -m v5.3.0 && git push upstream v5.3.0"
+                      .format(self.merge["5.3.0"]), stderr)
+
+    def test_the_warning_commands_quote_a_remote_with_a_space(self):
+        remote = os.path.join(self.tmp, "no such dir", "r.git")
+        out = porcelain(refused_line("v5.3.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            _code, _stdout, stderr = self.run_main("--since", "5.3.0", "--push", "--remote", remote)
+        command = re.search(r"git fetch .*$", self.warning_lines(stderr)[0]).group(0)
+        self.assertEqual(shlex.split(command.split(" && ")[0]), ["git", "fetch", remote])
+        self.assertEqual(shlex.split(command.split(" && ")[2]), ["git", "push", remote, "v5.3.0"])
+
+    def test_the_refused_tag_is_still_made_locally_and_a_rerun_does_not_make_it_again(self):
+        out = porcelain(refused_line("v5.3.0", GITHUB_WORKFLOWS_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            self.run_main("--since", "5.3.0", "--push")
+        before = self.git("rev-parse", "refs/tags/v5.3.0")
+        with mock.patch.object(tag_releases.subprocess, "run", wraps=subprocess.run) as run:
+            code, stdout, stderr = self.run_main("--since", "5.3.0", "--push")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertEqual(self.git("rev-parse", "refs/tags/v5.3.0"), before)
+        self.assertEqual(self.git_calls(run, "push"), [])   # 今回作ったタグが無いので送らない
+        self.assertIn("新しく付けるタグはありません", stdout)
+
+    def test_a_fresh_checkout_warns_again_and_stays_green(self):
+        """次の実行（Actions は毎回まっさらな checkout）でも、同じ警告を出して終了コード 0 のまま。"""
+        out = porcelain(refused_line("v5.3.0", GITHUB_WORKFLOWS_REASON))
+        for _ in range(2):
+            with fake_push(1, out, PUSH_ERROR):
+                code, _stdout, stderr = self.run_main("--since", "5.3.0", "--push")
+            self.assertEqual(code, 0)
+            self.assertEqual(len(self.warning_lines(stderr)), 1, stderr)
+            self.git("tag", "-d", "v5.3.0")            # まっさらな checkout を真似る
+
+    # -- それ以外の断り方・結果が得られない失敗は、これまでどおり終了コード 1 --
+
+    def test_a_workflows_refusal_next_to_another_refusal_is_exit_1(self):
+        out = porcelain(pushed_line("v3.0.0"),
+                        refused_line("v5.2.0", GITHUB_WORKFLOWS_REASON),
+                        refused_line("v5.3.0", "already exists", "[rejected]"))
+        with fake_push(1, out, PUSH_ERROR):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertIn("1 件のタグを origin に push しました（v3.0.0）。", stdout)
+        # workflows の断りは、ほかの断りがあっても警告として知らせる
+        warnings = self.warning_lines(stderr)
+        self.assertEqual(len(warnings), 1, stderr)
+        self.assertIn("v5.2.0", warnings[0])
+        # 失敗として知らせるのは、ほかの理由で断られたタグだけ
+        self.assertIn("v5.3.0 は origin に受け付けられませんでした: [rejected] (already exists)", stderr)
+        self.assertIn("タグを origin に push できませんでした: " + PUSH_ERROR.strip(), stderr)
+        self.assertIn("タグはこのリポジトリには作ってあります（v5.3.0）。", stderr)
+        self.assertIn(self.MANUAL + "git push origin refs/tags/v5.3.0\n", stderr)
+        manual = [line for line in stderr.splitlines() if line.startswith(self.MANUAL)]
+        self.assertEqual(len(manual), 1)
+        self.assertNotIn("v5.2.0", manual[0])
+
+    def test_another_kind_of_refusal_alone_is_exit_1(self):
+        out = porcelain(pushed_line("v3.0.0"), pushed_line("v5.3.0"),
+                        refused_line("v5.2.0", "pre-receive hook declined"))
+        with fake_push(1, out, PUSH_ERROR):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.warning_lines(stderr), [])
+        self.assertIn("2 件のタグを origin に push しました（v3.0.0, v5.3.0）。", stdout)
+        self.assertIn("v5.2.0 は origin に受け付けられませんでした: "
+                      "[remote rejected] (pre-receive hook declined)", stderr)
+        self.assertIn(self.MANUAL + "git push origin refs/tags/v5.2.0\n", stderr)
+
+    def test_an_oauth_scope_refusal_is_not_taken_for_the_workflows_permission(self):
+        out = porcelain(refused_line("v5.2.0", GITHUB_OAUTH_REASON))
+        with fake_push(1, out, PUSH_ERROR):
+            code, _stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.warning_lines(stderr), [])
+        self.assertIn(GITHUB_OAUTH_REASON, stderr)
+
+    def test_a_workflows_reason_on_a_tag_that_was_not_refused_does_not_count(self):
+        # 断られた行（!）でないものに理由が付いていても、断りとして数えない
+        out = porcelain("*\trefs/tags/v5.3.0:refs/tags/v5.3.0\t[new tag] ({0})\n"
+                        .format(GITHUB_WORKFLOWS_REASON))
+        with fake_push(0, out):
+            code, stdout, stderr = self.run_main("--since", "5.3.0", "--push")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("1 件のタグを origin に push しました（v5.3.0）。", stdout)
+
+    def test_a_push_without_per_tag_results_is_exit_1_as_before(self):
+        with fake_push(128, "", "fatal: Could not read from remote repository.\n"):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertNotIn("push しました", stdout)
+        self.assertIn("タグを origin に push できませんでした: "
+                      "fatal: Could not read from remote repository.", stderr)
+        self.assertIn("タグはこのリポジトリには作ってあります（v3.0.0, v5.2.0, v5.3.0）。", stderr)
+        self.assertIn(self.MANUAL + "git push origin "
+                      "refs/tags/v3.0.0 refs/tags/v5.2.0 refs/tags/v5.3.0\n", stderr)
+
+    def test_a_tag_missing_from_the_results_of_a_failed_push_is_not_called_pushed(self):
+        # v5.2.0 と v5.3.0 は結果の行が無い（途中で切れた）。送れたとは言えないので失敗にする
+        with fake_push(1, porcelain(pushed_line("v3.0.0")), PUSH_ERROR):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertIn("1 件のタグを origin に push しました（v3.0.0）。", stdout)
+        self.assertIn(self.MANUAL + "git push origin refs/tags/v5.2.0 refs/tags/v5.3.0\n", stderr)
+
+    def test_a_failure_status_with_only_good_lines_is_still_a_failure(self):
+        # git が失敗を返したのに、読み取れた結果がすべて良い（理由が分からない）。成功とは言わない
+        out = porcelain(*[pushed_line(tag) for tag in ("v3.0.0", "v5.2.0", "v5.3.0")])
+        with fake_push(1, out, "boom\n"):
+            code, _stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertIn("タグを origin に push できませんでした: boom", stderr)
+        self.assertIn(self.MANUAL + "git push origin "
+                      "refs/tags/v3.0.0 refs/tags/v5.2.0 refs/tags/v5.3.0\n", stderr)
+
+    # -- 成功の知らせ --
+
+    def test_a_successful_push_without_result_lines_counts_as_pushed(self):
+        with fake_push(0, "", ""):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("3 件のタグを origin に push しました（v3.0.0, v5.2.0, v5.3.0）。", stdout)
+
+    def test_tags_the_remote_already_has_are_reported_apart_from_the_pushed_ones(self):
+        out = porcelain(current_line("v3.0.0"), pushed_line("v5.2.0"), pushed_line("v5.3.0"))
+        with fake_push(0, out):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertIn("2 件のタグを origin に push しました（v5.2.0, v5.3.0）。", stdout)
+        self.assertIn("v3.0.0 は origin に既にあります（送る必要はありませんでした）。", stdout)
+
+    def test_nothing_new_to_send_says_the_remote_already_has_them(self):
+        out = porcelain(*[current_line(tag) for tag in ("v3.0.0", "v5.2.0", "v5.3.0")])
+        with fake_push(0, out):
+            code, stdout, _stderr = self.run_main("--push")
+        self.assertEqual(code, 0)
+        self.assertNotIn("push しました", stdout)
+        self.assertIn("v3.0.0, v5.2.0, v5.3.0 は origin に既にあります", stdout)
+
+    def test_the_push_is_asked_for_in_porcelain_form(self):
+        with mock.patch.object(tag_releases.subprocess, "run", wraps=subprocess.run) as run:
+            code, _stdout, _stderr = self.run_main("--push")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.git_calls(run, "push"),
+                         [["git", "push", "--porcelain", "origin", "refs/tags/v3.0.0",
+                           "refs/tags/v5.2.0", "refs/tags/v5.3.0"]])
+
+
+def hooks_runnable() -> bool:
+    return shutil.which("sh") is not None
+
+
+@unittest.skipUnless(hooks_runnable(), "sh がありません（受け取る側の hook を作れません）")
+class PushRejectionTest(GitRepoTestCase):
+    """受け取る側が断った push を、手元の bare リポジトリの hook で本当に起こして確かめる。
+
+    ``update`` hook は ref ごとに、``pre-receive`` hook は push 全体を断る。
+    GitHub の ``workflows`` 権限の断りだけは hook では真似られない（hook の断りの理由は
+    いつも ``hook declined``）ので、その理由の文字だけを GitHub の返答に差し替える。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.build_history()
+        self.remote = self.add_bare_remote()
+
+    def install_hook(self, name: str, body: str) -> None:
+        hooks = os.path.join(self.remote, "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        path = os.path.join(hooks, name)
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+
+    def refuse_tags(self, *tags: str) -> None:
+        """``update`` hook: 名前を挙げたタグだけを断り、ほかの ref は受け付ける。"""
+        cases = "".join("  refs/tags/{0}) exit 1 ;;\n".format(tag) for tag in tags)
+        self.install_hook("update", 'case "$1" in\n{0}esac\nexit 0\n'.format(cases))
+
+    def refuse_everything_if_it_has(self, tag: str) -> None:
+        """``pre-receive`` hook: 送られた ref に ``tag`` が 1 つでもあれば、push 全体を断る。"""
+        self.install_hook("pre-receive", 'while read old new ref; do\n'
+                          '  [ "$ref" = refs/tags/{0} ] && exit 1\n'
+                          'done\nexit 0\n'.format(tag))
+
+    def github_says(self, reason: str, *tags: str):
+        """断られた ``tags`` の理由（``hook declined``）を、``reason`` に差し替えて ``main`` に見せる。"""
+        real = tag_releases._git
+
+        def run(repo, *args, **kwargs):
+            result = real(repo, *args, **kwargs)
+            if args[:1] != ("push",):
+                return result
+            lines = []
+            for line in result.stdout.split("\n"):
+                if any(line.startswith("!\trefs/tags/{0}:".format(tag)) for tag in tags):
+                    line = line.replace("(hook declined)", "(" + reason + ")")
+                lines.append(line)
+            return subprocess.CompletedProcess(result.args, result.returncode,
+                                               "\n".join(lines), result.stderr)
+
+        return mock.patch.object(tag_releases, "_git", side_effect=run)
+
+    @staticmethod
+    def warning_lines(text: str) -> List[str]:
+        return [line for line in text.splitlines()
+                if line.startswith("警告: ") or line.startswith("::warning::")]
+
+    # -- workflows 権限の断り（hook が断り、理由だけ GitHub のものにする） --
+
+    def test_one_tag_refused_for_workflows_and_the_rest_pushed_is_exit_0(self):
+        self.refuse_tags("v5.2.0")
+        with self.github_says(GITHUB_WORKFLOWS_REASON, "v5.2.0"):
+            code, stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.tags(self.remote), ["v5.3.0"])          # 届いたのは 1 つだけ
+        self.assertEqual(self.tag_target("v5.3.0", self.remote), self.merge["5.3.0"])
+        self.assertEqual(self.tags(), ["v5.2.0", "v5.3.0"])           # ローカルには両方ある
+        self.assertIn("1 件のタグを origin に push しました（v5.3.0）。", stdout)
+        warnings = self.warning_lines(stderr)
+        self.assertEqual(len(warnings), 1, stderr)
+        self.assertIn("v5.2.0", warnings[0])
+        self.assertIn("git fetch origin && git tag -a v5.2.0 {0} -m v5.2.0 && git push origin v5.2.0"
+                      .format(self.merge["5.2.0"]), warnings[0])
+        self.assertNotIn("push できませんでした", stderr)
+        self.assertNotIn("手で送るには", stderr)
+
+    def test_the_commands_in_the_warning_make_the_tag_on_a_persons_machine(self):
+        self.git("push", "-q", "origin", "main")       # コミットは送り先にある（タグだけが断られる）
+        self.git("symbolic-ref", "HEAD", "refs/heads/main", cwd=self.remote)
+        self.refuse_tags("v5.2.0")
+        with self.github_says(GITHUB_WORKFLOWS_REASON, "v5.2.0"):
+            code, _stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.tags(self.remote), ["v5.3.0"])
+
+        # 人の手元: 送り先を clone しただけのリポジトリ。人の資格情報なら断られない（hook を外す）
+        person = os.path.join(self.tmp, "person")
+        self.git("clone", "-q", self.remote, person, cwd=self.tmp)
+        os.remove(os.path.join(self.remote, "hooks", "update"))
+        command = re.search(r"git fetch .*$", self.warning_lines(stderr)[0]).group(0)
+        done = subprocess.run(["sh", "-c", command], cwd=person, capture_output=True,
+                              text=True, encoding="utf-8")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.tags(self.remote), ["v5.2.0", "v5.3.0"])
+        self.assertEqual(self.tag_target("v5.2.0", self.remote), self.merge["5.2.0"])
+        self.assertEqual(self.git("cat-file", "-t", "v5.2.0", cwd=self.remote), "tag")
+
+    def test_a_workflows_refusal_next_to_a_hook_refusal_is_exit_1(self):
+        self.refuse_tags("v5.2.0", "v5.3.0")
+        with self.github_says(GITHUB_WORKFLOWS_REASON, "v5.2.0"):
+            code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.tags(self.remote), ["v3.0.0"])
+        self.assertIn("1 件のタグを origin に push しました（v3.0.0）。", stdout)
+        self.assertEqual(len(self.warning_lines(stderr)), 1, stderr)
+        self.assertIn("v5.3.0 は origin に受け付けられませんでした: [remote rejected] (hook declined)",
+                      stderr)
+        self.assertIn("手で送るには: git push origin refs/tags/v5.3.0\n", stderr)
+
+    # -- それ以外の断り方 --
+
+    def test_a_hook_refusing_one_tag_is_a_failure_for_that_tag(self):
+        self.refuse_tags("v5.2.0")
+        code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        # 断られなかったタグは届いていて、それは知らせる
+        self.assertEqual(self.tags(self.remote), ["v3.0.0", "v5.3.0"])
+        self.assertIn("2 件のタグを origin に push しました（v3.0.0, v5.3.0）。", stdout)
+        self.assertIn("v5.2.0 は origin に受け付けられませんでした: [remote rejected] (hook declined)",
+                      stderr)
+        self.assertIn("タグを origin に push できませんでした: ", stderr)
+        self.assertIn("タグはこのリポジトリには作ってあります（v5.2.0）。", stderr)
+        self.assertIn("手で送るには: git push origin refs/tags/v5.2.0\n", stderr)
+        self.assertEqual(self.warning_lines(stderr), [])
+
+    def test_a_pre_receive_hook_refusing_a_tag_refuses_the_whole_push(self):
+        self.refuse_everything_if_it_has("v5.2.0")
+        code, stdout, stderr = self.run_main("--push")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.tags(self.remote), [])
+        self.assertNotIn("push しました", stdout)
+        for tag in ("v3.0.0", "v5.2.0", "v5.3.0"):
+            self.assertIn("{0} は origin に受け付けられませんでした: "
+                          "[remote rejected] (pre-receive hook declined)".format(tag), stderr)
+        self.assertIn("手で送るには: git push origin "
+                      "refs/tags/v3.0.0 refs/tags/v5.2.0 refs/tags/v5.3.0\n", stderr)
+        self.assertEqual(self.warning_lines(stderr), [])
+
+    def test_an_oauth_style_refusal_through_a_hook_is_a_failure(self):
+        self.refuse_tags("v5.2.0")
+        with self.github_says(GITHUB_OAUTH_REASON, "v5.2.0"):
+            code, _stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+        self.assertEqual(code, 1)
+        self.assertEqual(self.warning_lines(stderr), [])
+
+    # -- 次の実行 --
+
+    def test_the_next_run_warns_again_until_a_person_sends_the_tag(self):
+        """Actions は毎回まっさらな checkout なので、断られたタグは次の実行でまた作られ、また断られる。"""
+        self.refuse_tags("v5.2.0")
+        # 1 回目は両方を作って送る。2 回目は断られた v5.2.0 だけが無い（v5.3.0 は届いたので送らない）
+        for run_number, refspecs in enumerate((["refs/tags/v5.2.0", "refs/tags/v5.3.0"],
+                                               ["refs/tags/v5.2.0"])):
+            if run_number:
+                self.git("tag", "-d", "v5.2.0")        # まっさらな checkout を真似る
+                self.git("tag", "-d", "v5.3.0")
+                self.git("fetch", "-q", "origin", "refs/tags/v5.3.0:refs/tags/v5.3.0")
+            with self.github_says(GITHUB_WORKFLOWS_REASON, "v5.2.0"), \
+                    mock.patch.object(tag_releases.subprocess, "run",
+                                      wraps=subprocess.run) as run:
+                code, _stdout, stderr = self.run_main("--since", "5.2.0", "--push")
+            self.assertEqual(code, 0)
+            self.assertEqual(len(self.warning_lines(stderr)), 1, stderr)
+            self.assertEqual(self.git_calls(run, "push"),
+                             [["git", "push", "--porcelain", "origin"] + refspecs])
+
+    def test_identical_tags_already_on_the_remote_are_up_to_date_not_an_error(self):
+        # 日時を固定してあるので、作り直したタグは前のものと同じオブジェクトになり、送り先は
+        # 「すでに同じ」と答える
+        self.run_main("--push")
+        for tag in ("v3.0.0", "v5.2.0", "v5.3.0"):
+            self.git("tag", "-d", tag)
+        code, stdout, stderr = self.run_main("--push")
+        self.assertEqual((code, stderr), (0, ""))
+        self.assertNotIn("push しました", stdout)
+        self.assertIn("v3.0.0, v5.2.0, v5.3.0 は origin に既にあります", stdout)
 
 
 class WarningTest(GitRepoTestCase):
@@ -1459,6 +2115,13 @@ class ExitCodeContractTest(unittest.TestCase):
         self.assertIn("1 = git の実行（履歴の読み取り・タグの作成・push）に失敗", doc)
         self.assertIn("2 = 使い方や環境の問題", doc)
         self.assertNotIn("1 = タグの作成または push に失敗", doc)
+
+    def test_the_docstring_explains_the_workflows_permission_refusal(self):
+        doc = tag_releases.__doc__
+        self.assertIn("git push --porcelain", doc)
+        self.assertIn("workflows", doc)
+        self.assertIn("GITHUB_TOKEN", doc)
+        self.assertIn("実行の失敗ではない", doc)
 
     def test_the_docstring_explains_which_merge_methods_are_fine(self):
         doc = tag_releases.__doc__

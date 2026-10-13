@@ -6,15 +6,15 @@ import argparse
 import difflib
 import json
 import logging
+import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
-from . import __version__, phrases, timesignal
+from . import buildinfo, check, configcheck, phrases, status, timesignal
 from .app import ChimeApp
-from .config import DEFAULT_CONFIG, ConfigError, load_config
+from .config import DEFAULT_CONFIG, Config, ConfigError, load_config
 from .logsetup import emit_early_error, setup_logging
 from .scheduler import format_events
-from .tts import TTSError
 from .weather import WeatherError
 
 logger = logging.getLogger("chime")
@@ -33,6 +33,9 @@ EPILOG = """\
   campus_chime.py --weather            天気予報の読み上げ文を確認する
   campus_chime.py --say 正午をお知らせしたのだ。  任意の文言を読み上げる
   campus_chime.py --generate-assets    時報音を生成し、時刻アナウンスの音声を用意できるか確認する
+  campus_chime.py --check              設置状態を点検する（設定・作り置きの音声・音源・書き込み。鳴らさず、何も書かない）
+  campus_chime.py --status             いまの状態（版・時刻の同期・サービス・直近の放送・次の予定）を表示する
+  campus_chime.py --wait-idle          放送の時間帯なら、終わるまで待つ（最大 360 秒。更新の前に使う）
 """
 
 
@@ -43,8 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--version", action="version",
-                        version="campus-chime {0}".format(__version__))
+    parser.add_argument("--version", action="version", version=buildinfo.version_string())
     parser.add_argument("--config", metavar="PATH",
                         help="設定ファイル（既定: config.json があれば読み込む）")
     parser.add_argument("--backend", choices=["auto", "pygame", "command", "mock"],
@@ -74,7 +76,44 @@ def build_parser() -> argparse.ArgumentParser:
                               "（作り置きがあるか）確認して終了。Pi では音声を新たに作らない")
     actions.add_argument("--print-config", action="store_true",
                          help="読み込んだ設定を表示して終了")
+    actions.add_argument("--check", action="store_true",
+                         help="設置状態を点検して終了（設定・作り置きの音声・音源・書き込み先。"
+                              "鳴らさず、何も書かない。NG があれば終了コード 1）")
+    actions.add_argument("--status", action="store_true",
+                         help="いまの状態（版・時刻の同期・サービス・直近の放送・次の予定）を表示して終了"
+                              "（何も書かない。気になる点があれば終了コード 1）")
+    actions.add_argument("--wait-idle", nargs="?", const=status.WAIT_IDLE_MAX, type=int,
+                         metavar="SECONDS",
+                         help="放送の時間帯なら、終わるまで待って終了（既定・最大 {0} 秒。"
+                              "待ちきれなければ終了コード 1）".format(status.WAIT_IDLE_MAX))
     return parser
+
+
+def logging_settings(config: Config) -> Tuple[str, str]:
+    """ログの ``(水準, 書式)``。設定に無い（または ``null`` の）ときは既定設定の値。
+
+    戻り先を別の文字列で持たない（既定設定を変えたときに食い違い、書式から
+    ``%(name)s`` が抜けるなどしていた）。
+    """
+    defaults = DEFAULT_CONFIG["logging"]
+    level = config.get("logging.level")
+    log_format = config.get("logging.format")
+    return (defaults["level"] if level is None else level,
+            defaults["format"] if log_format is None else log_format)
+
+
+def log_config_errors(config: Config, errors: List[configcheck.Finding]) -> None:
+    """既定値に置き換えた設定の誤りを、1 件ずつ ERROR で残す（キー・内容・直し方・出どころ）。
+
+    ``errors`` は :func:`chime.configcheck.sanitized` が返した誤り。それには値の出どころの
+    設定ファイルが無いので、誤りがあるときだけ、出どころ付きで同じ誤りを求め直して残す
+    （どのファイルを直せばよいかが分かる）。
+    """
+    if not errors:
+        return
+    for finding in configcheck.check_config(config):
+        if finding.level == configcheck.ERROR:
+            logger.error("設定の誤り: %s", finding.describe())
 
 
 def run(argv: Optional[List[str]] = None) -> int:
@@ -95,15 +134,36 @@ def run(argv: Optional[List[str]] = None) -> int:
         emit_early_error("設定エラー: {0}".format(exc))
         return 2
 
-    setup_logging(args.log_level or config.get("logging.level", "INFO"),
-                  config.get("logging.format", "%(asctime)s - %(levelname)s - %(message)s"),
-                  str(config.get("timezone", "")), stream=log_stream)
+    # 動かす設定は、危ない値（範囲外・型違いなど）だけを既定値に戻したもの。異常終了
+    # させても systemd の Restart=always が再起動を繰り返すだけで、時報は鳴らないため。
+    # --print-config は読んだとおりを見せるので、そのまま。
+    effective, errors = (config, []) if args.print_config else configcheck.sanitized(config)
+    level, log_format = logging_settings(effective)
+    setup_logging(args.log_level or level, log_format,
+                  str(effective.get("timezone", "")), stream=log_stream)
 
     if args.print_config:
         print(json.dumps(config.data, ensure_ascii=False, indent=2))
         return 0
 
-    app = ChimeApp(config, backend=args.backend, dry_run=args.dry_run)
+    # --check は、書かれたとおりの設定を調べて誤りを自分で表示する（ここで残すと二重になる）。
+    if args.check:
+        return check.run_check(config)
+
+    log_config_errors(config, errors)
+    # --status と --wait-idle は見るだけ。状態ファイルを書き換えないよう read-only にする。
+    look_only = args.status or args.wait_idle is not None
+    app = ChimeApp(effective, backend=args.backend, dry_run=args.dry_run or look_only)
+    return dispatch(app, args)
+
+
+def dispatch(app: ChimeApp, args: argparse.Namespace) -> int:
+    """動作モードに応じた処理を行う（どれも未指定なら常駐）。"""
+    if args.status:
+        return status.run_status(app)
+
+    if args.wait_idle is not None:
+        return status.wait_idle(app.scheduler, args.wait_idle)
 
     if args.schedule is not None:
         return show_schedule(app, args.schedule)
@@ -177,9 +237,10 @@ def warn_if_not_prerecorded(app: ChimeApp, text: str) -> None:
 def generate_assets(app: ChimeApp) -> int:
     """時報音を生成し、時刻アナウンスの音声を用意できるか（作り置きがあるか）確認する。
 
-    Pi では音声を新たに作らない（作り置き ``assets/voice/`` を引くだけ）。
-    VOICEVOX が動いている PC では、作り置きの欠けをその場で合成して埋めて
-    しまうため、PC での成功は作り置きが揃っている証拠にならない。
+    Pi では音声を新たに作らない（作り置き ``assets/voice/`` を引くだけ）。確かめるのは
+    作り置きの有無だけ（``prerecorded_lookup``）で、合成エンジンには問い合わせない。
+    VOICEVOX が動いている PC で合成まで試すと、作り置きの欠けをその場で埋めて
+    しまい、Pi では無音になる文言を「用意できた」と答えてしまうため。
     """
     settings = app.config.section("time_signal")
     path = timesignal.generate_time_signal(
@@ -191,13 +252,12 @@ def generate_assets(app: ChimeApp) -> int:
     # ジェネレーターなので、テンプレートが壊れていても、その時刻の前までは
     # OK / NG を出してから例外になる。
     for text in phrases.announcement_phrases(app.config):
-        try:
-            generated = app.tts.synthesize(text)
-        except TTSError as exc:
-            print("  NG {0}: {1}".format(text, exc), file=sys.stderr)
+        found = app.tts.prerecorded_lookup(text)
+        if found is None:
+            print("  NG {0}: {1}".format(text, missing_voice_reason(app)), file=sys.stderr)
             failures += 1
             continue
-        print("  OK {0} -> {1}".format(text, generated))
+        print("  OK {0} -> {1}".format(text, found))
 
     if failures:
         print("{0} 件の時刻アナウンスの音声を用意できませんでした。".format(failures),
@@ -208,6 +268,13 @@ def generate_assets(app: ChimeApp) -> int:
               file=sys.stderr)
         return 1
     return 0
+
+
+def missing_voice_reason(app: ChimeApp) -> str:
+    """作り置きに無い文言について、その理由（フォルダそのものが無いのか、文言が無いのか）。"""
+    if not os.path.isdir(app.tts.prerecorded_dir):
+        return "作り置きのフォルダ（assets/voice/）が見つかりません"
+    return "作り置き（assets/voice/）にこの文言がありません"
 
 
 def show_weather(app: ChimeApp) -> int:

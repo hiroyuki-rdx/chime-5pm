@@ -14,16 +14,22 @@ from contextlib import redirect_stderr, redirect_stdout
 from datetime import date, datetime, timedelta
 from unittest import mock
 from urllib.parse import urlparse
+from zoneinfo import ZoneInfo
 
 from tests.support import (ANNOUNCE_PATH, block_network, fixture_path, load_fixture,
                            load_manifest, logs_enabled)
 
-from chime import env
+from chime import buildinfo, cli, configcheck, env
+from chime.app import ChimeApp
 from chime.audio import Segment
 from chime.cli import CURRENT_HOUR, EPILOG, build_parser, run
+from chime.config import DEFAULT_CONFIG, load_config
+from chime.scheduler import Scheduler
 from chime.sequence import PlaybackPlan
 from chime.tts import TTSError
 from chime.weather import WeatherError
+
+TOKYO = ZoneInfo("Asia/Tokyo")
 
 
 def call(argv):
@@ -537,12 +543,372 @@ class RunTest(unittest.TestCase):
         self.assertEqual(external, [])
 
 
+class LoggingSettingsTest(unittest.TestCase):
+    """ログの水準と書式が設定に無い（または null の）ときは、既定設定の値に戻ること。
+
+    戻り先を別の文字列で持っていると、既定設定を変えたときに食い違う（実際に、
+    ``%(name)s`` の無い書式が残っていた）。``setup_logging`` へ渡る値を直接見る。
+    """
+
+    def setUp(self):
+        block_network(self)
+
+    def second_logging_call(self, data, *flags):
+        """設定を読んだあとの ``setup_logging`` の呼び出し（位置引数）を返す。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "config.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+            with mock.patch("chime.cli.setup_logging") as setup:
+                code, _, stderr = call_split(["--config", path] + list(flags))
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(setup.call_count, 2)
+        return setup.call_args_list[1][0]
+
+    def test_a_null_logging_section_falls_back_to_the_default_settings(self):
+        level, log_format = self.second_logging_call({"logging": None}, "--print-config")[:2]
+        self.assertEqual(level, DEFAULT_CONFIG["logging"]["level"])
+        self.assertEqual(log_format, DEFAULT_CONFIG["logging"]["format"])
+
+    def test_null_level_and_format_fall_back_to_the_default_settings(self):
+        data = {"logging": {"level": None, "format": None}}
+        level, log_format = self.second_logging_call(data, "--schedule", "1")[:2]
+        self.assertEqual(level, DEFAULT_CONFIG["logging"]["level"])
+        self.assertEqual(log_format, DEFAULT_CONFIG["logging"]["format"])
+
+    def test_configured_values_are_kept(self):
+        data = {"logging": {"level": "DEBUG", "format": "%(message)s"}}
+        level, log_format = self.second_logging_call(data, "--schedule", "1")[:2]
+        self.assertEqual((level, log_format), ("DEBUG", "%(message)s"))
+
+
+class VersionTest(unittest.TestCase):
+    def test_version_prints_the_version_string_with_the_commit(self):
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as raised:
+            build_parser().parse_args(["--version"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertEqual(out.getvalue(), buildinfo.version_string() + "\n")
+        self.assertRegex(out.getvalue(), r"^campus-chime \d+\.\d+\.\d+ \(.+\)\n$")
+
+    def test_version_uses_build_info(self):
+        out = io.StringIO()
+        with mock.patch("chime.cli.buildinfo.version_string", return_value="campus-chime 9.9.9 (abc1234)"), \
+                redirect_stdout(out), self.assertRaises(SystemExit):
+            build_parser().parse_args(["--version"])
+        self.assertEqual(out.getvalue(), "campus-chime 9.9.9 (abc1234)\n")
+
+
+class ConfigSanitizingTest(unittest.TestCase):
+    """危ない設定値は、読み込みのあとで既定値に戻してから動く（--print-config を除く）。"""
+
+    def setUp(self):
+        block_network(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def config_file(self, data):
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        return path
+
+    def test_the_app_runs_with_the_default_value_in_place_of_a_dangerous_one(self):
+        """タイムゾーンの綴りの誤りで OS のローカル時刻（Pi では UTC）にならない。"""
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        code, output = call(["--config", path, "--schedule", "1"])
+        self.assertEqual(code, 0, output)
+        self.assertRegex(output, r"現在時刻: .* JST")
+
+    def test_the_app_is_built_from_the_sanitized_config(self):
+        path = self.config_file({"timezone": "Asia/Tokio", "quotes": {"avoid_recent": 5}})
+        with mock.patch("chime.cli.ChimeApp", wraps=ChimeApp) as built:
+            call(["--config", path, "--schedule", "1"])
+        config = built.call_args[0][0]
+        self.assertEqual(config.get("timezone"), "Asia/Tokyo")
+        self.assertEqual(config.get("quotes.avoid_recent"), 5)
+
+    def test_each_error_is_logged_at_error_with_key_message_hint_and_source(self):
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        code, output = call(["--config", path, "--schedule", "1"])
+        lines = [line for line in output.splitlines() if line.startswith("ERROR - 設定の誤り: ")]
+        self.assertEqual(len(lines), 1, output)
+        self.assertIn("timezone: ", lines[0])
+        self.assertIn("Asia/Tokio", lines[0])
+        self.assertIn("Asia/Tokyo", lines[0])  # 直し方・既定値
+        self.assertIn("[{0}]".format(path), lines[0])  # 値の出どころ
+
+    def test_one_line_per_error(self):
+        path = self.config_file({"timezone": "Asia/Tokio", "schedule": {"max_sleep_seconds": 0}})
+        _, output = call(["--config", path, "--schedule", "1"])
+        lines = [line for line in output.splitlines() if "設定の誤り" in line]
+        self.assertEqual(len(lines), 2, output)
+
+    def test_a_config_without_errors_logs_no_error(self):
+        path = self.config_file({"quotes": {"avoid_recent": 5}})
+        _, output = call(["--config", path, "--schedule", "1"])
+        self.assertNotIn("設定の誤り", output)
+
+    def test_a_broken_log_format_no_longer_crashes_startup(self):
+        """``logging.format`` の誤りは、以前は ``setup_logging`` が例外で落ちた。"""
+        path = self.config_file({"logging": {"format": "%(asctime"}})
+        code, output = call_split(["--config", path, "--schedule", "1"])[:2]
+        self.assertEqual(code, 0)
+        self.assertIn("次回以降の予定", output)
+
+    def test_every_mode_except_print_config_is_sanitized(self):
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        for flags in (["--schedule", "1"], ["--say", "正午をお知らせしたのだ。", "--dry-run"],
+                      ["--test", "--dry-run", "--backend", "mock"], ["--status"], ["--wait-idle", "0"]):
+            with mock.patch("chime.cli.ChimeApp", wraps=ChimeApp) as built, \
+                    mock.patch("chime.cli.status.run_status", return_value=0), \
+                    mock.patch("chime.cli.status.wait_idle", return_value=0):
+                call(["--config", path] + flags)
+            self.assertEqual(built.call_args[0][0].get("timezone"), "Asia/Tokyo", flags)
+
+    def test_print_config_shows_the_config_as_written_and_logs_no_error(self):
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        code, stdout, stderr = call_split(["--config", path, "--print-config"])
+        self.assertEqual(code, 0, stderr)
+        self.assertEqual(json.loads(stdout)["timezone"], "Asia/Tokio")
+        self.assertNotIn("設定の誤り", stdout + stderr)
+
+    def test_print_config_does_not_sanitize(self):
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        with mock.patch("chime.cli.configcheck.sanitized") as sanitized:
+            call_split(["--config", path, "--print-config"])
+        sanitized.assert_not_called()
+
+
+class LogConfigErrorsTest(unittest.TestCase):
+    """``log_config_errors``：設定の誤りだけを ERROR で残す（警告・情報は残さない）。
+
+    ``--check`` 以外のモードは、誤りのあるキーを既定値に戻して動く。その誤りを 1 件ずつログに
+    残す関数で、誤りが無ければ何も読み直さない（起動のたびに設定を二度調べない）。
+    """
+
+    def setUp(self):
+        block_network(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def config(self, data):
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+        return load_config(path, base_dir=self.tmp)
+
+    def test_nothing_is_reread_when_there_are_no_errors(self):
+        config = self.config({"schedule": {"bogus_key": 1}})
+        with mock.patch.object(configcheck, "check_config", side_effect=AssertionError("reread")):
+            cli.log_config_errors(config, [])
+
+    def test_only_errors_are_logged_at_error_level(self):
+        # error 1 件（max_sleep_seconds）＋ warning（知らないキー）＋ info（既定値と同じ値）
+        config = self.config({"schedule": {"max_sleep_seconds": 0, "bogus_key": 1},
+                              "timezone": "Asia/Tokyo"})
+        _effective, errors = configcheck.sanitized(config)
+        self.assertEqual(len(errors), 1)
+        findings = configcheck.check_config(config)
+        self.assertEqual({finding.level for finding in findings},
+                         {configcheck.ERROR, configcheck.WARNING, configcheck.INFO})
+        with logs_enabled(), self.assertLogs("chime", level="ERROR") as captured:
+            cli.log_config_errors(config, errors)
+        self.assertEqual(len(captured.records), 1, [r.getMessage() for r in captured.records])
+        self.assertEqual(captured.records[0].levelno, logging.ERROR)
+        self.assertIn("schedule.max_sleep_seconds", captured.records[0].getMessage())
+
+    def test_warnings_and_infos_are_not_logged_even_when_an_error_exists(self):
+        config = self.config({"schedule": {"max_sleep_seconds": 0, "bogus_key": 1},
+                              "timezone": "Asia/Tokyo"})
+        _effective, errors = configcheck.sanitized(config)
+        with logs_enabled(), self.assertLogs("chime", level="DEBUG") as captured:
+            cli.log_config_errors(config, errors)
+        messages = [record.getMessage() for record in captured.records]
+        self.assertFalse([m for m in messages if "bogus_key" in m or "既定値と同じ" in m], messages)
+
+    def test_each_error_line_carries_the_file_it_came_from(self):
+        config = self.config({"schedule": {"max_sleep_seconds": 0}})
+        _effective, errors = configcheck.sanitized(config)
+        with logs_enabled(), self.assertLogs("chime", level="ERROR") as captured:
+            cli.log_config_errors(config, errors)
+        self.assertIn(os.path.join(self.tmp, "config.json"), captured.records[0].getMessage())
+        self.assertTrue(captured.records[0].getMessage().startswith("設定の誤り: "))
+
+
+class CheckModeTest(unittest.TestCase):
+    """``--check``（本体は ``chime/check.py``。ここでは配線を見る）。"""
+
+    def setUp(self):
+        block_network(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+
+    def config_file(self, data=None):
+        base = {"time_signal": {"output_file": os.path.join(self.tmp, "generated", "time_signal.wav")},
+                "state": {"file": os.path.join(self.tmp, "cache", "state.json"),
+                          "history_file": os.path.join(self.tmp, "cache", "history.jsonl")},
+                "tts": {"cache_dir": os.path.join(self.tmp, "cache", "tts")}}
+        base.update(data or {})
+        path = os.path.join(self.tmp, "config.json")
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(base, handle)
+        return path
+
+    def test_check_runs_the_check_with_the_config_as_written(self):
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        with mock.patch("chime.cli.check.run_check", return_value=0) as run_check:
+            code, _ = call(["--config", path, "--check"])
+        self.assertEqual(code, 0)
+        [config] = run_check.call_args[0]
+        self.assertEqual(config.get("timezone"), "Asia/Tokio")  # 既定値に戻す前の設定
+
+    def test_check_returns_what_the_check_returns(self):
+        path = self.config_file()
+        for expected in (0, 1):
+            with mock.patch("chime.cli.check.run_check", return_value=expected):
+                self.assertEqual(call(["--config", path, "--check"])[0], expected)
+
+    def test_check_does_not_build_the_app(self):
+        path = self.config_file()
+        with mock.patch("chime.cli.check.run_check", return_value=0), \
+                mock.patch("chime.cli.ChimeApp") as built:
+            call(["--config", path, "--check"])
+        built.assert_not_called()
+
+    def test_check_shows_errors_itself_instead_of_logging_them_twice(self):
+        path = self.config_file({"timezone": "Asia/Tokio"})
+        code, output = call(["--config", path, "--check"])
+        self.assertEqual(code, 1, output)
+        self.assertNotIn("ERROR - 設定の誤り", output)
+        self.assertIn("timezone", output)
+
+    def test_check_end_to_end_passes_on_the_shipped_assets_and_writes_nothing(self):
+        path = self.config_file()
+        before = sorted(os.listdir(self.tmp))
+        code, output = call(["--config", path, "--check"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("== 作り置きの音声 ==", output)
+        self.assertIn("138 件すべてそろっています", output)
+        self.assertIn("結果:", output)
+        # 時報音がまだ無くても警告にとどまり、点検は何も作らない。
+        self.assertIn("警告", output)
+        self.assertEqual(sorted(os.listdir(self.tmp)), before)
+
+    def test_check_with_an_unreadable_config_returns_2(self):
+        code, stdout, stderr = call_split(["--config", os.path.join(self.tmp, "none.json"), "--check"])
+        self.assertEqual(code, 2)
+        self.assertIn("設定エラー", stderr)
+        self.assertEqual(stdout, "")
+
+    def test_print_config_wins_over_check(self):
+        path = self.config_file()
+        with mock.patch("chime.cli.check.run_check") as run_check:
+            code, _, _ = call_split(["--config", path, "--check", "--print-config"])
+        self.assertEqual(code, 0)
+        run_check.assert_not_called()
+
+
+class StatusModeTest(unittest.TestCase):
+    """``--status`` / ``--wait-idle``（本体は ``chime/status.py``。ここでは配線を見る）。"""
+
+    def setUp(self):
+        block_network(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        data = {"state": {"file": os.path.join(self.tmp, "state.json"),
+                          "history_file": os.path.join(self.tmp, "history.jsonl")},
+                "tts": {"cache_dir": os.path.join(self.tmp, "tts")}}
+        self.config = os.path.join(self.tmp, "config.json")
+        with open(self.config, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    def test_the_new_options_are_parsed(self):
+        parser = build_parser()
+        args = parser.parse_args([])
+        self.assertFalse(args.check)
+        self.assertFalse(args.status)
+        self.assertIsNone(args.wait_idle)
+        self.assertTrue(parser.parse_args(["--check"]).check)
+        self.assertTrue(parser.parse_args(["--status"]).status)
+        self.assertEqual(parser.parse_args(["--wait-idle"]).wait_idle, 360)
+        self.assertEqual(parser.parse_args(["--wait-idle", "30"]).wait_idle, 30)
+
+    def test_help_lists_the_new_options(self):
+        text = build_parser().format_help()
+        for option in ("--check", "--status", "--wait-idle"):
+            self.assertIn(option, text)
+        for option in ("--check", "--status", "--wait-idle"):
+            self.assertIn("campus_chime.py " + option, EPILOG)
+
+    def test_status_is_dispatched_with_a_read_only_app(self):
+        with mock.patch("chime.cli.status.run_status", return_value=1) as run_status, \
+                mock.patch("chime.cli.ChimeApp", wraps=ChimeApp) as built:
+            code, _ = call(["--config", self.config, "--status"])
+        self.assertEqual(code, 1)
+        self.assertIsInstance(run_status.call_args[0][0], ChimeApp)
+        self.assertTrue(built.call_args[1]["dry_run"])
+
+    def test_wait_idle_is_dispatched_with_the_scheduler_and_the_limit(self):
+        for flags, limit in ((["--wait-idle"], 360), (["--wait-idle", "20"], 20)):
+            with mock.patch("chime.cli.status.wait_idle", return_value=1) as wait_idle, \
+                    mock.patch("chime.cli.ChimeApp", wraps=ChimeApp) as built:
+                code, _ = call(["--config", self.config] + flags)
+            self.assertEqual(code, 1)
+            scheduler, given = wait_idle.call_args[0]
+            self.assertIsInstance(scheduler, Scheduler)
+            self.assertEqual(given, limit)
+            self.assertTrue(built.call_args[1]["dry_run"])
+
+    def test_status_end_to_end_with_the_commands_faked(self):
+        def fake_run(command, **kwargs):
+            answers = {"timedatectl": "yes\n", "systemctl": "active\n"}
+            return type("Done", (), {"returncode": 0, "stdout": answers[command[0]]})()
+
+        with mock.patch("chime.status.subprocess.run", fake_run), \
+                mock.patch("chime.status.env.is_production_linux", return_value=True):
+            code, stdout, stderr = call_split(["--config", self.config, "--status", "--backend", "pygame"])
+        self.assertEqual(code, 0, stdout + stderr)
+        self.assertIn(buildinfo.version_string(), stdout)
+        self.assertIn("同期済み（NTP）", stdout)
+        self.assertIn("動作中（active）", stdout)
+        self.assertIn("138 件すべてそろっています", stdout)
+        self.assertIn("気になる点は見つかりませんでした。", stdout)
+
+    def test_status_writes_nothing(self):
+        with mock.patch("chime.status.subprocess.run", side_effect=FileNotFoundError):
+            call_split(["--config", self.config, "--status", "--backend", "pygame"])
+        self.assertEqual(sorted(os.listdir(self.tmp)), ["config.json"])
+
+    def test_wait_idle_on_a_weekend_returns_0_without_waiting(self):
+        saturday = datetime(2026, 10, 10, 12, 59, 30, tzinfo=TOKYO)
+        with mock.patch("chime.cli.ChimeApp.now", lambda self: saturday):
+            code, output = call(["--config", self.config, "--wait-idle", "5"])
+        self.assertEqual(code, 0, output)
+        self.assertIn("放送の時間帯ではありません", output)
+
+    def test_wait_idle_during_a_broadcast_times_out_with_1(self):
+        friday = datetime(2026, 10, 9, 13, 0, 30, tzinfo=TOKYO)
+        with mock.patch("chime.cli.ChimeApp.now", lambda self: friday), \
+                mock.patch("chime.status.time.sleep") as sleep:
+            code, stdout, stderr = call_split(["--config", self.config, "--wait-idle", "10"])
+        self.assertEqual(code, 1)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertIn("放送の時間帯です", stdout)
+        self.assertIn("10 秒待ちましたが", stderr)
+
+
 class GenerateAssetsTest(unittest.TestCase):
     """``--generate-assets``。``scripts/setup.sh`` が終了コードで分岐する。
 
     設定ファイルで時報音・状態ファイル・合成キャッシュの出力先を一時フォルダへ
-    振り向け、リポジトリには何も書かせない。音声合成は ``TTSService.synthesize``
-    を差し替えて、作り置きの有無や VOICEVOX ENGINE の有無に依存させない。
+    振り向け、リポジトリには何も書かせない。作り置きの有無は
+    ``TTSService.prerecorded_lookup`` を差し替えて、同梱の作り置きの内容に依存させない。
+    合成（``synthesize``）は呼ばれてはならないので、呼ばれたら失敗する。
     """
 
     #: 既定設定（10〜16 時）の時刻アナウンス。時の順に並ぶ。
@@ -573,16 +939,18 @@ class GenerateAssetsTest(unittest.TestCase):
             json.dump(data, handle)
         return path
 
-    def generate(self, synthesize, **extra):
-        """(終了コード, 標準出力, 標準エラー出力, synthesize に渡された文言の一覧)。"""
+    def generate(self, lookup, **extra):
+        """(終了コード, 標準出力, 標準エラー出力, lookup に渡された文言の一覧)。"""
         texts = []
 
         def recording(text):
             texts.append(text)
-            return synthesize(text)
+            return lookup(text)
 
         path = self.write_config(**extra)
-        with mock.patch("chime.tts.TTSService.synthesize", side_effect=recording):
+        with mock.patch("chime.tts.TTSService.prerecorded_lookup", side_effect=recording), \
+                mock.patch("chime.tts.TTSService.synthesize",
+                           side_effect=AssertionError("合成を呼んではならない")):
             code, stdout, stderr = call_split(
                 ["--config", path, "--generate-assets", "--backend", "mock"])
         return code, stdout, stderr, texts
@@ -604,10 +972,7 @@ class GenerateAssetsTest(unittest.TestCase):
         self.assertEqual(self.lines_starting_with(stdout, "  NG "), [])
 
     def test_all_failures_return_1_with_guidance_on_stderr(self):
-        def fail(text):
-            raise TTSError("作り置きに無い")
-
-        code, stdout, stderr, texts = self.generate(fail)
+        code, stdout, stderr, texts = self.generate(lambda text: None)
         self.assertEqual(code, 1)
         # 時報音は合成不要なので、読み上げが全滅しても先に生成される
         self.assertIn("時報音を生成しました: {0}".format(self.signal_path), stdout.splitlines())
@@ -615,7 +980,8 @@ class GenerateAssetsTest(unittest.TestCase):
         self.assertEqual(self.lines_starting_with(stdout, "  OK "), [])
         self.assertEqual(
             self.lines_starting_with(stderr, "  NG "),
-            ["  NG {0}: 作り置きに無い".format(text) for text in self.ANNOUNCEMENTS])
+            ["  NG {0}: 作り置き（assets/voice/）にこの文言がありません".format(text)
+             for text in self.ANNOUNCEMENTS])
         lines = stderr.splitlines()
         self.assertIn("7 件の時刻アナウンスの音声を用意できませんでした。", lines)
         self.assertIn("  - 作り置き（assets/voice/）に無い場合: PC で作り直す（docs/SETUP.md 9 章 B）",
@@ -627,17 +993,45 @@ class GenerateAssetsTest(unittest.TestCase):
         self.assertEqual(len(lines), 10)
 
     def test_partial_failure_returns_1_and_counts_only_the_failures(self):
-        def fail_noon_only(text):
-            if text == "正午をお知らせしたのだ。":
-                raise TTSError("失敗")
-            return "/voice/ok.wav"
+        def missing_noon_only(text):
+            return None if text == "正午をお知らせしたのだ。" else "/voice/ok.wav"
 
-        code, stdout, stderr, texts = self.generate(fail_noon_only)
+        code, stdout, stderr, texts = self.generate(missing_noon_only)
         self.assertEqual(code, 1)
         self.assertEqual(len(self.lines_starting_with(stdout, "  OK ")), 6)
         self.assertEqual(self.lines_starting_with(stderr, "  NG "),
-                         ["  NG 正午をお知らせしたのだ。: 失敗"])
+                         ["  NG 正午をお知らせしたのだ。: 作り置き（assets/voice/）にこの文言がありません"])
         self.assertIn("1 件の時刻アナウンスの音声を用意できませんでした。", stderr.splitlines())
+
+    def test_a_phrase_missing_from_prerecorded_is_ng_even_when_a_synthesizer_could_make_it(self):
+        """VOICEVOX が動いている PC でも、作り置きに無い文言は「用意できない」と答えること。
+
+        合成エンジンが動いていると、作り置きに無い文言もその場で合成されて「OK」に
+        なり、Pi では無音になることに気づけない。確かめるのは作り置きの有無だけ
+        （``prerecorded_lookup``）で、合成（``synthesize``）は呼ばない。
+        """
+        path = self.write_config()
+        with mock.patch("chime.tts.TTSService.prerecorded_lookup", return_value=None), \
+                mock.patch("chime.tts.TTSService.synthesize",
+                           side_effect=lambda text: "/synthesized/" + text + ".wav") as synthesize:
+            code, stdout, stderr = call_split(
+                ["--config", path, "--generate-assets", "--backend", "mock"])
+        self.assertEqual(code, 1, stdout)
+        self.assertEqual(self.lines_starting_with(stdout, "  OK "), [])
+        self.assertEqual(len(self.lines_starting_with(stderr, "  NG ")), 7)
+        synthesize.assert_not_called()
+
+    def test_a_missing_voice_folder_is_reported_as_such(self):
+        """作り置きのフォルダそのものが無いときは、文言ではなくフォルダが無いと伝える。"""
+        with tempfile.TemporaryDirectory() as empty:
+            path = self.write_config(tts={"cache_dir": os.path.join(self.tmp, "tts"),
+                                          "prerecorded_dir": os.path.join(empty, "no-voice")})
+            code, stdout, stderr = call_split(
+                ["--config", path, "--generate-assets", "--backend", "mock"])
+        self.assertEqual(code, 1, stdout)
+        self.assertEqual(
+            self.lines_starting_with(stderr, "  NG ")[0],
+            "  NG 午前10時をお知らせしたのだ。: 作り置きのフォルダ（assets/voice/）が見つかりません")
 
     def test_hourly_range_narrows_the_hours(self):
         code, stdout, stderr, texts = self.generate(

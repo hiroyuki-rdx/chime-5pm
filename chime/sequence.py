@@ -42,6 +42,14 @@ class PlaybackPlan:
     spoken: List[str] = field(default_factory=list)
     quote: Optional[str] = None
     warnings: List[str] = field(default_factory=list)
+    #: 読み上げるはずだったが、音声が用意できず無音になった文言（読み上げの順）。
+    silent: List[str] = field(default_factory=list)
+    #: 音源ファイルが無くて積めなかった、必須の部品の名前（時報音・閉館アナウンス・
+    #: 蛍の光）。積めなかった部品は ``segments`` に無いので、再生の件数（played / total）
+    #: には現れない。履歴が「すべて鳴った」と記録しないよう、ここに残す。
+    missing: List[str] = field(default_factory=list)
+    #: 組み立てに失敗して最小のプランに落としたとき True（``ChimeApp`` が立てる）。
+    degraded: bool = False
 
     def describe(self) -> str:
         lines = ["再生内容:"]
@@ -49,6 +57,8 @@ class PlaybackPlan:
             lines.append("  - {0}".format(segment.describe()))
         for text in self.spoken:
             lines.append("  読み上げ: {0}".format(text))
+        for text in self.silent:
+            lines.append("  無音: {0}".format(text))
         for warning in self.warnings:
             lines.append("  警告: {0}".format(warning))
         return "\n".join(lines)
@@ -201,7 +211,9 @@ class SequenceBuilder:
 
         必須セグメントのファイルが欠けていると、再生時の ``PlaybackError``
         でプラン全体が鳴らなくなる。積む前に確かめ、欠けた部品だけを省く。
-        パスが空文字列なら「設定しない」の意味なので、黙って積まない。
+        省いた部品は ``plan.missing`` に名前（``label``）を残す。
+        パスが空文字列なら「設定しない」の意味なので、黙って積まない
+        （欠けたことにも数えない）。
         """
         if not path:
             return
@@ -209,6 +221,7 @@ class SequenceBuilder:
             message = "音源ファイルが見つかりません: {0}".format(path)
             logger.error(message)
             plan.warnings.append(message)
+            plan.missing.append(label)
             return
         plan.segments.append(Segment(path, label=label, fade_in_ms=fade_in_ms))
 
@@ -277,6 +290,7 @@ class SequenceBuilder:
             message = "{0}を合成できませんでした（「{1}」）: {2}".format(label, text, exc)
             logger.error(message)
             plan.warnings.append(message)
+            plan.silent.append(text)
             return False
         # 読み上げは欠けても放送全体を止めない（無音になるだけ）ので常に optional。
         # 必須なのは時報音と閉館の音源（_append_audio_file）だけ。

@@ -14,7 +14,9 @@ import math
 import os
 import struct
 import wave
-from typing import Any, Dict, List, Mapping, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from .config import DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -129,13 +131,27 @@ def ensure_time_signal(path: str, settings: Mapping[str, Any],
     return path
 
 
+def _text_setting(settings: Optional[Mapping[str, Any]], key: str) -> Any:
+    """読み上げ文言まわりの設定を返す。無い（または ``null`` の）ときは既定設定の値。
+
+    読み上げ文言は作り置きの声を**完全一致**で引くため、設定が欠けたときの予備も
+    既定設定（``DEFAULT_CONFIG["time_signal"]``）と同じでなければならない。ここに
+    別の言い回しを書くと、``"time_signal": null`` などで作り置きに無い文言が
+    できて、その放送だけ無音になる。予備はここに書かず、既定設定から読む。
+    """
+    value = (settings or {}).get(key)
+    if value is None:
+        value = DEFAULT_CONFIG["time_signal"][key]
+    return value
+
+
 def hour_parts(hour: int, settings: Mapping[str, Any]) -> Dict[str, Any]:
     """テンプレートへ渡す 12 時間表記の部品を返す。"""
     hour = int(hour) % 24
     if hour < 12:
-        period = settings.get("period_am", "午前")
+        period = _text_setting(settings, "period_am")
     else:
-        period = settings.get("period_pm", "午後")
+        period = _text_setting(settings, "period_pm")
     # 0 時は 0 のまま（12 にしない）。hour_readings の "0"（れいじ）を引くため。
     # 12 時は 12、13 時以降は 12 を引く。
     hour12 = hour if hour <= 12 else hour - 12
@@ -148,7 +164,9 @@ def hour_parts(hour: int, settings: Mapping[str, Any]) -> Dict[str, Any]:
     # （hour_readings、既定はこの 4 つのみ）。
     # 正しく読める時刻まで一律にかな化しないのは、TTS のアクセントが
     # かえって不自然になるのを避けるため。
-    hour_readings: Mapping[str, str] = settings.get("hour_readings", {}) or {}
+    hour_readings = _text_setting(settings, "hour_readings")
+    if not isinstance(hour_readings, Mapping):
+        hour_readings = DEFAULT_CONFIG["time_signal"]["hour_readings"]
     hour_reading = hour_readings.get(str(hour12), "{0}時".format(hour12))
 
     return {"period": period, "hour": hour12, "hour24": hour, "hour_reading": hour_reading}
@@ -160,10 +178,13 @@ def announce_text(hour: int, settings: Mapping[str, Any]) -> str:
     テンプレートの ``{hour_reading}`` は誤読対策込みの時刻表現
     （例: 16 時なら「よじ」）。後方互換のため、数値のみの ``{hour}`` も
     引き続き使える（利用者が独自にテンプレートを書き換えている場合に備える）。
+
+    設定に無い（または ``null`` の）項目は、既定設定（``DEFAULT_CONFIG["time_signal"]``）
+    の値で補う。``"time_signal": null`` でも、既定の文言（作り置きがある文言）になる。
     """
     parts = hour_parts(hour, settings)
-    if parts["hour24"] == 12 and settings.get("use_noon_template", True):
-        template = settings.get("noon_template", "正午をお知らせしました。")
+    if parts["hour24"] == 12 and _text_setting(settings, "use_noon_template"):
+        template = _text_setting(settings, "noon_template")
     else:
-        template = settings.get("announce_template", "{period}{hour_reading}をお知らせしました。")
+        template = _text_setting(settings, "announce_template")
     return template.format(**parts)

@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import hashlib
+import http.client
 import logging
 import os
 import threading
@@ -36,6 +37,11 @@ class TTSError(RuntimeError):
     """音声合成に失敗した場合に送出する。"""
 
 
+#: VOICEVOX ENGINE との通信で起こりうる失敗。``urllib`` が ``OSError`` だけを
+#: ``URLError`` に包むため、HTTP ではないものが答えたとき（``BadStatusLine`` など）の
+#: ``http.client.HTTPException`` は別に受ける。
+_COMMUNICATION_ERRORS = (urllib.error.URLError, http.client.HTTPException, OSError, ValueError)
+
 #: 作り置きの目録（文言 → ファイル名）のファイル名。``assets/voice/`` 直下に置く。
 #: 実行時（:class:`PrerecordedEngine`）と生成側（``scripts/generate_voicevox.py``）が
 #: 同じ名前で読み書きするので、ここ 1 か所に定義する。
@@ -48,6 +54,16 @@ def digest(*parts: str) -> str:
     # キャッシュキーが衝突しうる。通常のテキストに現れない制御文字で区切る。
     joined = "\x1f".join(parts)
     return hashlib.sha1(joined.encode("utf-8")).hexdigest()[:20]
+
+
+def normalize_phrase(text: Optional[str]) -> str:
+    """作り置きを引く前の文言の整え方（前後の空白を落とす。``None`` は空文字列）。
+
+    実行時の照合（:class:`TTSService`）・文言の列挙（``chime.phrases``）・生成
+    （``scripts/generate_voicevox.py``）が同じ関数を通す。整え方が食い違うと、前後に
+    空白のある文言は manifest に空白つきのキーで載り、実行時には引けずに無音になる。
+    """
+    return (text or "").strip()
 
 
 def prerecorded_filename(text: str) -> str:
@@ -157,7 +173,11 @@ class VoicevoxEngine(TTSEngine):
             with urllib.request.urlopen(self.base_url + "/version",
                                         timeout=self.probe_timeout) as response:
                 return getattr(response, "status", 200) == 200
-        except (urllib.error.URLError, OSError, ValueError):
+        except _COMMUNICATION_ERRORS as exc:
+            # 落ちている・別のサービスが居座っているなど。使えないと判断した理由は
+            # DEBUG に残す（通常は静かに「使えない」と返すだけ）。
+            logger.debug("VOICEVOX ENGINE の疎通確認に失敗しました: %s: %s",
+                         type(exc).__name__, exc)
             return False
 
     def synthesize(self, text: str, out_path: str) -> None:
@@ -176,7 +196,7 @@ class VoicevoxEngine(TTSEngine):
             )
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 audio = response.read()
-        except (urllib.error.URLError, OSError, ValueError) as exc:
+        except _COMMUNICATION_ERRORS as exc:
             raise TTSError("VOICEVOX ENGINE との通信に失敗しました: {0}".format(exc)) from exc
 
         if not audio:
@@ -228,7 +248,7 @@ class TTSService:
         なる文言かどうかを事前に確かめる用途。
         """
         engine = self._prerecorded_engine()
-        text = (text or "").strip()
+        text = normalize_phrase(text)
         if engine is None or not text:
             return None
         return engine.lookup(text)
@@ -242,7 +262,7 @@ class TTSService:
 
     def synthesize(self, text: str) -> str:
         """文言を読み上げた WAV のパスを返す。全エンジン失敗時は :class:`TTSError`。"""
-        text = (text or "").strip()
+        text = normalize_phrase(text)
         if not text:
             raise TTSError("読み上げる文言が空です。")
 

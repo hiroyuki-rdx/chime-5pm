@@ -6,7 +6,7 @@ import http.client
 import os
 import tempfile
 import unittest
-from datetime import date
+from datetime import date, datetime
 from unittest import mock
 
 from tests.support import (REPO_ROOT, SHIPPED_QUOTES, load_fixture, logs_enabled, make_event,
@@ -15,7 +15,7 @@ from tests.support import (REPO_ROOT, SHIPPED_QUOTES, load_fixture, logs_enabled
 from chime import phrases
 from chime.config import DEFAULT_CONFIG, Config
 from chime.quotes import QuotePicker
-from chime.sequence import SequenceBuilder
+from chime.sequence import PlaybackPlan, SequenceBuilder
 from chime.state import State
 from chime.tts import TTSError
 from chime.weather import WeatherError, WeatherService
@@ -906,6 +906,261 @@ class BuildTextTest(BuilderTestCase):
         plan = self.make_builder(tts=StubTTS(self.tmp.name, fail=True)).build_text("だめなのだ。")
         self.assertEqual(len(plan.warnings), 1)
         self.assertIn("を合成できませんでした（「だめなのだ。」）", plan.warnings[0])
+
+
+class SelectiveFailureTTS(StubTTS):
+    """``failing`` に挙げた文言だけ合成に失敗する音声合成（ほかは鳴らせる）。"""
+
+    def __init__(self, tmp, failing):
+        super().__init__(tmp)
+        self.failing = set(failing)
+
+    def synthesize(self, text):
+        if text in self.failing:
+            self.texts.append(text)
+            raise TTSError("合成できません")
+        return super().synthesize(text)
+
+
+class SilentTextsTest(BuilderTestCase):
+    """``PlaybackPlan.silent``: 読み上げるはずが音声の無かった文言の一覧。"""
+
+    ANNOUNCE_10 = "午前10時をお知らせしたのだ。"
+
+    def failing_tts(self):
+        return StubTTS(self.tmp.name, fail=True)
+
+    def test_a_new_plan_has_no_silent_texts(self):
+        self.assertEqual(PlaybackPlan(event=None).silent, [])
+
+    def test_silent_lists_are_not_shared_between_plans(self):
+        first, second = PlaybackPlan(event=None), PlaybackPlan(event=None)
+        first.silent.append("だめなのだ。")
+        self.assertEqual(second.silent, [])
+
+    def test_a_plan_whose_speech_all_succeeds_has_no_silent_texts(self):
+        plan = self.make_builder().build_hourly(10)
+        self.assertEqual(plan.silent, [])
+        self.assertEqual(plan.warnings, [])
+
+    def test_a_failed_announcement_is_listed_and_the_quote_still_plays(self):
+        tts = SelectiveFailureTTS(self.tmp.name, failing=[self.ANNOUNCE_10])
+        plan = self.make_builder(tts=tts).build_hourly(10)
+        self.assertEqual(plan.silent, [self.ANNOUNCE_10])
+        self.assertNotIn(self.ANNOUNCE_10, plan.spoken)
+        self.assertEqual(len(self.quote_labels(plan)), 1)
+
+    def test_silent_and_spoken_never_overlap_and_cover_every_attempt(self):
+        tts = SelectiveFailureTTS(self.tmp.name, failing=[self.ANNOUNCE_10])
+        plan = self.make_builder(tts=tts).build_hourly(10)
+        self.assertEqual(sorted(plan.spoken + plan.silent), sorted(tts.texts))
+        self.assertFalse(set(plan.spoken) & set(plan.silent))
+
+    def test_every_text_is_silent_when_nothing_can_be_synthesized(self):
+        tts = self.failing_tts()
+        plan = self.make_builder(tts=tts).build_hourly(12)
+        # 時報音（音源ファイル）は積まれる。読み上げ（アナウンス・天気・ひとこと）は全部無音。
+        self.assertEqual(plan.spoken, [])
+        self.assertEqual(plan.silent, tts.texts)
+        self.assertEqual(plan.silent[0], "正午をお知らせしたのだ。")
+        self.assertEqual(plan.silent[1:1 + len(DEFAULT_WEATHER_SENTENCES)],
+                         DEFAULT_WEATHER_SENTENCES)
+        self.assertEqual(len(plan.silent), 1 + len(DEFAULT_WEATHER_SENTENCES) + 1)
+        self.assertIsNone(plan.quote)
+
+    def test_a_weather_sentence_that_fails_is_listed_by_itself(self):
+        failing = DEFAULT_WEATHER_SENTENCES[1]
+        tts = SelectiveFailureTTS(self.tmp.name, failing=[failing])
+        plan = self.make_builder(tts=tts).build_hourly(12)
+        self.assertEqual(plan.silent, [failing])
+        self.assertEqual(len(self.weather_labels(plan)), len(DEFAULT_WEATHER_SENTENCES) - 1)
+
+    def test_the_closing_extra_text_is_listed_when_it_fails(self):
+        extra = "本日もご利用ありがとうございました。"
+        self.config.data["closing"]["extra_text"] = extra
+        plan = self.make_builder(tts=SelectiveFailureTTS(self.tmp.name, [extra])).build_closing()
+        self.assertEqual(plan.silent, [extra])
+        self.assertEqual(len(plan.segments), 2)  # 閉館アナウンスと蛍の光は鳴る
+
+    def test_build_text_lists_the_failed_text(self):
+        plan = self.make_builder(tts=self.failing_tts()).build_text("だめなのだ。")
+        self.assertEqual(plan.silent, ["だめなのだ。"])
+
+    def test_build_texts_lists_only_the_failed_sentences_in_order(self):
+        tts = SelectiveFailureTTS(self.tmp.name, failing=["二つ目。", "四つ目。"])
+        plan = self.make_builder(tts=tts).build_texts(["一つ目。", "二つ目。", "三つ目。", "四つ目。"])
+        self.assertEqual(plan.spoken, ["一つ目。", "三つ目。"])
+        self.assertEqual(plan.silent, ["二つ目。", "四つ目。"])
+
+    def test_an_empty_text_is_not_silent(self):
+        # 読み上げる文言が無いのは「無音になった」ではなく、そもそも読まない。
+        tts = self.failing_tts()
+        plan = self.make_builder(tts=tts).build_texts([""])
+        self.assertEqual(plan.silent, [])
+        self.assertEqual(tts.texts, [])
+
+    def test_the_warning_message_is_unchanged(self):
+        # CI とテストがこの文言を grep するので、silent を足しても変えない。
+        plan = self.make_builder(tts=self.failing_tts()).build_text("だめなのだ。")
+        self.assertEqual(plan.warnings,
+                         ["読み上げを合成できませんでした（「だめなのだ。」）: 合成できません"])
+
+    def test_the_error_log_is_unchanged(self):
+        with logs_enabled(), self.assertLogs("chime.sequence", level="ERROR") as captured:
+            self.make_builder(tts=self.failing_tts()).build_text("だめなのだ。")
+        self.assertEqual([record.getMessage() for record in captured.records],
+                         ["読み上げを合成できませんでした（「だめなのだ。」）: 合成できません"])
+
+    def test_every_silent_text_has_a_matching_warning(self):
+        plan = self.make_builder(tts=self.failing_tts()).build_hourly(12)
+        for text in plan.silent:
+            self.assertTrue(any("（「{0}」）".format(text) in warning for warning in plan.warnings),
+                            text)
+
+    def test_a_minimal_plan_has_no_silent_texts(self):
+        event = make_event(datetime(2026, 8, 26, 12, 0), key="hourly:12", hour=12)
+        plan = self.make_builder(tts=self.failing_tts()).build_minimal(event)
+        self.assertEqual(plan.silent, [])
+
+    def test_describe_shows_each_silent_text(self):
+        plan = self.make_builder(tts=SelectiveFailureTTS(
+            self.tmp.name, failing=["二つ目。"])).build_texts(["一つ目。", "二つ目。"])
+        lines = plan.describe().splitlines()
+        self.assertIn("  読み上げ: 一つ目。", lines)
+        self.assertIn("  無音: 二つ目。", lines)
+        self.assertNotIn("  読み上げ: 二つ目。", lines)
+
+    def test_describe_puts_silent_texts_after_spoken_and_before_warnings(self):
+        plan = self.make_builder(tts=SelectiveFailureTTS(
+            self.tmp.name, failing=["二つ目。"])).build_texts(["一つ目。", "二つ目。"])
+        lines = plan.describe().splitlines()
+        spoken = lines.index("  読み上げ: 一つ目。")
+        silent = lines.index("  無音: 二つ目。")
+        warning = next(index for index, line in enumerate(lines) if line.startswith("  警告: "))
+        self.assertLess(spoken, silent)
+        self.assertLess(silent, warning)
+
+    def test_describe_has_no_silent_line_when_nothing_is_silent(self):
+        plan = self.make_builder().build_hourly(10)
+        self.assertNotIn("無音", plan.describe())
+
+    def test_describe_of_a_hand_made_plan(self):
+        plan = PlaybackPlan(event=None, spoken=["鳴る。"], silent=["鳴らない。", "これも。"],
+                            warnings=["注意"])
+        self.assertEqual(plan.describe(),
+                         "再生内容:\n  読み上げ: 鳴る。\n  無音: 鳴らない。\n  無音: これも。\n  警告: 注意")
+
+
+class MissingPartsTest(BuilderTestCase):
+    """``PlaybackPlan.missing``: 音源ファイルが無くて積めなかった、必須の部品。
+
+    積めなかった部品は ``segments`` に無いので、再生の件数（played / total）に
+    現れない。履歴が「すべて鳴った」と記録しないよう、プランに名前を残す。
+    """
+
+    TIME_SIGNAL_LABEL = "時報音（ポ・ポ・ポ・ポーン）"
+
+    def event(self, kind):
+        moment = datetime(2026, 8, 26, 12, 0)
+        key = "hourly:12" if kind == "hourly" else "closing"
+        return make_event(moment, key=key, kind=kind, hour=12)
+
+    def remove(self, key):
+        os.remove(self.config.path(key))
+
+    def test_a_new_plan_has_nothing_missing(self):
+        self.assertEqual(PlaybackPlan(event=None).missing, [])
+
+    def test_missing_lists_are_not_shared_between_plans(self):
+        first, second = PlaybackPlan(event=None), PlaybackPlan(event=None)
+        first.missing.append("蛍の光")
+        self.assertEqual(second.missing, [])
+
+    def test_complete_plans_have_nothing_missing(self):
+        builder = self.make_builder()
+        self.assertEqual(builder.build_closing().missing, [])
+        self.assertEqual(builder.build_hourly(12).missing, [])
+        self.assertEqual(builder.build_text("読み上げ。").missing, [])
+
+    def test_a_missing_announcement_file_is_listed(self):
+        self.remove("closing.announce_file")
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.missing, ["閉館アナウンス"])
+        self.assertEqual(len(plan.segments), 1)
+
+    def test_a_missing_music_file_is_listed_by_its_label(self):
+        self.remove("closing.music_file")
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.missing, ["蛍の光（2000ms フェードイン）"])
+        self.assertEqual(len(plan.segments), 1)
+
+    def test_both_missing_are_listed_in_playing_order(self):
+        self.remove("closing.announce_file")
+        self.remove("closing.music_file")
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.missing, ["閉館アナウンス", "蛍の光（2000ms フェードイン）"])
+        self.assertEqual(plan.segments, [])
+
+    def test_the_music_label_follows_the_fade_in_setting(self):
+        self.config.data["audio"]["fade_in_ms"] = 500
+        self.remove("closing.music_file")
+        self.assertEqual(self.make_builder().build_closing().missing,
+                         ["蛍の光（500ms フェードイン）"])
+
+    def test_a_file_that_is_not_set_is_not_missing(self):
+        # 空文字列は「設定しない」。無いことにはならない。
+        self.config.data["closing"]["announce_file"] = ""
+        self.config.data["closing"]["music_file"] = ""
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.missing, [])
+        self.assertEqual(plan.warnings, [])
+
+    def test_each_missing_part_has_a_warning_naming_the_file(self):
+        self.remove("closing.announce_file")
+        plan = self.make_builder().build_closing()
+        self.assertEqual(plan.warnings, [
+            "音源ファイルが見つかりません: {0}".format(self.config.path("closing.announce_file"))])
+
+    def test_a_time_signal_that_cannot_be_made_or_found_is_listed(self):
+        with mock.patch("chime.timesignal.ensure_time_signal", side_effect=OSError("書けない")):
+            plan = self.make_builder().build_hourly(12)
+        self.assertEqual(plan.missing, [self.TIME_SIGNAL_LABEL])
+        self.assertIn("正午をお知らせしたのだ。", plan.spoken)  # 読み上げは残る
+
+    def test_an_existing_time_signal_is_used_and_not_missing(self):
+        self.make_builder().build_hourly(12)  # 時報音を作る
+        with mock.patch("chime.timesignal.ensure_time_signal", side_effect=OSError("書けない")):
+            plan = self.make_builder().build_hourly(12)
+        self.assertEqual(plan.missing, [])
+        self.assertTrue(plan.warnings)  # 作れなかったことは警告に残る
+
+    def test_the_minimal_plan_lists_what_it_could_not_add(self):
+        self.remove("closing.music_file")
+        self.assertEqual(self.make_builder().build_minimal(self.event("closing")).missing,
+                         ["蛍の光（2000ms フェードイン）"])
+        with mock.patch("chime.timesignal.ensure_time_signal", side_effect=OSError("書けない")):
+            plan = self.make_builder().build_minimal(self.event("hourly"))
+        self.assertEqual(plan.missing, [self.TIME_SIGNAL_LABEL])
+
+    def test_a_speech_that_fails_is_silent_not_missing(self):
+        # 読み上げは欠けても放送を止めない任意の部品。silent の側に数える。
+        plan = self.make_builder(tts=StubTTS(self.tmp.name, fail=True)).build_hourly(12)
+        self.assertTrue(plan.silent)
+        self.assertEqual(plan.missing, [])
+
+    def test_a_failed_optional_part_is_not_missing(self):
+        plan = self.make_builder(weather=StubWeather(fail=True)).build_hourly(12)
+        self.assertTrue(plan.warnings)
+        self.assertEqual(plan.missing, [])
+
+    def test_describe_is_unchanged(self):
+        # 欠けた部品は警告として describe に出ている。新しい行は足さない。
+        self.remove("closing.announce_file")
+        lines = self.make_builder().build_closing().describe().splitlines()
+        self.assertEqual([line for line in lines if line.startswith("  警告: ")],
+                         ["  警告: 音源ファイルが見つかりません: {0}".format(
+                             self.config.path("closing.announce_file"))])
+        self.assertEqual(len(lines), 3)  # 見出し・蛍の光・警告
 
 
 class BuildDispatchTest(BuilderTestCase):

@@ -206,6 +206,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "state": {
         "file": "cache/state.json",
+        # 放送ごとの結果を 1 行ずつ残す（--status で直近の放送を見るため）。
+        "history_file": "cache/history.jsonl",
     },
 }
 
@@ -257,6 +259,16 @@ class Config:
         self.base_dir = base_dir
         self.sources = list(sources or [])
 
+    def __eq__(self, other: object) -> bool:
+        """中身（設定値・``base_dir``・読み込んだファイル）が同じなら等しい。
+
+        値で比べるので、可変の設定をハッシュ値の元にしない（辞書のキーや集合には入れられない）。
+        """
+        if not isinstance(other, Config):
+            return NotImplemented
+        return (self._data == other._data and self.base_dir == other.base_dir
+                and self.sources == other.sources)
+
     # ------------------------------------------------------------------
     @property
     def data(self) -> Dict[str, Any]:
@@ -298,13 +310,24 @@ class Config:
         return os.path.normpath(os.path.join(self.base_dir, expanded))
 
 
+def local_config_path(base_dir: str = BASE_DIR) -> str:
+    """現地設定（Git 管理外の ``config.json``）の場所を返す。``base_dir`` 直下。
+
+    :func:`load_config` は現地設定を必ずここを通して探す。開発者の手元の
+    ``config.json`` をテストが読んでしまわないよう、差し替えられる 1 か所にして
+    ある（``tests/support.py`` の ``isolate_local_config``）。本番の動作は
+    ``os.path.join`` と同じで、変わらない。
+    """
+    return os.path.join(base_dir, "config.json")
+
+
 def load_config(explicit_path: Optional[str] = None, base_dir: str = BASE_DIR) -> Config:
     """既定値・現地設定・明示指定ファイルをマージして :class:`Config` を返す。"""
     data: Dict[str, Any] = copy.deepcopy(DEFAULT_CONFIG)
     sources = ["<defaults>"]
 
     candidates = []
-    local_path = os.path.join(base_dir, "config.json")
+    local_path = local_config_path(base_dir)
     if os.path.exists(local_path):
         candidates.append(local_path)
     if explicit_path:
