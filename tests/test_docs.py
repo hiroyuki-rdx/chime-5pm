@@ -18,6 +18,15 @@
 ことがある）。設定の検査で何を置き換え、何を警告にとどめるかの表も、実装に値を入れて
 確かめた結果と一致させる。
 
+休館日（``schedule.closures``）・「今日だけ止める」（``--pause-*``）・種類ごとの音量（``audio.volume``）・
+停止要求での再生の停止については、設定例の JSON が実際に読めて効くこと、出力例（``--pause-*``・``--schedule``・
+``--status``）が実装に出させた文面と一致すること、既定値・上限・秒数が実装の定数と一致すること、
+「再生中は止まらない」「祝日判定は未対応」のような v6.1.0 までの記述が残っていないことを確かめる。
+止めた回の履歴は、言い過ぎない（先に止めた日の回は履歴にも回ごとのログにも残らず、準備に入っていた回だけが
+``skipped`` になる）ことを、本物の常駐ループで確かめる。設置場所の種類のような、裏づけのない事実も書かない
+（祝日も開館する、は運用者の判断として書く）。0 時の時報は鳴る予定の日で休止・休館日が決まること、休館日の行の頭は
+「休館」であること、休止の記録を書けない・消せないときの案内、``--check`` が警告するかどうかも、実装と同じに書く。
+
 数え間違い（表の行数と「上の N つ」の食い違い）、言い過ぎ（途中で切れた MP3 を見つけると
 書いたのに、先頭しか見ていなかった）、言い落とし（原因ごとの案内、上限の値、簡易の内容で
 鳴った放送の表示）も、実装の動きと定数に合わせて確かめる。ソースの書き方（無効な
@@ -26,8 +35,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import dataclasses
 import glob
+import inspect
 import io
 import json
 import os
@@ -41,20 +53,23 @@ from typing import List, NamedTuple, Tuple
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from tests.support import REPO_ROOT, load_manifest
+from tests.support import REPO_ROOT, load_manifest, logs_enabled
 
-from chime import __version__, buildinfo, check, cli, configcheck, phrases, status, timesignal, weather
+from chime import __version__, audio, buildinfo, check, cli, configcheck, phrases, status, timesignal, weather
 from chime import config as chime_config
-from chime.app import MISSING_PREVIEW, RETRY_SECONDS, ChimeApp
+from chime.app import MISSING_PREVIEW, NO_EVENTS_RECHECK_SECONDS, RETRY_SECONDS, ChimeApp
 from chime.audio import Segment
 from chime.check import INFO_LIMIT, LIST_LIMIT, Result, prerecorded_coverage, render_section, summarize
 from chime.config import BASE_DIR, DEFAULT_CONFIG, Config
-from chime.history import KEEP_LINES, MAX_LINES, History, make_entry
+from chime.history import KEEP_LINES, MAX_LINES, RESULTS, History, make_entry
+from chime.pause import MAX_PAUSE_BYTES, MAX_PAUSE_DAYS, PauseStore
 from chime.phrases import announcement_phrases, collect_phrases
 from chime.quotes import load_quotes
-from chime.scheduler import Scheduler
+from chime.scheduler import MAX_LOOKAHEAD_DAYS, Scheduler
 from chime.sequence import PlaybackPlan
 from chime.state import MAX_RECENT_QUOTES
+
+import tests.test_app as app_tests
 
 CHANGELOG_PATH = os.path.join(REPO_ROOT, "CHANGELOG.md")
 
@@ -404,7 +419,7 @@ def documented_claims(counts: DocumentedCounts) -> List[Claim]:
               r"廃止した (\d+) 項目 `weather\.provider`", (counts.removed_weather,)),
         Claim("docs/KNOWLEDGE_BASE.md", "廃止したキーの数", r"廃止した (\d+) キーのうち",
               (counts.removed,)),
-    ] + tool_claims()
+    ] + tool_claims() + closure_and_pause_claims()
 
 
 def tool_claims() -> List[Claim]:
@@ -468,6 +483,66 @@ def tool_claims() -> List[Claim]:
         Claim(spec, "予定を求められないときのやり直し", r"(\d+) 秒後にやり直す", (RETRY_SECONDS,)),
         Claim(spec, "起動時の警告に挙げる文言の数", r"件数と先頭 (\d+) 件の文言", (MISSING_PREVIEW,)),
     ]
+
+
+def service_value(name: str) -> int:
+    """``campus_chime.service`` の ``name=数値`` の行の数値。"""
+    text = read_text(os.path.join(REPO_ROOT, "campus_chime.service"))
+    match = re.search(r"^{0}=(\d+)$".format(name), text, re.MULTILINE)
+    assert match is not None, "campus_chime.service に {0} がありません".format(name)
+    return int(match.group(1))
+
+
+def closure_and_pause_claims() -> List[Claim]:
+    """休館日・休止・音量・再生の停止について文書に書かれた数値と、実装の定数・既定の設定。"""
+    docs = ("README.md", "docs/SETUP.md", "docs/KNOWLEDGE_BASE.md", "docs/SPECIFICATION.md",
+            "docs/REQUIREMENTS.md")
+    setup, kb, spec = "docs/SETUP.md", "docs/KNOWLEDGE_BASE.md", "docs/SPECIFICATION.md"
+    claims = [Claim(path, "休止の最長の日数", r"最長 (\d+) 日", (MAX_PAUSE_DAYS,)) for path in docs]
+    claims += [Claim(path, "近い休館日を挙げる日数", r"休館日（今後 (\d+) 日）", (status.CLOSURE_DAYS,))
+               for path in (setup, kb, spec)]
+    claims += [
+        Claim(spec, "予定を探す日数", r"最大 (\d+) 日先まで", (MAX_LOOKAHEAD_DAYS,)),
+        Claim(spec, "予定が無いときの再確認", r"(\d+) 分ごとに再確認",
+              (NO_EVENTS_RECHECK_SECONDS // 60,)),
+        Claim(spec, "停止要求のフェードアウト", r"(\d+) ミリ秒（`STOP_FADEOUT_MS`）",
+              (audio.STOP_FADEOUT_MS,)),
+        Claim(spec, "WAV の打ち切りの余裕", r"長さに (\d+) 秒（`WAV_TIMEOUT_MARGIN_SECONDS`）",
+              (int(audio.WAV_TIMEOUT_MARGIN_SECONDS),)),
+        Claim(spec, "休止の記録の大きさの上限", r"(\d+) MiB（`MAX_PAUSE_BYTES`）", (MAX_PAUSE_BYTES // (1024 * 1024),)),
+        Claim(spec, "停止のフェードアウトを待つ余裕", r"(\d+) ミリ秒〔`STOP_FADEOUT_MARGIN_MS`〕",
+              (audio.STOP_FADEOUT_MARGIN_MS,)),
+        Claim(spec, "再生の確認の間隔", r"([\d.]+) 秒（`POLL_SECONDS`）", (audio.POLL_SECONDS,)),
+        Claim(spec, "外部コマンドを止める猶予", r"(\d+) 秒（`TERMINATE_GRACE_SECONDS`）",
+              (int(audio.TERMINATE_GRACE_SECONDS),)),
+        Claim(spec, "音声デバイスの初期化の試行",
+              r"(\d+) 回（`MIXER_INIT_ATTEMPTS`）まで試し、(\d+) 秒（`MIXER_INIT_RETRY_SECONDS`）おき",
+              (audio.MIXER_INIT_ATTEMPTS, int(audio.MIXER_INIT_RETRY_SECONDS))),
+        Claim(spec, "ユニットの停止の待ち時間", r"TimeoutStopSec=(\d+)", (service_value("TimeoutStopSec"),)),
+    ]
+    # 設定表の既定値（仕様書 3.2 章）。キーの書き方は、表の見出しの節の中の短い形
+    schedule, audio_defaults = DEFAULT_CONFIG["schedule"], DEFAULT_CONFIG["audio"]
+    # 休止の説明が言う秒数: 実行中のサービスが書き換えに気づくまで（待機の 1 回分）と、準備に入る時刻（再生開始の前）
+    claims += [Claim(path, "休止に気づくまでの秒数", r"最大 (\d+) 秒ほど", (int(schedule["max_sleep_seconds"]),))
+               for path in ("README.md", setup, kb)]
+    claims += [Claim(path, "待機の長さの既定", r"max_sleep_seconds`。既定 (\d+) 秒", (int(schedule["max_sleep_seconds"]),))
+               for path in (setup, kb)]
+    claims += [Claim(path, "追いかけ再生の猶予の既定", r"catchup_grace_seconds`。既定 (\d+) 秒",
+                     (int(schedule["catchup_grace_seconds"]),)) for path in (setup, kb)]
+    claims += [Claim(path, "準備に入る秒数", r"再生開始の (\d+) 秒前から", (int(schedule["prepare_lead_seconds"]),))
+               for path in ("README.md", setup, kb, spec, "docs/REQUIREMENTS.md")]
+    rows = [("closures.dates", schedule["closures"]["dates"]),
+            ("closures.ranges", schedule["closures"]["ranges"]),
+            ("volume.time_signal", audio_defaults["volume"]["time_signal"]),
+            ("volume.voice", audio_defaults["volume"]["voice"]),
+            ("volume.music", audio_defaults["volume"]["music"]),
+            ("max_segment_seconds", audio_defaults["max_segment_seconds"]),
+            ("state.pause_file", DEFAULT_CONFIG["state"]["pause_file"])]
+    for key, value in rows:
+        shown = value if isinstance(value, str) else json.dumps(value)
+        claims.append(Claim(spec, "設定表の既定値 {0}".format(key),
+                            r"\| `{0}` \| `([^`]*)` \|".format(re.escape(key)), (shown,)))
+    return claims
 
 
 class ClaimCheckTest(unittest.TestCase):
@@ -772,7 +847,8 @@ class CliOptionsInDocsTest(unittest.TestCase):
         table = section(doc(REQUIREMENTS_MD), "### FR-09", "### FR-10")
         listed = set(re.findall(r"^\| `(--[a-z-]+)", table, re.MULTILINE))
         self.assertEqual(sorted(listed - cli_options()), [])
-        for option in ("--check", "--status", "--wait-idle", "--version"):
+        for option in ("--check", "--status", "--wait-idle", "--version", "--pause-today",
+                       "--pause-until", "--pause-off", "--reason"):
             self.assertIn(option, listed, "REQUIREMENTS.md の FR-09 の表に載っていません")
 
     def test_the_options_written_after_the_commands_exist(self):
@@ -824,7 +900,7 @@ class FileListsInDocsTest(unittest.TestCase):
         self.assertEqual(missing, [], "SPECIFICATION.md に `chime/<名前>` の記載がありません")
 
     def test_the_specification_names_every_script_in_its_script_section(self):
-        scripts = section(self.spec, "### 4.19", "\n---\n")
+        scripts = section(self.spec, "### 4.19", "### 4.20")
         self.assertTrue(scripts, "SPECIFICATION.md に 4.19 章がありません")
         missing = [name for name in listed_files("scripts", (".sh", ".py"))
                    if "| `{0}` |".format(name) not in scripts]
@@ -970,7 +1046,8 @@ def _app_in(directory: str, **overrides) -> ChimeApp:
     data = copy.deepcopy(DEFAULT_CONFIG)
     _merge(data, overrides)
     data["state"] = {"file": os.path.join(directory, "state.json"),
-                     "history_file": os.path.join(directory, "history.jsonl")}
+                     "history_file": os.path.join(directory, "history.jsonl"),
+                     "pause_file": os.path.join(directory, "pause.json")}
     data["audio"]["mock_max_seconds"] = 0
     data["tts"]["engines"] = ["prerecorded"]
     return ChimeApp(Config(data, base_dir=BASE_DIR), backend="mock")
@@ -1043,6 +1120,29 @@ def real_history_lines(directory: str) -> List[str]:
     app = _app_in(directory)
     event = _event(app, date(2026, 10, 9), "closing")
     _broadcast(app, event, app.builder.build_closing())
+
+    # 10/12 10:00 時報: 「今日だけ止める」で止めていたので、鳴らさなかった
+    app = _app_in(directory)
+    app.pause = PauseStore(app.pause.path, today=lambda: date(2026, 10, 12))
+    app.pause.set(date(2026, 10, 12), "設備点検", now=datetime(2026, 10, 12, 9, 0, tzinfo=ZONE))
+    event = _event(app, date(2026, 10, 12), "hourly:10")
+    with mock.patch("chime.app.logger"):
+        app._skip_if_paused(event)
+    os.remove(app.pause.path)
+
+    # 10/12 16:57 閉館放送: 閉館アナウンスのあと、蛍の光の前に停止の要求を受けて止まった
+    app = _app_in(directory)
+    event = _event(app, date(2026, 10, 12), "closing")
+    plan = app.builder.build_closing()
+    play_one = app.player.play_one
+
+    def play_one_then_stop(segment):
+        play_one(segment)
+        app.stop_event.set()
+
+    with mock.patch.object(app.player, "play_one", play_one_then_stop), \
+            mock.patch("chime.app.logger"):
+        _broadcast(app, event, plan)
 
     entries = History(os.path.join(directory, "history.jsonl")).recent(status.HISTORY_LIMIT)
     return [status.describe_entry(entry, ZONE).replace(home, EXAMPLE_HOME) for entry in entries]
@@ -1123,7 +1223,7 @@ class OutputExamplesTest(unittest.TestCase):
                 break
             labels.append(re.split(r"\s{2,}", line, maxsplit=1)[0])
         self.assertEqual(labels, ["現在時刻", "時刻の同期", "サービス", "自動起動", "再生方法",
-                                  "作り置きの音声"])
+                                  "作り置きの音声", "放送の休止"])
         for label in labels:
             self.assertIn("「{0}」".format(label), self.knowledge_base)
 
@@ -1186,16 +1286,16 @@ class OutputExamplesTest(unittest.TestCase):
         # 実装に放送させて、履歴に記録された行を読み出し、--status が表示する行と比べる
         with tempfile.TemporaryDirectory() as directory:
             lines = real_history_lines(directory)
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), status.HISTORY_LIMIT)
         self.assertIn("\n".join(lines), self.knowledge_base)
 
     def test_the_result_words_of_a_history_line_are_explained(self):
         words = []
-        for result in ("ok", "partial", "failed", "error"):
+        for result in RESULTS:
             line = status.describe_entry(
                 {"kind": "hourly", "result": result, "at": "2026-10-08T12:00:00+09:00"}, ZONE)
             words.append(line.split()[3])
-        self.assertEqual(words, ["成功", "一部のみ", "失敗", "エラー"])
+        self.assertEqual(words, ["成功", "一部のみ", "失敗", "エラー", "止めていた", "中断"])
         for word in words:
             self.assertIn("| {0} |".format(word), self.knowledge_base)
 
@@ -1212,8 +1312,10 @@ class OutputExamplesTest(unittest.TestCase):
         degraded = dict(history=[{"result": "ok", "degraded": True}])
         # tts.engines に prerecorded が無いと、声がそろっていても Pi は無音になる
         silent = dict(prerecorded_enabled=False)
+        # 停止要求で途中で止まった放送。結果は「中断」で、失敗とは別の理由として挙げる
+        interrupted = dict(history=[{"result": "interrupted", "played": 1, "total": 2}])
         cases = (dict(ntp=False), dict(active="inactive"), dict(backend="mock"),
-                 dict(history=[{"result": "failed"}]), dropped, degraded, silent,
+                 dict(history=[{"result": "failed"}]), dropped, degraded, interrupted, silent,
                  dict(coverage=missing))
         for overrides in cases:
             reason = reasons(**overrides)
@@ -1628,7 +1730,7 @@ class HistoryEntryInDocsTest(DocTestCase):
 
     def test_every_field_of_an_entry_is_a_row_of_the_specification_table(self):
         entry = make_entry(at=datetime(2026, 10, 8, 12, 0, tzinfo=ZONE), key="hourly:12",
-                           kind="hourly", played=1, total=1, error="x")
+                           kind="hourly", played=1, total=1, error="x", reason="休止: 点検")
         table = section(doc(SPECIFICATION_MD), "### 4.16", "### 4.17")
         for field in entry:
             with self.subTest(field=field):
@@ -2591,6 +2693,691 @@ class Mp3AndStickyChecksInDocsTest(DocTestCase):
                                  (KNOWLEDGE_BASE_MD, "### 3-6.", "\n---\n")):
             with self.subTest(doc=name):
                 self.assertInDoc("sticky ビット", section(doc(name), start, end), name)
+
+
+# -- 休館日・休止・音量・停止の文書 ---------------------------------------------------
+
+#: 休館日と休止の出力例の「いま」（金曜 12:30）。SETUP.md 6-3・7 章と KNOWLEDGE_BASE.md の例は、この時刻の出力。
+EXAMPLE_NOW = datetime(2026, 10, 30, 12, 30, tzinfo=ZONE)
+
+#: SETUP.md 7 章の、休館日と音量の例の見出し（太字）。
+CLOSURES_HEADING = "休館日を決める（学園祭・年末年始など）"
+VOLUME_HEADING = "音量を絞る"
+
+
+@contextlib.contextmanager
+def example_clock(now: datetime = EXAMPLE_NOW):
+    """``ChimeApp.now()`` を ``now`` に固定する（この間に作ったアプリの予定の計算も追従する）。"""
+    with mock.patch.object(ChimeApp, "now", lambda app: now):
+        yield
+
+
+def printing(function, *args):
+    """``function(*args)`` の ``(戻り値, 標準出力, 標準エラー出力)``。"""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        result = function(*args)
+    return result, out.getvalue(), err.getvalue()
+
+
+def setup_example(heading: str) -> dict:
+    """SETUP.md 7 章の、太字の見出し ``heading`` の下にある JSON の例（設定の上書き）。"""
+    chapter = section(doc(SETUP_MD), "## 7. 設定を変える", "\n## 8.")
+    body = section(chapter, "**{0}**".format(heading), "\n**")
+    blocks = [block for block in fenced_blocks(body) if block.lstrip().startswith("{")]
+    assert blocks, "SETUP.md 7 章に「{0}」の JSON の例がありません".format(heading)
+    return json.loads(blocks[0])
+
+
+def unit_directives(text: str) -> List[str]:
+    """systemd ユニットの、コメントと空行を除いた行。"""
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+class ClosureAndPauseExamplesInDocsTest(DocTestCase):
+    """休館日・休止の設定の例と出力の例が、実装の動きと同じであること。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.directory = tmp.name
+        clock = example_clock()
+        clock.__enter__()
+        self.addCleanup(clock.__exit__, None, None, None)
+        self.setup = doc(SETUP_MD)
+        self.knowledge_base = doc(KNOWLEDGE_BASE_MD)
+
+    def app(self) -> ChimeApp:
+        """SETUP.md 7 章の休館日の例を設定にした、一時フォルダの中だけに書くアプリ。"""
+        return _app_in(self.directory, **setup_example(CLOSURES_HEADING))
+
+    def pause(self, app: ChimeApp, *argv: str) -> str:
+        """休止のコマンドを実行して、標準出力を返す（成功するはず）。"""
+        args = cli.build_parser().parse_args(list(argv))
+        code, out, err = printing(cli.run_pause, app, args)
+        self.assertEqual((code, err), (0, ""), argv)
+        return out
+
+    def assertBlockInDoc(self, expected: str, text: str, name: str) -> None:
+        blocks = [block.rstrip("\n") for block in fenced_blocks(text)]
+        if expected.rstrip("\n") not in blocks:
+            self.fail("{0} に、実装の出力と同じコードブロックがありません:\n{1}".format(
+                name, expected.rstrip("\n")))
+
+    # -- 設定の例 ----------------------------------------------------------------
+    def test_the_closure_example_in_setup_is_read_without_a_problem_and_closes_the_days(self):
+        example = setup_example(CLOSURES_HEADING)
+        app = _app_in(self.directory, **example)
+        self.assertEqual(app.scheduler.closures.problems, [])
+        self.assertEqual(configcheck.validate(app.config), [])
+        closures = example["schedule"]["closures"]
+        self.assertTrue(closures["dates"] and closures["ranges"], "1 日ずつと期間の両方の例が要る")
+        named = []
+        for entry in closures["dates"]:
+            day, name = (entry, "") if isinstance(entry, str) else (entry["date"], entry.get("name", ""))
+            named.append((date.fromisoformat(day), name))
+        for entry in closures["ranges"]:
+            named.append((date.fromisoformat(entry["from"]), entry.get("name", "")))
+            named.append((date.fromisoformat(entry["to"]), entry.get("name", "")))
+        for day, name in named:
+            with self.subTest(day=day.isoformat()):
+                self.assertEqual(app.scheduler.events_for_date(day), [])
+                self.assertEqual(app.scheduler.closures.closed_reason(day),
+                                 "休館: " + name if name else "休館")
+
+    def test_the_volume_example_in_setup_sets_every_kind_and_is_read_as_written(self):
+        example = setup_example(VOLUME_HEADING)
+        app = _app_in(self.directory, **example)
+        self.assertEqual(configcheck.validate(app.config), [])
+        volumes = example["audio"]["volume"]
+        self.assertEqual(sorted(volumes), sorted(audio.SEGMENT_KINDS))
+        for kind, value in volumes.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    audio.volume_for(Segment("x.wav", kind=kind), app.config.section("audio")), value)
+
+    # -- 出力の例 ----------------------------------------------------------------
+    def test_the_pause_until_and_pause_off_outputs_in_setup_are_what_the_commands_print(self):
+        app = self.app()
+        until = self.pause(app, "--pause-until", "2026-11-05", "--reason", "設備点検")
+        self.assertBlockInDoc(until, self.setup, SETUP_MD)
+        code, lifted, err = printing(cli.pause_off, app)
+        self.assertEqual((code, err), (0, ""))
+        self.assertBlockInDoc(lifted, self.setup, SETUP_MD)
+
+    def test_the_pause_off_output_with_a_catch_up_in_setup_is_what_the_command_prints(self):
+        # 12 時の時報（再生開始 11:59:57）の 23 秒後に戻すと、その回をサービスが追いかけて鳴らす。
+        self.pause(self.app(), "--pause-until", "2026-11-05", "--reason", "設備点検")
+        with example_clock(datetime(2026, 10, 30, 12, 0, 20, tzinfo=ZONE)):
+            code, lifted, err = printing(cli.pause_off, self.app())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("追いかけて鳴らします", lifted)
+        self.assertBlockInDoc(lifted, self.setup, SETUP_MD)
+
+    def test_the_pause_off_output_with_a_maybe_catch_up_in_setup_is_what_the_command_prints(self):
+        # 12 時の時報（再生開始 11:59:57）の 108 秒後に戻す。サービスが解除に気づくまで最大 30 秒かかり、猶予（120 秒）を
+        # 過ぎるかもしれないので、鳴ると約束せず「間に合えば」と言う。
+        self.pause(self.app(), "--pause-until", "2026-11-05", "--reason", "設備点検")
+        with example_clock(datetime(2026, 10, 30, 12, 1, 45, tzinfo=ZONE)):
+            code, lifted, err = printing(cli.pause_off, self.app())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("間に合えば追いかけて鳴ります", lifted)
+        self.assertNotIn("サービスが追いかけて鳴らします", lifted)
+        self.assertBlockInDoc(lifted, self.setup, SETUP_MD)
+
+    def test_the_settings_examples_say_nothing_to_the_check_not_even_that_a_value_is_the_default(self):
+        # 写して使う例で、既定値と同じ値を書かせない（--check が「書かなくても同じ動作です」と情報を出すため）
+        examples = [("SETUP.md 休館日", setup_example(CLOSURES_HEADING)),
+                    ("SETUP.md 音量", setup_example(VOLUME_HEADING))]
+        advice = section(self.knowledge_base, "### 3-5.", "### 3-6.")
+        blocks = [block for block in fenced_blocks(advice) if block.lstrip().startswith("{")]
+        self.assertTrue(blocks, "KNOWLEDGE_BASE.md 3-5 に音量の JSON の例がありません")
+        examples.append(("KNOWLEDGE_BASE.md 音量", json.loads(blocks[0])))
+        for label, example in examples:
+            with self.subTest(example=label), tempfile.TemporaryDirectory() as directory:
+                config = pi_like_install(directory, example)
+                self.assertEqual([(f.level, f.key, f.message) for f in configcheck.check_config(config)], [])
+        self.assertEqual(examples[1][1], examples[2][1], "音量の例は、SETUP.md と KNOWLEDGE_BASE.md で同じ")
+
+    def test_a_record_that_cannot_be_written_or_cleared_points_to_check_or_to_the_folder(self):
+        # 文書: 書けない・消せないときは終了コード 1。場所がフォルダなら手で移す・消す案内、それ以外は --check の案内
+        app = self.app()
+        args = cli.build_parser().parse_args(["--pause-today"])
+        with mock.patch.object(PauseStore, "set", side_effect=PermissionError(13, "Permission denied")):
+            code, out, err = printing(cli.run_pause, app, args)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("休止の記録を書けませんでした", err)
+        self.assertIn("--check", err)
+        os.mkdir(app.pause.path)
+        code, out, err = printing(cli.pause_off, app)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("休止の記録を消せませんでした", err)
+        self.assertIn("フォルダ", err)
+        self.assertIn("--pause-off でも消せません", err)
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                text = doc(name)
+                self.assertInDoc("終了コード 1", text, name)
+                self.assertInDoc("`python3 campus_chime.py --check`", text, name)
+                self.assertInDoc("手で移すか消す", text, name)
+        self.assertInDoc("`--check` の「書き込み」で直し方を確かめる", doc(README_MD), README_MD)
+
+    def test_the_closure_rows_of_schedule_start_with_closed_and_no_document_calls_them_paused(self):
+        # 休館日の行の頭は「休館」。「休止」は --pause-* で止めたほうの言い方で、行の頭には付けない
+        code, out, err = printing(cli.show_schedule, self.app(), 8)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual([line for line in out.splitlines() if "学園祭" in line], ["  休館 2026-11-02（月） 学園祭"])
+        self.assertFalse([line for line in out.splitlines() if line.lstrip().startswith("休止")], out)
+        for path in current_doc_paths():
+            text = read_text(path)
+            with self.subTest(doc=os.path.relpath(path, REPO_ROOT)):
+                self.assertIsNone(re.search(r"^ +休止 \d{4}-\d\d-\d\d|「休止 (…|日付)", text, re.MULTILINE))
+
+    def test_the_pause_today_output_in_the_knowledge_base_is_what_the_command_prints(self):
+        today = self.pause(self.app(), "--pause-today", "--reason", "点検")
+        self.assertBlockInDoc(today, self.knowledge_base, KNOWLEDGE_BASE_MD)
+
+    def test_the_schedule_with_a_pause_and_a_closure_in_setup_is_what_schedule_prints(self):
+        app = self.app()
+        self.pause(app, "--pause-today", "--reason", "点検")
+        code, out, err = printing(cli.show_schedule, app, 5)
+        self.assertEqual((code, err), (0, ""))
+        self.assertBlockInDoc(out, self.setup, SETUP_MD)
+
+    def test_the_status_while_paused_in_the_knowledge_base_is_what_status_prints(self):
+        app = self.app()
+        self.pause(app, "--pause-today", "--reason", "点検")
+
+        def no_command(*args, **kwargs):
+            raise FileNotFoundError("timedatectl / systemctl は使わない")
+
+        collected = status.collect_status(app, run=no_command, production=True)
+        paused = dataclasses.replace(
+            collected, version="campus-chime 6.1.0 (a1b2c3d)", ntp=True, active="active",
+            enabled="enabled", backend="pygame")
+        self.assertEqual(status.attention(paused), [])
+        self.assertBlockInDoc("\n".join(status.render_status(paused, [])), self.knowledge_base,
+                              KNOWLEDGE_BASE_MD)
+
+    def test_the_pause_line_of_check_is_what_check_prints(self):
+        # KNOWLEDGE_BASE.md 3-6 の表が引く、止めているときの情報の行（書き込みの節）
+        with tempfile.TemporaryDirectory() as directory:
+            config = pi_like_install(directory)
+            app = ChimeApp(config, backend="mock")
+            # 点検は「今日」を自分で数える（アプリの時計を使わない）ので、そちらも例の日付に固定する
+            # （固定しないと、例の日付を過ぎた日にテストが落ちる）
+            with example_clock(), mock.patch.object(check, "_today", lambda config: EXAMPLE_NOW.date()):
+                app.pause.set(date(2026, 10, 30), "点検", now=EXAMPLE_NOW)
+                printed = check_output(config)
+        line = next(line for line in printed if "cache/pause.json" in line)
+        self.assertTrue(line.startswith("  情報  cache/pause.json"), line)
+        self.assertIn("止めています: 10/30（点検）", line)
+        self.assertIn("python3 campus_chime.py --pause-off", line)
+        self.assertInDoc("cache/pause.json", self.knowledge_base, KNOWLEDGE_BASE_MD)
+
+
+class ClosureAndPauseRulesInDocsTest(DocTestCase):
+    """休館日・休止・音量・停止について、文書が実装の決まりと同じことを言っていること。"""
+
+    #: 実装の動きと食い違うので、どの文書にも残してはいけない書き方（v6.1.0 までの記述）。
+    STALE = ("再生中は止まらず", "再生中は止まらない", "約 90 秒後", "今後の版で改善予定",
+             "祝日判定は未対応", "祝日・休講日の判定")
+
+    def test_no_document_still_says_that_a_playing_broadcast_cannot_be_stopped(self):
+        for path in current_doc_paths():
+            text = read_text(path)
+            for phrase in self.STALE:
+                with self.subTest(doc=os.path.relpath(path, REPO_ROOT), phrase=phrase):
+                    self.assertNotInDoc(phrase, text, os.path.relpath(path, REPO_ROOT))
+
+    def test_the_docs_say_that_a_stop_request_stops_the_playback(self):
+        # 実装: 0.05 秒ごとに確かめ、300 ミリ秒でフェードアウトして止める（1 秒に収まる）
+        self.assertLess(audio.POLL_SECONDS + audio.STOP_FADEOUT_MS / 1000.0, 1.0)
+        for name in (README_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("1 秒ほどで止ま", doc(name), name)
+        spec = doc(SPECIFICATION_MD)
+        self.assertInDoc("PlaybackInterrupted", section(spec, "### 4.3", "### 4.4"), SPECIFICATION_MD)
+        self.assertInDoc("`interrupted`", section(spec, "### 4.16", "### 4.17"), SPECIFICATION_MD)
+
+    def test_every_document_says_that_public_holidays_are_not_closed_automatically(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("祝日は自動では休", doc(name), name)
+
+    #: 実装より言い過ぎな書き方（止めた回は、どれも履歴に「止めていた」と残る、という約束）。実際に残るのは、
+    #: 準備に入っていた回を止めたときだけで、先に止めた日の回は予定の選び直しで外すだけ。
+    OVERCLAIMS = (
+        "（`cache/history.jsonl` には「止めていた」と残ります）",
+        "止めているあいだの放送は、`--status` の「直近の放送」に「止めていた」と残ります",
+        "再生済みの記録も付けない。履歴には「止めていた」と残る。",
+        "止めた回は再生済みにしない（履歴は「止めていた」）",
+        "**再生済みの記録を付けず**、履歴に「止めていた」と残すこと（",
+        "次の正時は鳴らず、`--status` の「直近の放送」に「止めていた」と残る",
+        "「今日だけ止める」で止めた日。意図した動き。履歴には",
+        "`--pause-*` で止めていた日。意図した動き",
+    )
+
+    def test_no_document_says_that_every_paused_broadcast_leaves_a_history_row(self):
+        for path in current_doc_paths():
+            text = read_text(path)
+            for phrase in self.OVERCLAIMS:
+                with self.subTest(doc=os.path.relpath(path, REPO_ROOT), phrase=phrase):
+                    self.assertNotInDoc(phrase, text, os.path.relpath(path, REPO_ROOT))
+
+    #: 「履歴に『止めていた』と残る」という書き方（残るのは、準備に入っていた回を止めたときだけ）。
+    HISTORY_ROW_CLAIM = re.compile("「止めていた」(と残|の行が付)")
+    PREPARING = re.compile("準備に入っていた回|再生開始の 45 秒前")
+
+    def test_every_claim_of_a_paused_row_in_the_history_names_the_chime_being_prepared(self):
+        # 言い回しを変えても、「止めていた」と残る回を、準備に入っていた回に限って書かせる
+        # （先に止めた日の回は、履歴にも回ごとのログにも残らない）。限定は、同じ行の前か、同じ文の中に要る。
+        seen = 0
+        for name in FACT_DOCS:
+            for line in doc(name).splitlines():
+                for match in self.HISTORY_ROW_CLAIM.finditer(line):
+                    seen += 1
+                    start = line.rfind("。", 0, match.start()) + 1
+                    end = line.find("。", match.end())
+                    sentence = line[start:end if end >= 0 else len(line)]
+                    with self.subTest(doc=name, line=line[:60]):
+                        self.assertTrue(self.PREPARING.search(line[:match.start()]) or self.PREPARING.search(sentence),
+                                        "{0}: 準備に入っていた回に限る書き方になっていません: {1}".format(name, sentence))
+        self.assertGreaterEqual(seen, 6, "「止めていた」と残る、という記述が文書から消えています（言い換えたなら正規表現を直す）")
+
+    def test_the_acceptance_check_of_pausing_expects_a_row_only_when_the_pause_came_late(self):
+        row = next(line for line in doc(SPECIFICATION_MD).splitlines() if line.startswith("| T-18 "))
+        for needle in ("先に止めたので", "「放送の休止」", "行は付かない", "再生開始の 45 秒前から"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, row)
+
+    def test_every_document_says_that_only_the_broadcast_being_prepared_leaves_a_row(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("準備に入っていた回", doc(name), name)
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("先に止めた日の回は", doc(name), name)
+
+    def test_the_docs_say_that_a_folder_in_place_of_the_record_cannot_be_cleared_by_pause_off(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("フォルダになっているときだけは", doc(name), name)
+                self.assertInDoc("`--pause-off` でも消せない", doc(name), name)
+
+    def test_the_docs_quote_the_note_that_status_adds_to_a_record_it_cannot_use(self):
+        shown = "止めていません" + status.PAUSE_UNUSABLE_NOTE
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc(shown, doc(name), name)
+
+    def test_no_document_names_the_kind_of_site(self):
+        # 設置場所の種類（図書館など）は、依頼にも設定にも書かれていない。祝日の理由は、どの施設でも通る言い方にする。
+        for path in current_doc_paths():
+            with self.subTest(doc=os.path.relpath(path, REPO_ROOT)):
+                self.assertNotInDoc("図書館", read_text(path), os.path.relpath(path, REPO_ROOT))
+
+    def test_the_reason_for_ringing_on_holidays_is_the_operators_decision_not_a_claim_about_the_facility(self):
+        # 運用者の判断は「祝日も開館する（鳴らす）」。「祝日も開く施設があるため」のような一般論にしない
+        for path in current_doc_paths():
+            with self.subTest(doc=os.path.relpath(path, REPO_ROOT)):
+                self.assertNotInDoc("開く施設", read_text(path), os.path.relpath(path, REPO_ROOT))
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("祝日も開館", doc(name), name)
+        self.assertInDoc("運用者（オーナー）の判断", section(doc(REQUIREMENTS_MD), "### FR-05", "### FR-06")
+                         + section(doc(REQUIREMENTS_MD), "## 2.7", "\n## 3"), REQUIREMENTS_MD)
+
+    def test_the_docs_say_whether_check_warns_about_a_wait_as_long_as_the_grace_as_it_does(self):
+        # schedule.max_sleep_seconds がスケジュールの猶予（catchup_grace_seconds）以上だと、再生開始の直前に
+        # 解除した回を取りこぼす。文書は、そうなる前に --check が警告するかどうかを、実装と同じに書く
+        # （警告が増えたのに「警告しない」と書いてある、警告が無いのに「警告する」と書いてある、のどちらでも落ちる）
+        grace = DEFAULT_CONFIG["schedule"]["catchup_grace_seconds"]
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["schedule"]["max_sleep_seconds"] = grace
+        warned = [finding for finding in configcheck.validate(Config(data, base_dir=BASE_DIR))
+                  if finding.key == "schedule.max_sleep_seconds" and finding.level == "warning"]
+        says_warns, says_silent = "`--check` が警告", "`--check` は警告し"
+        for name, marker in ((SETUP_MD, "取りこぼすことがあります"), (KNOWLEDGE_BASE_MD, "取りこぼすことがある")):
+            [bullet] = [line for line in doc(name).splitlines() if marker in line and "max_sleep_seconds" in line]
+            with self.subTest(doc=name):
+                self.assertIn(says_warns if warned else says_silent, bullet,
+                              "実装が警告する・しないことを、文書が書いていません: " + bullet)
+                self.assertNotIn(says_silent if warned else says_warns, bullet,
+                                 "実装が警告する・しないと、文書の書き方が違います: " + bullet)
+
+    def test_every_description_of_status_lists_the_pause_row_and_the_closures(self):
+        # 「いまの状態（版・時刻の同期・サービス・…）」と並べる文書の説明は、ヘルプと同じ項目を挙げる。
+        for name in (README_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD):
+            described = re.findall(r"（版・時刻の同期[^）。]*", doc(name))
+            with self.subTest(doc=name):
+                self.assertTrue(described, "--status の項目の説明がありません")
+                for text in described:
+                    self.assertIn("放送の休止", text)
+                    self.assertIn("休館日", text)
+
+    def test_the_advice_for_silencing_a_day_is_pausing_not_stopping_the_service(self):
+        advice = section(doc(KNOWLEDGE_BASE_MD), "### 3-4.", "### 3-5.")
+        self.assertTrue(advice)
+        for needle in ("--pause-today", "--pause-until", "--pause-off", "schedule.closures"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, advice, KNOWLEDGE_BASE_MD)
+        self.assertInDoc("--pause-today", doc(SPECIFICATION_MD), SPECIFICATION_MD)
+        operations = section(doc(SPECIFICATION_MD), "## 11. 運用・保守", "\n---\n")
+        row = next((line for line in operations.splitlines() if line.startswith("| 放送を止める")), "")
+        self.assertIn("--pause-today", row)
+        self.assertIn("--pause-off", row)
+
+    def test_the_volume_advice_is_to_fix_alsa_high_and_lower_it_in_the_app(self):
+        for name, start, end in ((SETUP_MD, "### 4-2.", "### 4-3."),
+                                 (KNOWLEDGE_BASE_MD, "### 3-5.", "### 3-6.")):
+            advice = section(doc(name), start, end)
+            with self.subTest(doc=name):
+                self.assertTrue(advice)
+                self.assertInDoc("高め", advice, name)
+                self.assertInDoc("audio.volume", advice, name)
+        self.assertInDoc("高めに固定", doc(README_MD), README_MD)
+
+    def test_the_docs_say_that_a_command_runs_in_its_own_group_and_the_code_starts_it_so(self):
+        # 仕様書: ラッパー（sh -c "aplay …"）が起こした孫の再生も止まるよう、子のグループごと止める
+        self.assertIn("start_new_session=True", inspect.getsource(audio.CommandPlayer))
+        self.assertIn("killpg", inspect.getsource(audio.CommandPlayer))
+        row = next(line for line in doc(SPECIFICATION_MD).splitlines() if line.startswith("| `CommandPlayer`"))
+        for needle in ("start_new_session=True", "グループごと", "孫の再生", "SIGKILL"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, row)
+
+    def test_the_docs_say_that_the_command_backend_cannot_change_the_volume(self):
+        for name in (README_MD, SETUP_MD, SPECIFICATION_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("音量を変えられません", doc(name), name)
+
+    #: 文書（仕様書か運用ナレッジ）が引用する、v6.2.0 のログの文面。実装に無い文面を載せない。
+    LOG_MESSAGES = (
+        "休止中のため鳴らしません",
+        "休止の記録があります",
+        "休止の記録が変わりました",
+        "休止の記録を使えません（放送は通常どおり行います）",
+        "休止の記録を確かめられませんでした（放送は通常どおり行います）",
+        "休館日の設定に使えない項目があります",
+        "予定されたイベントがありません。",
+        "分ごとに再確認します",
+        "停止要求のため再生を中断しました",
+        "音を出す前に停止要求を受けたため、再生済みにしません",
+        "停止要求で中断",
+        "再生が終わらないため打ち切りました（上限",
+        "音声デバイスの初期化に失敗しました",
+        "音声デバイスを初期化できませんでした",
+        "command 方式では音量を変えられません",
+    )
+
+    def test_the_log_messages_the_docs_quote_exist_in_the_code(self):
+        source = message_source()
+        quoted = doc(SPECIFICATION_MD) + doc(KNOWLEDGE_BASE_MD)
+        for message in self.LOG_MESSAGES:
+            with self.subTest(message=message):
+                self.assertIn(message, source, "実装にありません")
+                self.assertIn(message, quoted, "仕様書にも運用ナレッジにも載っていません")
+
+    def test_the_unit_in_the_specification_is_the_unit_file(self):
+        unit = block_starting_with(section(doc(SPECIFICATION_MD), "## 6. systemd", "### 6.1"), "[Unit]")
+        self.assertTrue(unit)
+        service = read_text(os.path.join(REPO_ROOT, "campus_chime.service"))
+        self.assertEqual(unit_directives(unit), unit_directives(service))
+
+    def test_every_result_of_a_history_line_is_in_the_specification_table(self):
+        table = section(doc(SPECIFICATION_MD), "### 4.16", "### 4.17")
+        for result in RESULTS:
+            with self.subTest(result=result):
+                self.assertInDoc("`{0}`".format(result), table, SPECIFICATION_MD)
+
+    def test_the_new_options_are_rows_of_the_specification_and_the_requirements_tables(self):
+        options = ("--pause-today", "--pause-until", "--pause-off", "--reason")
+        table = section(doc(SPECIFICATION_MD), "### 4.11", "### 4.12")
+        requirements = section(doc(REQUIREMENTS_MD), "### FR-09", "### FR-10")
+        for option in options:
+            with self.subTest(option=option):
+                self.assertInDoc("| `{0}".format(option), table, SPECIFICATION_MD)
+                self.assertInDoc("| `{0}".format(option), requirements, REQUIREMENTS_MD)
+
+    def test_the_closure_and_pause_backlog_items_are_marked_done(self):
+        backlog = section(doc(REQUIREMENTS_MD), "## 10. 将来課題", "\n---\n")
+        rows = {split_cells(line)[1]: line for line in backlog.splitlines()
+                if line.startswith("| ") and line[2:3].isdigit()}
+        for item in ("祝日・休講日判定", "音量の設定ファイル化"):
+            with self.subTest(item=item):
+                self.assertIn(item, rows)
+                self.assertIn("6.2.0", rows[item])
+                self.assertIn("対応済み", rows[item])
+
+    def test_the_settings_added_in_6_2_0_are_listed_as_warnings_not_as_replaced_values(self):
+        added = {"schedule.closures", "schedule.closures.dates", "schedule.closures.ranges",
+                 "audio.volume", "audio.volume.time_signal", "audio.volume.voice",
+                 "audio.volume.music", "audio.max_segment_seconds", "state.pause_file"}
+        rows = rule_table(doc(SPECIFICATION_MD))
+        warned = set()
+        for row in rows:
+            warned |= keys_in(row[2])
+        errors, warnings = probed_levels()
+        self.assertEqual(sorted(added - warned), [], "仕様書 3.5 章の表の warning の欄に載っていません")
+        self.assertEqual(sorted(added & errors), [], "error にならないはずの設定です")
+        self.assertEqual(sorted(added - warnings), [], "warning になりうる設定のはずです")
+
+
+class PausedBroadcastRecordInDocsTest(app_tests.PauseTestCase):
+    """文書が言う「履歴に『止めていた』と残るのは、準備に入っていた回だけ」が、実装の動きであること。
+
+    文書は、先に止めた日の回は履歴にも回ごとのログにも残らず、準備に入っていた回を止めたときだけ
+    ``skipped`` の行とログが残る、と言う。実装がそう動くかを、本物の ``ChimeApp`` の常駐ループで確かめる。
+    待機は偽物に差し替え、呼び出しを数えて、止まらないループは打ち切る。
+    """
+
+    def test_a_pause_written_before_the_chime_is_prepared_leaves_no_row_and_no_log(self):
+        self.set_pause(date(2026, 10, 14), "試験")   # 止めた日は 2026-10-14（その日の 10 時の時報も外れる）
+
+        def pass_the_chime_time_then_stop(target, interrupt):
+            self.app.stop_event.set()
+            return False
+
+        self.install_sleeper(pass_the_chime_time_then_stop)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_forever()
+        self.assertEqual(self.entries(), [])
+        self.assertEqual([record.getMessage() for record in captured.records
+                          if "休止中のため鳴らしません" in record.getMessage()], [])
+
+    def test_the_chime_being_prepared_when_the_pause_is_written_leaves_a_skipped_row_and_a_log(self):
+        event = self.scheduled()
+        self.install_sleeper()
+        self.set_pause(date(2026, 10, 14), "試験")
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_event(event)
+        entry = self.skipped_entry()
+        self.assertEqual((entry["key"], entry["reason"]), (event.key, "休止: 試験"))
+        self.assertTrue([record for record in captured.records
+                         if "休止中のため鳴らしません" in record.getMessage()])
+
+    def test_the_startup_list_of_upcoming_chimes_leaves_out_the_paused_days_as_the_specification_says(self):
+        self.set_pause(date(2026, 10, 14), "試験")
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app._log_upcoming()
+        text = "\n".join(record.getMessage() for record in captured.records)
+        heading = "次回以降の予定（休止のあいだは省いています）:"
+        self.assertIn(heading, text)
+        self.assertNotIn("2026-10-14 10:00:00", text)
+        self.assertIn(heading, doc(SPECIFICATION_MD))
+
+    def midnight_scheduler(self, **closures) -> Scheduler:
+        """0 時の時報だけを毎日鳴らす予定（0 時の時報は、前の日の 23:59:57 に鳴り始める）。"""
+        settings = copy.deepcopy(DEFAULT_CONFIG["schedule"])
+        settings["hourly"].update(start_hour=0, end_hour=0, weekdays=[0, 1, 2, 3, 4, 5, 6])
+        settings["closing"]["enabled"] = False
+        settings["closures"] = closures
+        return Scheduler(settings, self.app.tzinfo, 3.0, clock=self.app.now)
+
+    def test_a_midnight_chime_belongs_to_the_day_it_sounds_for_when_pausing(self):
+        event = self.midnight_scheduler().events_for_date(date(2026, 10, 15))[0]
+        self.assertEqual((event.at.date(), event.play_at.date()), (date(2026, 10, 15), date(2026, 10, 14)))
+        self.set_pause(date(2026, 10, 14))     # 前の日だけを止めても、翌日の 0 時の時報は止まらない
+        self.assertIsNone(self.app._pause_covering(event))
+        self.set_pause(date(2026, 10, 15))     # 翌日を止めれば止まる
+        self.assertIsNotNone(self.app._pause_covering(event))
+
+    def test_a_midnight_chime_belongs_to_the_day_it_sounds_for_when_closing(self):
+        day = date(2026, 10, 15)
+        self.assertEqual(len(self.midnight_scheduler(dates=["2026-10-14"]).events_for_date(day)), 1)
+        self.assertEqual(self.midnight_scheduler(dates=["2026-10-15"]).events_for_date(day), [])
+        self.assertEqual(self.midnight_scheduler(dates=["2026-10-15"]).events_for_date(date(2026, 10, 14))[0].at.date(),
+                         date(2026, 10, 14))
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD):
+            with self.subTest(doc=name):
+                text = doc(name)
+                for needle in ("23:59:57", "翌日の放送として扱"):
+                    self.assertIn(needle, text, "{0} に次の記述がありません: {1}".format(name, needle))
+                self.assertRegex(text, "前(の日|日)だけ", name)
+
+    def test_the_prepare_time_the_docs_state_is_the_default_of_the_scheduler(self):
+        event = self.scheduled()
+        self.assertEqual((event.play_at - event.prepare_at).total_seconds(),
+                         DEFAULT_CONFIG["schedule"]["prepare_lead_seconds"])
+
+
+#: 文書の数を拾うときに数えない文書（変更履歴・開発履歴）。
+FACT_DOCS = (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD)
+
+
+def stated_numbers(pattern: str, *names: str) -> dict:
+    """文書 ``names`` から ``pattern`` の最初の捕獲群を全部集める（``{文書: [数の文字列, …]}``。無い文書は入れない）。"""
+    found = {}
+    for name in names:
+        values = re.findall(pattern, doc(name))
+        if values:
+            found[name] = values
+    return found
+
+
+def mp3_seconds(path: str) -> float:
+    """MPEG-1 Layer III のフレームをたどった長さ（秒）。ID3 タグは読み飛ばす。"""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    index = 0
+    if data[:3] == b"ID3":
+        index = 10 + ((data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 | (data[8] & 0x7F) << 7 | (data[9] & 0x7F))
+    bitrates = {1: 32, 2: 40, 3: 48, 4: 56, 5: 64, 6: 80, 7: 96, 8: 112, 9: 128, 10: 160, 11: 192,
+                12: 224, 13: 256, 14: 320}
+    rates = [44100, 48000, 32000]
+    total = 0.0
+    while index + 4 <= len(data):
+        header = int.from_bytes(data[index:index + 4], "big")
+        if (header >> 21) & 0x7FF != 0x7FF:
+            index += 1
+            continue
+        version, layer, bitrate, rate = (header >> 19) & 3, (header >> 17) & 3, (header >> 12) & 15, (header >> 10) & 3
+        if version != 3 or layer != 1 or bitrate in (0, 15) or rate == 3:
+            index += 1
+            continue
+        length = 144 * bitrates[bitrate] * 1000 // rates[rate] + ((header >> 9) & 1)
+        total += 1152 / rates[rate]
+        index += length
+    return total
+
+
+class DocumentedFactsInDocsTest(DocTestCase):
+    """文書の文中に書いた数（分・回・秒）が、実装の定数・既定の設定・同梱の音源と同じであること。
+
+    ``Claim`` は文書ごとに 1 か所の書き方を決めて数えるが、ここは書き方が文書ごとに違う数を、
+    見つかった文書すべてについて確かめる（1 つの文書にも無ければ、記述が消えたとして落とす）。
+    """
+
+    def assertAllStated(self, found: dict, expected, what: str) -> None:
+        self.assertTrue(found, "文書に {0} の記述が見つかりません（言い換えたなら正規表現を直す）".format(what))
+        for name, values in found.items():
+            for value in values:
+                self.assertEqual(float(value), float(expected), "{0} の {1}".format(name, what))
+
+    def test_the_minutes_between_rechecks_when_nothing_is_scheduled(self):
+        self.assertAllStated(stated_numbers(r"(\d+) 分ごとに再確認", *FACT_DOCS),
+                             NO_EVENTS_RECHECK_SECONDS // 60, "予定が無いときの再確認の間隔（分）")
+
+    def test_the_attempts_to_open_the_audio_device_and_their_interval(self):
+        self.assertAllStated(stated_numbers(r"(\d+) 回まで試す", KNOWLEDGE_BASE_MD),
+                             audio.MIXER_INIT_ATTEMPTS, "音声デバイスの初期化を試す回数")
+        self.assertAllStated(stated_numbers(r"(\d+) 回試しました", *FACT_DOCS),
+                             audio.MIXER_INIT_ATTEMPTS, "音声デバイスの初期化を試した回数")
+        self.assertAllStated(stated_numbers(r"(\d+) 秒おきに \d+ 回まで試す", KNOWLEDGE_BASE_MD),
+                             audio.MIXER_INIT_RETRY_SECONDS, "初期化をやり直す間隔（秒）")
+
+    def test_the_days_the_scheduler_looks_ahead(self):
+        self.assertAllStated(stated_numbers(r"(\d+) 日先まで", *FACT_DOCS),
+                             MAX_LOOKAHEAD_DAYS, "予定を探す日数")
+
+    def test_the_seconds_after_the_start_a_late_chime_is_still_played(self):
+        grace = DEFAULT_CONFIG["schedule"]["catchup_grace_seconds"]
+        self.assertAllStated(stated_numbers(r"開始から (\d+) 秒以内", *FACT_DOCS), grace, "追いかけ再生の猶予（秒）")
+
+    def test_the_seconds_after_the_start_a_chime_is_sure_to_be_caught_up_after_pause_off(self):
+        # 休止を解いたとき、確実に鳴るのは、開始からの経過が「猶予 − 解除に気づくまでの長さ」に満たない回だけ。
+        # それ以降の回は、サービスが気づくのが猶予に間に合えば鳴る（間に合わなければ鳴らない）
+        schedule = DEFAULT_CONFIG["schedule"]
+        grace, noticing = schedule["catchup_grace_seconds"], schedule["max_sleep_seconds"]
+        docs = (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD)
+        self.assertAllStated(stated_numbers(r"開始から (\d+) 秒未満", *docs), grace - noticing, "確実に鳴る回の経過（秒）")
+        self.assertAllStated(stated_numbers(r"開始から (\d+) 秒以上たった", *docs), grace - noticing,
+                             "間に合えば鳴る回の経過（秒）")
+        self.assertAllStated(stated_numbers(r"最大 (\d+) 秒かか", *docs), noticing, "解除に気づくまでの長さ（秒）")
+        self.assertAllStated(stated_numbers(r"(\d+) 秒を過ぎ", *docs), grace, "追いかけ再生の猶予（秒）")
+
+    def test_the_margin_added_to_a_wav_before_it_is_cut_off(self):
+        margin = audio.WAV_TIMEOUT_MARGIN_SECONDS
+        self.assertAllStated(stated_numbers(r"音の長さ ＋ (\d+) 秒", *FACT_DOCS), margin, "WAV の打ち切りに足す秒数")
+        self.assertAllStated(stated_numbers(r"音の長さに (\d+) 秒を足した", *FACT_DOCS), margin, "WAV の打ち切りに足す秒数")
+
+    def test_a_stop_request_stops_the_playback_in_about_one_second(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            self.assertInDoc("1 秒ほど", doc(name), name)
+        self.assertAllStated(stated_numbers(r"(\d+) 秒ほどで止ま", *FACT_DOCS), 1, "停止にかかる秒数")
+        self.assertLessEqual(audio.STOP_FADEOUT_MS / 1000.0 + audio.POLL_SECONDS, 1.0)
+
+    def test_the_wait_for_the_service_to_stop_is_the_one_of_the_unit_file(self):
+        unit = service_value("TimeoutStopSec")
+        self.assertAllStated(stated_numbers(r"停止の待ち時間は (\d+) 秒", *FACT_DOCS), unit, "停止の待ち時間")
+        self.assertAllStated(stated_numbers(r"TimeoutStopSec=(\d+)", *FACT_DOCS), unit, "TimeoutStopSec")
+
+    def test_the_length_of_hotaru_is_the_length_of_the_file(self):
+        seconds = mp3_seconds(os.path.join(REPO_ROOT, "assets", "hotaru.mp3"))
+        stated = stated_numbers(r"約 (\d+) 秒", SETUP_MD, KNOWLEDGE_BASE_MD)
+        long_ones = [(name, value) for name, values in stated.items() for value in values if int(value) > 100]
+        self.assertTrue(long_ones, "蛍の光が鳴り終わる長さ（約 N 秒）の記述がありません")
+        for name, value in long_ones:   # 「約 139 秒」のような、蛍の光の長さだけを対象にする
+            self.assertAlmostEqual(float(value), seconds, delta=1.0, msg=name)
+
+    def test_the_default_of_max_segment_seconds(self):
+        default = DEFAULT_CONFIG["audio"]["max_segment_seconds"]
+        self.assertAllStated(stated_numbers(r"max_segment_seconds`（既定 (\d+) 秒）", SETUP_MD), default,
+                             "max_segment_seconds の既定")
+        self.assertAllStated(stated_numbers(r"既定の (\d+) 秒として扱う", KNOWLEDGE_BASE_MD), default,
+                             "max_segment_seconds の既定")
+
+    def test_the_default_of_the_time_signal_volume(self):
+        default = DEFAULT_CONFIG["time_signal"]["volume"]
+        self.assertAllStated(stated_numbers(r"time_signal\.volume`?（既定 ([\d.]+)）", *FACT_DOCS), default,
+                             "time_signal.volume の既定")
+
+    def test_the_pause_commands_are_never_documented_with_sudo(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            text = doc(name)
+            self.assertInDoc("`sudo` を付けずに", text, name)
+            self.assertNotRegex(text, r"(?<!ずに)`sudo` を付けて(?!ずに)[^。\n]*(--pause|休止)", name)
+            self.assertNotRegex(text, r"sudo python3 campus_chime\.py --pause", name)
+
+    def test_the_mp3_length_reader_counts_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tone.mp3")
+            frame = bytes([0xFF, 0xFB, 0x90, 0x00]) + bytes(417 - 4)   # MPEG-1 Layer III、128 kbps、44.1 kHz
+            with open(path, "wb") as handle:
+                handle.write(frame * 10)
+            self.assertAlmostEqual(mp3_seconds(path), 10 * 1152 / 44100.0, places=6)
 
 
 # -- 文書ではなく、ソースの書き方 ---------------------------------------------------------

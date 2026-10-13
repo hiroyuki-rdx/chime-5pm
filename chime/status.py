@@ -5,7 +5,9 @@
     （NTP）・サービスの状態・再生方法・直近の放送・次の予定・作り置きの声。
     何も書かない。外のコマンド（``timedatectl`` / ``systemctl``）は、呼び出し側から
     差し替えられる（テストでは本物を呼ばない）。調べられないものは「確認できません」
-    と表示し、問題とは数えない。気になる点があれば終了コード 1。
+    と表示し、問題とは数えない。気になる点があれば終了コード 1。放送を止めているか
+    （``--pause-today`` など）と、近い休館日（``schedule.closures``）も表示する。
+    止めているのは利用者の意思なので、問題とは数えない。
 
 ``--wait-idle``
     更新（``scripts/update.sh``）のとき、放送の最中にサービスを再起動して
@@ -18,15 +20,16 @@ import subprocess
 import sys
 import time
 import unicodedata
-from dataclasses import dataclass
-from datetime import datetime, timedelta, tzinfo
+from dataclasses import dataclass, field
+from datetime import date, datetime, time as day_time, timedelta, tzinfo
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Mapping, Optional, TextIO, Tuple
 
 from . import buildinfo, env
-from .check import display_width, pad, prerecorded_coverage
-from .history import History
+from .check import describe_pause, display_width, pad, pause_record_unusable, prerecorded_coverage
+from .history import RESULT_INTERRUPTED, RESULT_SKIPPED, History
+from .pause import Pause
 from .phrases import Coverage, CoverageTooLarge, coverage
-from .scheduler import Event, Scheduler, format_events
+from .scheduler import WEEKDAY_NAMES, Event, Scheduler, format_events
 from .tts import TTSService
 
 if TYPE_CHECKING:  # 型の注釈にだけ使う（実行時に pygame まで引き込まない）
@@ -44,6 +47,9 @@ NTP_COMMAND = ["timedatectl", "show", "-p", "NTPSynchronized", "--value"]
 HISTORY_LIMIT = 8
 UPCOMING_LIMIT = 3
 
+#: 休館日を挙げる範囲（今日から数えた日数）。
+CLOSURE_DAYS = 14
+
 #: 無音だった文言・欠けた音源を 1 件の履歴につき挙げる数。
 SILENT_LIMIT = 3
 MISSING_LIMIT = 3
@@ -54,8 +60,12 @@ DEGRADED_NOTE = "簡易の内容で放送"
 
 UNKNOWN = "確認できません"
 
+#: 休止の記録があるのに使えないとき、「止めていません」に添える案内（放送は通常どおり鳴る）。
+PAUSE_UNUSABLE_NOTE = "（休止の記録を使えません。--check で確かめてください）"
+
 _KIND_LABELS = {"hourly": "時報", "closing": "閉館放送"}
-_RESULT_LABELS = {"ok": "成功", "partial": "一部のみ", "failed": "失敗", "error": "エラー"}
+_RESULT_LABELS = {"ok": "成功", "partial": "一部のみ", "failed": "失敗", "error": "エラー",
+                  RESULT_SKIPPED: "止めていた", RESULT_INTERRUPTED: "中断"}
 #: 履歴の結果のうち、「放送が失敗した」と数えるもの。
 _FAILED_RESULTS = ("failed", "error")
 
@@ -128,11 +138,35 @@ class Status:
     #: 放送が作り置きの声を引くか（``tts.engines`` に ``prerecorded`` があるか）。無ければ、
     #: 声がディスクにそろっていても、放送は作り置きを引かない（Pi では読み上げがすべて無音）。
     prerecorded_enabled: bool = True
+    #: 今効いている休止（``--pause-today`` など）。止めていなければ ``None``。
+    pause: Optional[Pause] = None
+    #: 休止の記録が、あるのに使えないか（壊れている・読めないなど。止めていないものとして鳴る）。
+    pause_unusable: bool = False
+    #: 近い休館日（今日から :data:`CLOSURE_DAYS` 日以内で、休館のために鳴らさない日と理由）。
+    closures: List[Tuple[date, str]] = field(default_factory=list)
+
+    @property
+    def last_broadcast(self) -> Optional[Mapping[str, Any]]:
+        """直近の放送の履歴。休止で鳴らさなかった記録（``skipped``）は飛ばす。
+
+        止めていた日の記録が、その前の放送の失敗を隠してしまわないようにする。
+        """
+        for entry in self.history:
+            if isinstance(entry, Mapping) and entry.get("result") != RESULT_SKIPPED:
+                return entry
+        return None
 
     @property
     def last_failed(self) -> bool:
         """直近の放送が失敗（1 つも鳴らせない、または例外）で終わったか。"""
-        return bool(self.history) and self.history[0].get("result") in _FAILED_RESULTS
+        last = self.last_broadcast
+        return last is not None and last.get("result") in _FAILED_RESULTS
+
+    @property
+    def last_interrupted(self) -> bool:
+        """直近の放送が、停止要求で途中で止まったか。"""
+        last = self.last_broadcast
+        return last is not None and last.get("result") == RESULT_INTERRUPTED
 
     @property
     def last_missing(self) -> bool:
@@ -140,9 +174,10 @@ class Status:
 
         ``missing`` の無い古い行は、無かったものとして扱う。
         """
-        if not self.history:
+        last = self.last_broadcast
+        if last is None:
             return False
-        missing = self.history[0].get("missing")
+        missing = last.get("missing")
         return isinstance(missing, list) and bool(missing)
 
     @property
@@ -151,7 +186,8 @@ class Status:
 
         ``degraded`` の無い古い行は、無かったものとして扱う（真偽値の ``true`` だけを数える）。
         """
-        return bool(self.history) and self.history[0].get("degraded") is True
+        last = self.last_broadcast
+        return last is not None and last.get("degraded") is True
 
 
 def collect_status(app: ChimeApp, run: Optional[Runner] = None,
@@ -165,6 +201,7 @@ def collect_status(app: ChimeApp, run: Optional[Runner] = None,
     backend = app.player.name
     found, error = _coverage_or_error(app)
     active, enabled = service_state(run)
+    pause = _current_pause(app)
     return Status(
         version=version if version is not None else buildinfo.version_string(),
         now=app.now(),
@@ -174,12 +211,68 @@ def collect_status(app: ChimeApp, run: Optional[Runner] = None,
         backend=backend,
         production=env.is_production_linux() if production is None else production,
         history=History(app.config.path("state.history_file")).recent(HISTORY_LIMIT),
-        upcoming=app.scheduler.upcoming(limit=UPCOMING_LIMIT),
+        upcoming=_upcoming_events(app, pause),
         coverage=found,
         coverage_error=error,
         zone=app.tzinfo,
         prerecorded_enabled=_prerecorded_enabled(app),
+        pause=pause,
+        pause_unusable=pause is None and _pause_unusable(app),
+        closures=_upcoming_closures(app),
     )
+
+
+def start_of_day(day: date, tz: Optional[tzinfo]) -> datetime:
+    """``day`` の 0 時（``tz`` のタイムゾーン。``None`` ならタイムゾーンなし）。"""
+    return datetime.combine(day, day_time.min, tzinfo=tz)
+
+
+def _current_pause(app: ChimeApp) -> Optional[Pause]:
+    """今効いている休止。止めていない・調べられない・休止の機能を持たない app なら ``None``。"""
+    store = getattr(app, "pause", None)
+    if store is None:
+        return None
+    try:
+        return store.current()
+    except Exception:  # 表示のために状態の表示を止めない
+        return None
+
+
+def _pause_unusable(app: ChimeApp) -> bool:
+    """休止の記録が、あるのに使えないか。休止の機能を持たない app・調べられないときは ``False``。"""
+    store = getattr(app, "pause", None)
+    if store is None:
+        return False
+    try:
+        return pause_record_unusable(app.config, store.path, app.now().date())
+    except Exception:  # 案内のために状態の表示を止めない
+        return False
+
+
+def _upcoming_events(app: ChimeApp, pause: Optional[Pause]) -> List[Event]:
+    """次の予定。休止中は、止めているあいだを飛ばして休止が明けてから数える。"""
+    if pause is None:
+        return app.scheduler.upcoming(limit=UPCOMING_LIMIT)
+    return app.scheduler.upcoming(
+        start_of_day(pause.last_day + timedelta(days=1), app.tzinfo), limit=UPCOMING_LIMIT)
+
+
+def _upcoming_closures(app: ChimeApp) -> List[Tuple[date, str]]:
+    """今日から :data:`CLOSURE_DAYS` 日以内の、休館のために鳴らさない日と理由。調べられなければ空。
+
+    曜日の決まりでもともと鳴らない日（土日など）は挙げない。
+    """
+    try:
+        today = app.now().date()
+        found = []
+        for offset in range(CLOSURE_DAYS):
+            day = today + timedelta(days=offset)
+            reason = app.scheduler.skip_reason(day)
+            if reason is not None:
+                found.append((day, reason))
+        return found
+    except Exception:  # 休館日の表示のために状態の表示を止めない
+        return []
 
 
 def _runtime_tts(app: ChimeApp) -> TTSService:
@@ -241,6 +334,10 @@ def attention(status: Status) -> List[str]:
         reasons.append("再生方法が mock です（実機では音が出ません。audio.backend と音声まわりを確認）")
     if status.last_failed:
         reasons.append("直近の放送が失敗しています（下の「直近の放送」を参照）")
+    elif status.last_interrupted:
+        reasons.append("直近の放送は、停止要求で途中で止まりました"
+                       "（サービスの停止や再起動と重なったと思われます。下の「直近の放送」を参照。"
+                       "次の放送が最後まで鳴れば、この表示は消えます）")
     elif status.last_missing:
         reasons.append("直近の放送で、音源ファイルが無くて鳴らせなかった部分があります"
                        "（下の「直近の放送」を参照。--check で確認）")
@@ -270,7 +367,9 @@ def render_status(status: Status, reasons: List[str]) -> List[str]:
     lines.extend("{0}  {1}".format(pad(label, width), value) for label, value in rows)
     lines.extend(["", "直近の放送（新しい順）"])
     lines.extend(_history_lines(status))
-    lines.extend(["", "次の予定", format_events(status.upcoming), ""])
+    upcoming = "次の予定" if status.pause is None else "次の予定（休止のあいだは省いています）"
+    lines.extend(["", upcoming, format_events(status.upcoming), ""])
+    lines.extend(_closure_lines(status))
     if reasons:
         lines.append("要確認:")
         lines.extend("  - {0}".format(reason) for reason in reasons)
@@ -288,7 +387,30 @@ def _rows(status: Status) -> List[Tuple[str, str]]:
         ("自動起動", _enabled_text(status.enabled)),
         ("再生方法", _backend_text(status)),
         ("作り置きの音声", _coverage_text(status)),
+        ("放送の休止", _pause_text(status.pause, status.pause_unusable)),
     ]
+
+
+def _pause_text(pause: Optional[Pause], unusable: bool = False) -> str:
+    """休止の行。止めていなければ ``止めていません``。
+
+    記録があるのに使えないとき（止めたつもりで書いたのに壊れている、など）は、止めていない
+    理由に気づけるよう ``--check`` を案内する。放送は通常どおり鳴るので、要確認にはしない。
+    """
+    if pause is None:
+        return "止めていません" + (PAUSE_UNUSABLE_NOTE if unusable else "")
+    return "止めています: {0}".format(describe_pause(pause))
+
+
+def _closure_lines(status: Status) -> List[str]:
+    """近い休館日の節（休館日が無ければ何も出さない。使っていない設置場所の画面を増やさない）。"""
+    if not status.closures:
+        return []
+    lines = ["休館日（今後 {0} 日）".format(CLOSURE_DAYS)]
+    lines.extend("  {0}（{1}） {2}".format(day.strftime("%m/%d"), WEEKDAY_NAMES[day.weekday()], reason)
+                 for day, reason in status.closures)
+    lines.append("")
+    return lines
 
 
 def _ntp_text(ntp: Optional[bool]) -> str:
@@ -385,11 +507,25 @@ def _listed_note(title: str, values: Any, limit: int) -> List[str]:
     return ["{0}: {1}{2}".format(title, texts, more)]
 
 
+def _is_count(value: Any) -> bool:
+    """件数として読める値か（``bool`` は ``int`` の子なので除く）。"""
+    return type(value) is int and value >= 0
+
+
 def _entry_notes(entry: Mapping[str, Any]) -> str:
-    """結果の補足（エラーの説明・簡易の内容で放送・欠けた音源・無音だった文言）。"""
+    """結果の補足（止めた理由・エラーの説明・鳴らせた数・簡易の内容で放送・欠けた音源・無音だった文言）。
+
+    止めた理由（``reason``）は文字列のときだけ。鳴らせた数は、停止要求で中断した放送にだけ添える
+    （どこまで鳴ったかが分かる）。
+    """
     notes = []
+    if isinstance(entry.get("reason"), str) and entry["reason"]:
+        notes.append(_plain(entry["reason"]))
     if entry.get("error"):
         notes.append("エラー: {0}".format(_plain(entry["error"])))
+    if (entry.get("result") == RESULT_INTERRUPTED
+            and _is_count(entry.get("played")) and _is_count(entry.get("total"))):
+        notes.append("{0}/{1} 件を鳴らして停止".format(entry["played"], entry["total"]))
     if entry.get("degraded") is True:
         notes.append(DEGRADED_NOTE)
     notes.extend(_listed_note("欠けた音源", entry.get("missing"), MISSING_LIMIT))

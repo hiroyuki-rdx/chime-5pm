@@ -25,7 +25,9 @@ from chime.audio import Segment
 from chime.cli import CURRENT_HOUR, EPILOG, build_parser, run
 from chime.config import DEFAULT_CONFIG, load_config
 from chime.scheduler import Scheduler
+from chime.pause import MAX_PAUSE_DAYS
 from chime.sequence import PlaybackPlan
+from chime.state import State
 from chime.tts import TTSError
 from chime.weather import WeatherError
 
@@ -1144,6 +1146,730 @@ class ModeHandlersTest(unittest.TestCase):
         self.assertIn("テストモード: 閉館放送を再生します。", output)
         self.assertIn("再生できるセグメントがありませんでした", output)
         self.assertIn("テストを終了します。", output)
+
+
+class PauseOptionsTest(unittest.TestCase):
+    """休止のオプション（``--pause-today`` / ``--pause-until`` / ``--pause-off`` / ``--reason``）の定義。"""
+
+    def test_defaults_do_not_pause(self):
+        args = build_parser().parse_args([])
+        self.assertFalse(args.pause_today)
+        self.assertIsNone(args.pause_until)
+        self.assertFalse(args.pause_off)
+        self.assertIsNone(args.reason)
+
+    def test_the_options_are_parsed(self):
+        parser = build_parser()
+        self.assertTrue(parser.parse_args(["--pause-today"]).pause_today)
+        self.assertTrue(parser.parse_args(["--pause-off"]).pause_off)
+        args = parser.parse_args(["--pause-until", "2026-11-05", "--reason", "学園祭"])
+        self.assertEqual((args.pause_until, args.reason), ("2026-11-05", "学園祭"))
+
+    def test_help_and_the_examples_list_the_options(self):
+        text = build_parser().format_help()
+        for option in ("--pause-today", "--pause-until", "--pause-off", "--reason"):
+            self.assertIn(option, text)
+        for example in ("campus_chime.py --pause-today", "campus_chime.py --pause-until 2026-11-05",
+                        "campus_chime.py --pause-off"):
+            self.assertIn(example, EPILOG)
+
+    def test_help_tells_the_longest_pause(self):
+        self.assertIn("最長 31 日", " ".join(build_parser().format_help().split()))
+
+    def test_the_longest_pause_in_the_help_is_the_limit_of_the_code(self):
+        # 最長の日数は、ヘルプの本文とオプションの説明の両方に書く。コードの上限（MAX_PAUSE_DAYS）と食い違わない。
+        for text in (EPILOG, build_parser().format_help()):
+            days = re.findall(r"最長 (\d+) 日", text)
+            self.assertTrue(days)
+            self.assertEqual({int(day) for day in days}, {MAX_PAUSE_DAYS})
+
+    def test_the_pause_group_says_who_runs_it(self):
+        help_text = " ".join(build_parser().format_help().split())
+        self.assertIn("放送の一時休止（常駐中のサービスにそのまま効く。サービスの利用者で実行する）", help_text)
+
+    def test_every_pause_option_has_an_example_line(self):
+        examples = EPILOG.replace("campus_chime.py --pause-today --reason", "campus_chime.py --reason")
+        for option in ("--pause-today", "--pause-until", "--pause-off", "--reason"):
+            self.assertIn("campus_chime.py " + option, examples)
+
+    def test_the_status_help_names_the_pause_row_and_the_closures(self):
+        # --status は「放送の休止」の行と、近い休館日の節を出す。ヘルプも使用例もそう言う。
+        [example] = [line for line in EPILOG.splitlines() if "campus_chime.py --status" in line]
+        described = re.search(r"--status (いまの状態.*?) --wait-idle",
+                              " ".join(build_parser().format_help().split()))
+        self.assertIsNotNone(described)
+        for text in (example, described.group(1)):
+            for word in ("放送の休止", "休館日"):
+                self.assertIn(word, text)
+
+    def test_given_tells_a_zero_from_not_given(self):
+        args = build_parser().parse_args(["--test-hourly", "0"])
+        self.assertTrue(cli.given(args, "test_hourly"))
+        self.assertFalse(cli.given(args, "test"))
+        self.assertFalse(cli.given(args, "say"))
+
+    def test_parse_day_accepts_only_real_dates_in_ascii(self):
+        self.assertEqual(cli.parse_day("2026-11-05"), date(2026, 11, 5))
+        for text in ("", "tomorrow", "2026-13-01", "2026-02-30", "2026-1-5", "2026/11/05",
+                     "２０２６-11-05", " 2026-11-05", "2026-11-05 ", "20261105"):
+            self.assertIsNone(cli.parse_day(text), repr(text))
+
+
+class PauseCommandCase(unittest.TestCase):
+    """一時フォルダの設定で、休止のコマンドを動かす土台。
+
+    時計は水曜 2026-10-14 12:30。実行している利用者は ``pi``（root ではない）に固定する
+    （root で動くテスト環境でも同じ結果にするため）。休止の記録・状態・履歴は一時フォルダ。
+    """
+
+    NOW = datetime(2026, 10, 14, 12, 30, tzinfo=TOKYO)
+
+    def setUp(self):
+        block_network(self)
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
+        self.pause_path = os.path.join(self.tmp, "pause.json")
+        self.write_config({})
+        self.clock = {"now": self.NOW}
+        for patcher in (mock.patch("os.geteuid", return_value=1000),
+                        mock.patch("chime.cli.ChimeApp.now", lambda app: self.clock["now"])):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write_config(self, extra):
+        data = {"state": {"file": os.path.join(self.tmp, "state.json"),
+                          "history_file": os.path.join(self.tmp, "history.jsonl"),
+                          "pause_file": self.pause_path},
+                "tts": {"cache_dir": os.path.join(self.tmp, "tts")}}
+        for section, values in extra.items():
+            data.setdefault(section, {}).update(values)
+        self.config = os.path.join(self.tmp, "config.json")
+        with open(self.config, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+
+    def run_cli(self, *argv):
+        """(終了コード, 標準出力, 標準エラー出力)。"""
+        return call_split(["--config", self.config] + list(argv))
+
+    def pause_record(self):
+        with open(self.pause_path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def put_pause_file(self, **record):
+        values = {"v": 1, "first_day": "2026-10-14", "last_day": "2026-10-15",
+                  "set_at": "2026-10-14T09:00:00+09:00", "reason": "点検"}
+        values.update(record)
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            json.dump(values, handle)
+
+    def files(self):
+        return sorted(os.listdir(self.tmp))
+
+
+class PauseTodayTest(PauseCommandCase):
+    def test_it_pauses_today_and_says_what_stops_and_when_it_resumes(self):
+        code, out, err = self.run_cli("--pause-today")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("10/14 の放送（時報 4 回・閉館 1 回）を止めます。10/15 10:00 に再開します。", out)
+
+    def test_the_record_is_written_for_today(self):
+        self.run_cli("--pause-today", "--reason", "点検")
+        record = self.pause_record()
+        self.assertEqual((record["v"], record["first_day"], record["last_day"], record["reason"]),
+                         (1, "2026-10-14", "2026-10-14", "点検"))
+        self.assertEqual(record["set_at"], "2026-10-14T12:30:00+09:00")
+        self.assertNotIn("pause.json.", " ".join(self.files()))   # 一時ファイルを残さない
+
+    def test_the_reason_is_shown_back(self):
+        _, out, _ = self.run_cli("--pause-today", "--reason", "点検")
+        self.assertIn("理由: 点検", out)
+
+    def test_without_a_reason_there_is_no_reason_line(self):
+        _, out, _ = self.run_cli("--pause-today")
+        self.assertNotIn("理由", out)
+        self.assertEqual(self.pause_record()["reason"], "")
+
+    def test_it_tells_that_the_running_service_follows_without_a_restart(self):
+        _, out, _ = self.run_cli("--pause-today")
+        self.assertIn("常駐中のサービスにはそのまま効きます（再起動は要りません）", out)
+        self.assertIn("--pause-off", out)
+
+    def test_what_has_already_played_today_is_not_counted(self):
+        self.clock["now"] = datetime(2026, 10, 14, 16, 30, tzinfo=TOKYO)
+        _, out, _ = self.run_cli("--pause-today")
+        self.assertIn("10/14 の放送（時報 0 回・閉館 1 回）を止めます。", out)   # 16:00 の時報はもう鳴った
+        self.clock["now"] = datetime(2026, 10, 14, 17, 30, tzinfo=TOKYO)
+        _, out, _ = self.run_cli("--pause-today")
+        self.assertIn("10/14 の放送（時報 0 回・閉館 0 回）を止めます。10/15 10:00 に再開します。", out)
+
+    def test_a_chime_whose_play_time_is_exactly_now_is_counted(self):
+        # ちょうど再生開始の時刻に実行したとき、その回は「これから鳴る」に数える
+        # （Scheduler.iter_events が play_at >= start を残すのと同じ）。
+        self.clock["now"] = datetime(2026, 10, 14, 9, 59, 57, tzinfo=TOKYO)   # 10 時の時報の再生開始
+        code, out, err = self.run_cli("--dry-run", "--pause-today")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("10/14 の放送（時報 7 回・閉館 1 回）を止めます。", out)
+
+    def test_a_chime_one_second_past_its_play_time_is_not_counted(self):
+        self.clock["now"] = datetime(2026, 10, 14, 9, 59, 58, tzinfo=TOKYO)
+        _, out, _ = self.run_cli("--dry-run", "--pause-today")
+        self.assertIn("（時報 6 回・閉館 1 回）", out)
+
+    def test_a_value_error_from_the_store_is_exit_2_with_its_message(self):
+        # 先に確かめたはずの誤りが、書く段階で ValueError になったときも、終了コード 2 で理由を言う。
+        with mock.patch("chime.pause.PauseStore.set", side_effect=ValueError("日付の誤りなのだ")):
+            code, out, err = self.run_cli("--pause-today")
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(err, "日付の誤りなのだ\n")
+        self.assertFalse(os.path.exists(self.pause_path))
+
+    def test_a_day_with_no_broadcast_says_zero(self):
+        self.clock["now"] = datetime(2026, 10, 18, 12, 30, tzinfo=TOKYO)   # 日曜
+        code, out, _ = self.run_cli("--pause-today")
+        self.assertEqual(code, 0)
+        self.assertIn("10/18 の放送（時報 0 回・閉館 0 回）を止めます。10/19 10:00 に再開します。", out)
+
+    def test_a_closure_tomorrow_moves_the_resume_day(self):
+        self.write_config({"schedule": {"closures": {"dates": ["2026-10-15"], "ranges": []}}})
+        _, out, _ = self.run_cli("--pause-today")
+        self.assertIn("10/16 10:00 に再開します。", out)
+
+    def test_today_is_the_configured_zone_not_the_machine_zone(self):
+        self.clock["now"] = datetime(2026, 10, 14, 0, 30, tzinfo=TOKYO)   # UTC では前日
+        self.run_cli("--pause-today")
+        self.assertEqual(self.pause_record()["first_day"], "2026-10-14")
+
+    def test_pausing_again_replaces_the_record(self):
+        self.run_cli("--pause-today", "--reason", "一度目")
+        self.run_cli("--pause-until", "2026-10-15", "--reason", "二度目")
+        record = self.pause_record()
+        self.assertEqual((record["last_day"], record["reason"]), ("2026-10-15", "二度目"))
+
+    def test_no_state_or_history_is_touched(self):
+        self.run_cli("--pause-today")
+        self.assertEqual(self.files(), ["config.json", "pause.json"])
+
+
+class PauseUntilTest(PauseCommandCase):
+    def test_it_pauses_the_whole_span_and_counts_the_weekdays(self):
+        code, out, err = self.run_cli("--pause-until", "2026-10-16", "--reason", "学園祭の準備")
+        self.assertEqual((code, err), (0, ""), out)
+        # 水（今日の残り 4 + 1）・木・金（それぞれ 7 + 1）。土日は鳴らない。
+        self.assertIn("10/14〜10/16 の放送（時報 18 回・閉館 3 回）を止めます。10/19 10:00 に再開します。", out)
+        self.assertIn("理由: 学園祭の準備", out)
+        self.assertEqual(self.pause_record()["last_day"], "2026-10-16")
+
+    def test_closure_days_inside_the_span_are_not_counted(self):
+        self.write_config({"schedule": {"closures": {"dates": ["2026-10-15"], "ranges": []}}})
+        _, out, _ = self.run_cli("--pause-until", "2026-10-16")
+        self.assertIn("10/14〜10/16 の放送（時報 11 回・閉館 2 回）を止めます。", out)
+
+    def test_until_today_is_a_one_day_pause(self):
+        _, out, _ = self.run_cli("--pause-until", "2026-10-14")
+        self.assertIn("10/14 の放送（時報 4 回・閉館 1 回）を止めます。", out)
+        self.assertNotIn("〜", out)
+
+    def test_the_longest_pause_is_31_days_including_today(self):
+        code, out, _ = self.run_cli("--pause-until", "2026-11-13")
+        self.assertEqual(code, 0, out)
+        self.assertEqual(self.pause_record()["last_day"], "2026-11-13")
+
+    def test_a_pause_longer_than_31_days_is_refused_and_points_to_closures(self):
+        code, out, err = self.run_cli("--pause-until", "2026-11-14")
+        self.assertEqual(code, 2)
+        self.assertIn("最長 31 日", err)
+        self.assertIn("2026-11-14 まででは 32 日", err)
+        self.assertIn("schedule.closures", err)
+        self.assertNotIn("止めます", out)
+        self.assertEqual(self.files(), ["config.json"])
+
+    def test_a_date_in_the_past_is_refused(self):
+        code, out, err = self.run_cli("--pause-until", "2026-10-13")
+        self.assertEqual(code, 2)
+        self.assertIn("過去の日付", err)
+        self.assertEqual(self.files(), ["config.json"])
+
+    def test_after_the_end_of_the_schedule_the_resume_line_says_so(self):
+        self.write_config({"schedule": {"hourly": {"enabled": False}, "closing": {"enabled": False}}})
+        code, out, _ = self.run_cli("--pause-today")
+        self.assertEqual(code, 0)
+        self.assertIn("このあと鳴らす予定の放送がありません", out)
+
+    def test_a_reason_that_cannot_be_written_as_utf8_is_refused(self):
+        # 端末の文字コードが合っていないと、引数に孤立したサロゲートが混ざる。
+        for extra in ([], ["--dry-run"]):
+            code, out, err = self.run_cli("--pause-today", "--reason", "\udcff", *extra)
+            self.assertEqual(code, 2, extra)
+            self.assertIn("文字コードの正しくない文字", err)
+            self.assertEqual(out, "")
+            self.assertEqual(self.files(), ["config.json"])
+
+    def test_a_past_date_is_refused_in_a_dry_run_too(self):
+        code, _, err = self.run_cli("--pause-until", "2026-10-13", "--dry-run")
+        self.assertEqual(code, 2)
+        self.assertIn("過去の日付", err)
+
+    def test_a_pause_longer_than_31_days_is_refused_in_a_dry_run_too(self):
+        code, _, err = self.run_cli("--pause-until", "2026-11-14", "--dry-run")
+        self.assertEqual(code, 2)
+        self.assertIn("schedule.closures", err)
+
+
+class PauseArgumentsTest(PauseCommandCase):
+    """引数の組み合わせの誤りは、設定を読む前に断る（終了コード 2、何も書かない）。"""
+
+    def setUp(self):
+        super().setUp()
+        loader = mock.patch("chime.cli.load_config", side_effect=AssertionError("設定を読んではいけない"))
+        loader.start()
+        self.addCleanup(loader.stop)
+        built = mock.patch("chime.cli.ChimeApp", side_effect=AssertionError("組み立ててはいけない"))
+        built.start()
+        self.addCleanup(built.stop)
+
+    def refused(self, *argv):
+        code, out, err = call_split(list(argv))
+        self.assertEqual(code, 2, (out, err))
+        self.assertEqual(out, "")
+        self.assertEqual(self.files(), ["config.json"])
+        return err
+
+    def test_reason_alone_is_refused(self):
+        self.assertIn("--reason は --pause-today か --pause-until と一緒に", self.refused("--reason", "x"))
+
+    def test_reason_with_pause_off_is_refused(self):
+        self.assertIn("--reason は --pause-off では使えません",
+                      self.refused("--pause-off", "--reason", "x"))
+
+    def test_two_pause_options_are_refused(self):
+        err = self.refused("--pause-today", "--pause-off")
+        self.assertIn("--pause-today と --pause-off は同時に指定できません", err)
+        self.assertIn("--pause-today と --pause-until", self.refused("--pause-today", "--pause-until", "2026-11-05"))
+
+    def test_a_pause_with_another_mode_is_refused(self):
+        for other in (["--status"], ["--schedule"], ["--test"], ["--check"], ["--wait-idle"],
+                      ["--say", "x"], ["--print-config"], ["--weather"], ["--generate-assets"],
+                      ["--test-all"], ["--test-hourly", "0"], ["--test-hourly"]):
+            err = self.refused("--pause-today", *other)
+            self.assertIn("--pause-today は {0} と同時に指定できません".format(other[0]), err)
+
+    def test_a_date_that_is_not_a_date_is_refused(self):
+        for text in ("", "tomorrow", "2026-13-01", "2026-02-30", "2026-1-5", "２０２６-11-05"):
+            err = self.refused("--pause-until", text)
+            self.assertIn("YYYY-MM-DD", err)
+
+    def test_a_bad_pause_argument_is_refused_before_the_root_check(self):
+        with mock.patch("os.geteuid", return_value=0):
+            err = self.refused("--pause-until", "tomorrow")
+        self.assertIn("YYYY-MM-DD", err)
+        self.assertNotIn("root", err)
+
+
+class PauseAsRootTest(PauseCommandCase):
+    """root では休止を使えない（``cache/`` が root の持ち物になり、サービスが書けなくなる）。"""
+
+    def test_each_pause_option_is_refused_for_root(self):
+        built = mock.patch("chime.cli.ChimeApp", side_effect=AssertionError("組み立ててはいけない"))
+        built.start()
+        self.addCleanup(built.stop)
+        for argv in (["--pause-today"], ["--pause-until", "2026-10-16"], ["--pause-off"],
+                     ["--pause-today", "--reason", "x"]):
+            with mock.patch("os.geteuid", return_value=0):
+                code, out, err = self.run_cli(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn("root では {0} を使えません".format(argv[0]), err)
+            self.assertIn("サービスの利用者（pi など）で実行してください", err)
+            self.assertEqual(out, "")
+            self.assertEqual(self.files(), ["config.json"])
+
+    def test_other_modes_are_not_affected_by_the_root_rule(self):
+        with mock.patch("os.geteuid", return_value=0):
+            code, out, _ = self.run_cli("--schedule", "1")
+        self.assertEqual(code, 0, out)
+
+    def test_an_os_without_uids_is_not_root(self):
+        with mock.patch.object(cli.os, "geteuid", None):
+            self.assertFalse(cli.running_as_root())
+        with mock.patch("os.geteuid", return_value=0):
+            self.assertTrue(cli.running_as_root())
+        with mock.patch("os.geteuid", return_value=1000):
+            self.assertFalse(cli.running_as_root())
+
+
+class PauseOffTest(PauseCommandCase):
+    def test_it_lifts_a_pause_and_says_what_was_lifted_and_what_is_next(self):
+        self.run_cli("--pause-until", "2026-10-15", "--reason", "点検")
+        code, out, err = self.run_cli("--pause-off")
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("休止を解除しました: 10/14〜10/15（点検）", out)
+        self.assertIn("次の放送は 10/14 13:00 です。", out)
+        self.assertFalse(os.path.exists(self.pause_path))
+
+    def test_without_a_pause_it_says_nothing_was_paused(self):
+        code, out, err = self.run_cli("--pause-off")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("止めている放送はありません。", out)
+        self.assertEqual(self.files(), ["config.json"])
+
+    def test_an_expired_record_is_removed_and_said_so(self):
+        self.put_pause_file(first_day="2026-10-10", last_day="2026-10-12")
+        code, out, _ = self.run_cli("--pause-off")
+        self.assertEqual(code, 0)
+        self.assertIn("期限が切れていた（または読めなかった）休止の記録を消しました", out)
+        self.assertFalse(os.path.exists(self.pause_path))
+
+    def test_a_broken_record_is_removed_too(self):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write("{ broken")
+        code, out, _ = self.run_cli("--pause-off")
+        self.assertEqual(code, 0)
+        self.assertIn("消しました", out)
+        self.assertFalse(os.path.exists(self.pause_path))
+
+    def test_a_record_that_cannot_be_removed_is_exit_1(self):
+        self.put_pause_file()
+        with mock.patch("chime.pause.os.remove", side_effect=PermissionError("拒否されました")):
+            code, out, err = self.run_cli("--pause-off")
+        self.assertEqual(code, 1)
+        self.assertIn("休止の記録を消せませんでした", err)
+        self.assertTrue(os.path.exists(self.pause_path))
+
+    def pause_then_move_to(self, paused_at, now, *argv):
+        """``paused_at`` に休止を書き、時計を ``now`` に進めて ``--pause-off`` を実行する。"""
+        self.clock["now"] = paused_at
+        self.assertEqual(self.run_cli("--pause-until", "2026-10-15", "--reason", "点検")[0], 0)
+        self.clock["now"] = now
+        return self.run_cli("--pause-off", *argv)
+
+    def test_it_says_which_chime_the_service_will_catch_up_on(self):
+        # 12 時の時報（再生開始 11:59:57）の 23 秒後に解除すると、サービスがその回を追いかけて鳴らす。
+        # 「次の放送は 13:00」だけだと、すぐ鳴る回が抜けて驚かれる。
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines(), [
+            "休止を解除しました: 10/14〜10/15（点検）",
+            "開始から 90 秒未満の回は、サービスが追いかけて鳴らします:",
+            "  - 時報 2026-10-14 12:00:00（再生開始 11:59:57）",
+            "次の放送は 10/14 13:00 です。",
+        ])
+
+    def test_a_chime_the_service_may_notice_too_late_is_not_promised(self):
+        # 12 時の時報（再生開始 11:59:57）の 108 秒後に解除する。常駐中のサービスが解除に気づくのは、待機の区切り
+        # （schedule.max_sleep_seconds）の終わりで、最大 30 秒あと。猶予（120 秒）を過ぎて間に合わないことがあるので、
+        # 「追いかけて鳴らします」と約束せず、「間に合えば」と言う。
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 1, 45, tzinfo=TOKYO))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines(), [
+            "休止を解除しました: 10/14〜10/15（点検）",
+            "間に合えば追いかけて鳴ります（サービスが解除に気づくまで最大 30 秒かかり、"
+            "開始から 120 秒を過ぎると鳴りません）:",
+            "  - 時報 2026-10-14 12:00:00（再生開始 11:59:57）",
+            "次の放送は 10/14 13:00 です。",
+        ])
+        self.assertNotIn("サービスが追いかけて鳴らします", out)
+
+    def test_the_certain_chimes_are_the_ones_the_service_still_picks_when_it_notices_last(self):
+        # 「確実」の境目は、実際の動きと同じ。解除の max_sleep_seconds 秒後（サービスが最後に気づく時刻）にも
+        # Scheduler が選ぶ回だけを約束する。選ばないかもしれない回は、約束しない（ちょうど 90 秒の境目は確かめない）。
+        self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO))
+        app = ChimeApp(load_config(self.config), backend="mock", dry_run=True)
+        play_at = datetime(2026, 10, 14, 11, 59, 57, tzinfo=TOKYO)
+        for age in (1, 59, 60, 89, 91, 92, 119, 120):
+            lifted = play_at + timedelta(seconds=age)
+            noticed = lifted + timedelta(seconds=app.scheduler.max_sleep)   # 解除に気づく、いちばん遅い時刻
+            self.clock["now"] = lifted
+            with self.subTest(seconds_after_play_time=age), mock.patch.object(app, "now", lambda: lifted):
+                [event] = cli.catch_up_events(app)
+                chosen = app.scheduler.next_event(noticed)
+                picked_even_when_noticed_last = chosen is not None and chosen.key == event.key
+                sure, maybe = cli.split_catch_up(app, [event])
+                self.assertEqual((bool(sure), bool(maybe)), (picked_even_when_noticed_last,
+                                                             not picked_even_when_noticed_last))
+
+    def test_a_chime_exactly_at_the_edge_of_the_certain_window_is_not_promised(self):
+        # 確実なのは、経過が「猶予 − 待機の長さ」（120 − 30 = 90 秒）に満たない回だけ。ちょうど 90 秒は、約束しない。
+        app = ChimeApp(load_config(self.config), backend="mock", dry_run=True)
+        play_at = datetime(2026, 10, 14, 11, 59, 57, tzinfo=TOKYO)
+        [event] = [e for e in app.scheduler.events_for_date(play_at.date()) if e.key == "hourly:12"]
+        for age, expected in ((89.5, "certain"), (90, "maybe"), (90.5, "maybe")):
+            moment = play_at + timedelta(seconds=age)
+            with self.subTest(seconds_after_play_time=age), mock.patch.object(app, "now", lambda: moment):
+                certain, maybe = cli.split_catch_up(app, [event])
+                self.assertEqual(("certain" if certain else "maybe", len(certain) + len(maybe)), (expected, 1))
+
+    def test_a_wait_as_long_as_the_grace_promises_nothing(self):
+        # schedule.max_sleep_seconds が猶予以上だと、どの回も「間に合えば」にとどまる（確実な回は無い）
+        self.write_config({"schedule": {"max_sleep_seconds": 300}})
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("間に合えば追いかけて鳴ります（サービスが解除に気づくまで最大 300 秒かかり、"
+                      "開始から 120 秒を過ぎると鳴りません）:", out)
+        self.assertIn("  - 時報 2026-10-14 12:00:00（再生開始 11:59:57）", out)
+        self.assertNotIn("サービスが追いかけて鳴らします", out)
+
+    def test_certain_and_maybe_chimes_are_listed_in_their_own_groups(self):
+        # 猶予 2 時間の設定で、12:59:30 に解除する。11:59:57 の回（経過 3573 秒）は確実、10:59:57 の回（7173 秒）は
+        # 7170 秒（猶予 − 30 秒）を超えているので「間に合えば」。
+        self.write_config({"schedule": {"catchup_grace_seconds": 7200}})
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 10, 0, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 59, 30, tzinfo=TOKYO))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.splitlines(), [
+            "休止を解除しました: 10/14〜10/15（点検）",
+            "開始から 7170 秒未満の回は、サービスが追いかけて鳴らします:",
+            "  - 時報 2026-10-14 12:00:00（再生開始 11:59:57）",
+            "間に合えば追いかけて鳴ります（サービスが解除に気づくまで最大 30 秒かかり、"
+            "開始から 7200 秒を過ぎると鳴りません）:",
+            "  - 時報 2026-10-14 11:00:00（再生開始 10:59:57）",
+            "次の放送は 10/14 13:00 です。",
+        ])
+
+    def test_the_catch_up_is_what_the_scheduler_really_picks(self):
+        # 案内する回は、Scheduler.next_event の取りこぼしの拾い上げ（追いかけ再生）が選ぶ回と同じ。
+        self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO))
+        app = ChimeApp(load_config(self.config), backend="mock", dry_run=True)
+        app.now = lambda: self.clock["now"]
+        for offset in (0, 59, 60, 119, 120, 121, 300):
+            moment = datetime(2026, 10, 14, 11, 59, 57, tzinfo=TOKYO) + timedelta(seconds=offset)
+            self.clock["now"] = moment
+            with self.subTest(seconds_after_play_time=offset), \
+                    mock.patch.object(app, "now", lambda moment=moment: moment):
+                chosen = app.scheduler.next_event(moment)
+                late = chosen is not None and chosen.play_at < moment
+                found = cli.catch_up_events(app)
+                self.assertEqual(bool(found), late)
+                if late:
+                    self.assertEqual(found, [chosen])
+
+    def test_a_chime_that_is_too_late_or_already_played_is_not_announced(self):
+        # 猶予（120 秒）を過ぎた回は鳴らない。鳴らし終えた回は、追いかけない。
+        late = self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 2, 1, tzinfo=TOKYO))
+        self.assertNotIn("追いかけ", late[1])
+        State(os.path.join(self.tmp, "state.json")).mark_fired("hourly:12", "2026-10-14")
+        played = self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO))
+        self.assertNotIn("追いかけ", played[1])
+
+    def test_nothing_is_announced_when_no_pause_was_in_force(self):
+        # 止めていない（期限切れ・壊れた記録）なら、サービスはもう鳴らしているので、案内しない。
+        self.clock["now"] = datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO)
+        self.put_pause_file(first_day="2026-10-10", last_day="2026-10-12")
+        code, out, _ = self.run_cli("--pause-off")
+        self.assertEqual(code, 0)
+        self.assertNotIn("追いかけ", out)
+
+    def test_many_late_chimes_are_listed_up_to_three_and_counted(self):
+        # 猶予を長くした設定で、止めているあいだに過ぎた回が多いとき（長い猶予は設定の誤りだが、案内は崩れない）。
+        self.write_config({"schedule": {"catchup_grace_seconds": 4 * 3600}})
+        code, out, _ = self.pause_then_move_to(
+            datetime(2026, 10, 14, 10, 0, tzinfo=TOKYO), datetime(2026, 10, 14, 15, 0, 20, tzinfo=TOKYO))
+        self.assertEqual(code, 0)
+        self.assertIn("開始から 14370 秒未満の回は、サービスが追いかけて鳴らします:", out)
+        self.assertEqual(out.count("  - 時報"), cli.CATCH_UP_LIMIT)
+        self.assertIn("  ほか 1 件", out)
+
+    def test_exactly_as_many_chimes_as_the_limit_are_listed_without_a_remainder_line(self):
+        # 3 件ちょうど（上限と同じ）のとき、「ほか 0 件」を出さない。猶予 3 時間で、15:00:20 には 3 回が該当する。
+        self.write_config({"schedule": {"catchup_grace_seconds": 3 * 3600}})
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 10, 0, tzinfo=TOKYO), datetime(2026, 10, 14, 15, 0, 20, tzinfo=TOKYO))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(out.count("  - 時報"), cli.CATCH_UP_LIMIT)
+        self.assertNotIn("ほか", out)
+
+    def test_a_chime_that_started_before_midnight_is_still_announced_after_midnight(self):
+        # 猶予の範囲が日付をまたぐとき、前の日の予定も調べる（23:59 の閉館放送を、0:00:20 に解除）。
+        self.write_config({"schedule": {"closing": {"hour": 23, "minute": 59}}})
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 23, 50, tzinfo=TOKYO), datetime(2026, 10, 15, 0, 0, 20, tzinfo=TOKYO))
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertIn("開始から 90 秒未満の回は、サービスが追いかけて鳴らします:", out)
+        self.assertIn("閉館放送 2026-10-14 23:59:00", out)
+
+    def test_a_dry_run_announces_no_catch_up(self):
+        code, out, err = self.pause_then_move_to(
+            datetime(2026, 10, 14, 11, 50, tzinfo=TOKYO), datetime(2026, 10, 14, 12, 0, 20, tzinfo=TOKYO),
+            "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertNotIn("追いかけ", out)
+        self.assertTrue(os.path.exists(self.pause_path))
+
+    def test_a_record_that_is_a_folder_cannot_be_removed_and_the_message_says_what_to_do(self):
+        # --check は「そのフォルダを移すか消す」と案内する。--pause-off では消せないので、そう言う。
+        os.mkdir(self.pause_path)
+        code, _, err = self.run_cli("--pause-off")
+        self.assertEqual(code, 1)
+        self.assertIn("休止の記録を消せませんでした", err)
+        self.assertIn("がフォルダです", err)
+        self.assertIn("そのフォルダを移すか消して", err)
+        self.assertTrue(os.path.isdir(self.pause_path))
+
+    def test_pause_off_then_the_schedule_has_no_pause_line(self):
+        self.run_cli("--pause-today")
+        self.run_cli("--pause-off")
+        _, out, _ = self.run_cli("--schedule", "2")
+        self.assertNotIn("止めています", out)
+
+
+class PauseDryRunTest(PauseCommandCase):
+    def test_a_dry_run_shows_what_would_happen_and_writes_nothing(self):
+        code, out, err = self.run_cli("--pause-today", "--dry-run")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("--dry-run のため、休止の記録は書きません", out)
+        self.assertIn("10/14 の放送（時報 4 回・閉館 1 回）を止めます。", out)
+        self.assertEqual(self.files(), ["config.json"])
+
+    def test_a_dry_run_of_pause_off_keeps_the_record(self):
+        self.put_pause_file()
+        code, out, _ = self.run_cli("--pause-off", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("--dry-run のため、休止の記録は消しません", out)
+        self.assertIn("止めています: 10/14〜10/15（点検）", out)
+        self.assertTrue(os.path.exists(self.pause_path))
+
+
+class PauseFailureTest(PauseCommandCase):
+    def test_a_record_that_cannot_be_written_is_exit_1(self):
+        with mock.patch("chime.pause.write_json_atomic", side_effect=OSError("読み取り専用です")):
+            code, out, err = self.run_cli("--pause-today")
+        self.assertEqual(code, 1)
+        self.assertIn("休止の記録を書けませんでした: 読み取り専用です", err)
+        self.assertNotIn("止めます", out)
+
+    def test_a_failure_points_to_the_check_for_the_fix(self):
+        # 書けない・消せないときの次の手がかり。--check の「書き込み」の節が直し方まで出す。
+        with mock.patch("chime.pause.write_json_atomic", side_effect=PermissionError("拒否されました")):
+            _, _, written = self.run_cli("--pause-today")
+        self.put_pause_file()
+        with mock.patch("chime.pause.os.remove", side_effect=PermissionError("拒否されました")):
+            _, _, removed = self.run_cli("--pause-off")
+        for err in (written, removed):
+            self.assertIn("拒否されました", err)
+            self.assertIn("python3 campus_chime.py --check", err)
+
+    def test_a_record_that_is_a_folder_cannot_be_written_and_the_message_says_what_to_do(self):
+        os.mkdir(self.pause_path)
+        code, out, err = self.run_cli("--pause-today")
+        self.assertEqual(code, 1)
+        self.assertNotIn("止めます", out)
+        self.assertIn("休止の記録を書けませんでした", err)
+        self.assertIn("がフォルダです", err)
+        self.assertIn("そのフォルダを移すか消して", err)
+        self.assertEqual(self.files(), ["config.json", "pause.json"])   # 一時ファイルを残さない
+
+    def test_an_empty_place_for_the_record_means_pausing_is_not_available(self):
+        self.write_config({"state": {"pause_file": ""}})
+        for argv in (["--pause-today"], ["--pause-off"]):
+            code, out, err = self.run_cli(*argv)
+            self.assertEqual(code, 2, argv)
+            self.assertIn("state.pause_file", err)
+        self.assertEqual(self.files(), ["config.json"])
+
+
+class ScheduleWithPauseTest(PauseCommandCase):
+    def test_a_paused_schedule_says_so_on_top_and_lists_after_the_pause(self):
+        self.run_cli("--pause-until", "2026-10-15", "--reason", "点検")
+        code, out, _ = self.run_cli("--schedule", "3")
+        self.assertEqual(code, 0, out)
+        lines = out.splitlines()
+        self.assertTrue(lines[0].startswith("現在時刻: 2026-10-14 12:30:00"), lines[0])
+        self.assertEqual(lines[1], "止めています: 10/14〜10/15（点検）")
+        self.assertEqual(lines[2], "次回以降の予定（休止のあいだは省いています）:")
+        listed = [line for line in lines if line.startswith("  - ")]
+        self.assertEqual(len(listed), 3)
+        self.assertIn("2026-10-16 10:00:00", listed[0])   # 休止が明けた金曜の 10 時から
+
+    def test_a_pause_without_a_reason_shows_just_the_span(self):
+        self.run_cli("--pause-today")
+        _, out, _ = self.run_cli("--schedule", "1")
+        self.assertIn("止めています: 10/14\n", out)
+
+    def test_without_a_pause_the_schedule_is_what_it_was(self):
+        _, out, _ = self.run_cli("--schedule", "3")
+        lines = out.splitlines()
+        self.assertEqual(lines[1], "次回以降の予定:")
+        self.assertNotIn("止めています", out)
+        listed = [line for line in lines if line.startswith("  - ")]
+        self.assertEqual(len(listed), 3)
+        self.assertIn("2026-10-14 13:00:00", listed[0])
+
+    def test_an_expired_pause_is_not_shown(self):
+        self.put_pause_file(first_day="2026-10-10", last_day="2026-10-13")
+        _, out, _ = self.run_cli("--schedule", "1")
+        self.assertNotIn("止めています", out)
+
+    def test_a_broken_record_is_not_shown_as_a_pause(self):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write("nonsense")
+        code, out, _ = self.run_cli("--schedule", "1")
+        self.assertEqual(code, 0)
+        self.assertNotIn("止めています", out)
+        self.assertIn("2026-10-14 13:00:00", out)
+
+    def test_closure_days_are_shown_in_the_list(self):
+        self.write_config({"schedule": {"closures": {
+            "dates": [{"date": "2026-10-16", "name": "学園祭"}], "ranges": []}}})
+        _, out, _ = self.run_cli("--schedule", "20")
+        self.assertIn("  休館 2026-10-16（金） 学園祭", out)
+        self.assertNotIn("2026-10-16 10:00:00", out)   # その日は鳴らない
+        self.assertIn("2026-10-19 10:00:00", out)
+
+    def test_closure_days_and_a_pause_together(self):
+        self.write_config({"schedule": {"closures": {
+            "dates": [{"date": "2026-10-16", "name": "学園祭"}], "ranges": []}}})
+        self.run_cli("--pause-until", "2026-10-15")
+        _, out, _ = self.run_cli("--schedule", "3")
+        self.assertIn("止めています: 10/14〜10/15", out)
+        # 休止が明けた金曜は休館日。その行と、次に鳴る月曜の予定が並ぶ。
+        self.assertIn("  休館 2026-10-16（金） 学園祭", out)
+        self.assertIn("2026-10-19 10:00:00", out)
+
+    def test_a_closure_line_never_uses_the_word_for_the_pause_command(self):
+        # 「休止」は --pause-* の言葉。休館日の行と取り違えないよう、行頭は「休館」。
+        self.write_config({"schedule": {"closures": {
+            "dates": [{"date": "2026-10-16", "name": "学園祭"}], "ranges": []}}})
+        self.run_cli("--pause-until", "2026-10-15")
+        _, out, _ = self.run_cli("--schedule", "3")
+        self.assertEqual([line for line in out.splitlines() if "休止" in line],
+                         ["次回以降の予定（休止のあいだは省いています）:"])
+
+    def test_a_count_of_zero_or_less_still_lists_one(self):
+        _, out, _ = self.run_cli("--schedule", "0")
+        self.assertEqual(out.count("  - "), 1)
+
+
+class PauseDispatchTest(PauseCommandCase):
+    def test_a_pause_never_starts_the_daemon_or_plays(self):
+        with mock.patch("chime.cli.ChimeApp.run_forever") as daemon, \
+                mock.patch("chime.cli.ChimeApp.play") as play:
+            for argv in (["--pause-today"], ["--pause-until", "2026-10-15"], ["--pause-off"]):
+                self.assertEqual(self.run_cli(*argv)[0], 0)
+        daemon.assert_not_called()
+        play.assert_not_called()
+
+    def test_the_app_for_a_pause_is_a_normal_app_unless_dry_run(self):
+        with mock.patch("chime.cli.ChimeApp", wraps=ChimeApp) as built:
+            self.run_cli("--pause-today")
+            self.assertFalse(built.call_args[1]["dry_run"])
+            self.run_cli("--pause-today", "--dry-run")
+            self.assertTrue(built.call_args[1]["dry_run"])
+
+    def test_the_record_a_pause_command_writes_is_what_the_daemon_reads(self):
+        self.run_cli("--pause-until", "2026-10-15", "--reason", "点検")
+        config = load_config(self.config)
+        app = ChimeApp(config, backend="mock")
+        pause = app.pause.current()
+        self.assertEqual((pause.first_day, pause.last_day, pause.reason),
+                         (date(2026, 10, 14), date(2026, 10, 15), "点検"))
+        event = app._next_pending_event()
+        self.assertEqual(event.day, "2026-10-16")
 
 
 class EnvironmentTest(unittest.TestCase):

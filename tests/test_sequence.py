@@ -1163,6 +1163,66 @@ class MissingPartsTest(BuilderTestCase):
         self.assertEqual(len(lines), 3)  # 見出し・蛍の光・警告
 
 
+class SegmentKindTest(BuilderTestCase):
+    """積むセグメントには音量の区分（``Segment.kind``）が付くこと。
+
+    時報音は ``time_signal``、蛍の光は ``music``、それ以外（作り置きの読み上げと
+    閉館アナウンス）は ``voice``。音量そのものは再生側が ``audio.volume`` から引く。
+    """
+
+    def kinds(self, plan):
+        return [(segment.label.split("（")[0].split("「")[0], segment.kind)
+                for segment in plan.segments]
+
+    def test_the_time_signal_is_time_signal_and_all_speech_is_voice(self):
+        self.config.data["extra_segment"]["weather_hours"] = [12]
+        plan = self.make_builder().build_hourly(12)
+        self.assertEqual(plan.segments[0].kind, "time_signal")
+        self.assertIn("時報音", plan.segments[0].label)
+        speech = plan.segments[1:]
+        self.assertTrue(any("天気予報" in segment.label for segment in speech))
+        self.assertTrue(any("ひとこと" in segment.label for segment in speech))
+        self.assertEqual([segment.kind for segment in speech], ["voice"] * len(speech))
+
+    def test_the_closing_announce_is_voice_and_the_music_is_music(self):
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        plan = self.make_builder().build_closing()
+        self.assertEqual(self.kinds(plan), [
+            ("閉館アナウンス", "voice"), ("追加アナウンス", "voice"), ("蛍の光", "music")])
+
+    def test_the_minimal_plans_have_the_same_kinds(self):
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+
+        moment = datetime(2026, 8, 26, 12, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        hourly = self.make_builder().build_minimal(make_event(moment))
+        closing = self.make_builder().build_minimal(
+            make_event(moment, key="closing", kind="closing", hour=12))
+        self.assertEqual(self.kinds(hourly), [("時報音", "time_signal")])
+        self.assertEqual(self.kinds(closing), [("閉館アナウンス", "voice"), ("蛍の光", "music")])
+
+    def test_text_to_speech_plans_are_voice(self):
+        plan = self.make_builder().build_texts(["一文目なのだ。", "二文目なのだ。"])
+        self.assertEqual([segment.kind for segment in plan.segments], ["voice", "voice"])
+
+    def test_every_segment_of_every_broadcast_has_a_known_kind(self):
+        from chime.audio import SEGMENT_KINDS
+
+        self.config.data["extra_segment"]["weather_hours"] = list(range(10, 17))
+        self.config.data["closing"]["extra_text"] = "本日もご利用ありがとうございました。"
+        builder = self.make_builder()
+        plans = [builder.build_hourly(hour) for hour in range(10, 17)] + [builder.build_closing()]
+        kinds = {segment.kind for plan in plans for segment in plan.segments}
+        self.assertEqual(kinds, set(SEGMENT_KINDS))
+
+    def test_the_kinds_do_not_change_what_is_played(self):
+        # 区分を付けても、積む順番・ラベル・optional・フェードインは今までどおり。
+        plan = self.make_builder().build_closing()
+        self.assertEqual(
+            [(segment.label, segment.optional, segment.fade_in_ms) for segment in plan.segments],
+            [("閉館アナウンス", False, 0), ("蛍の光（2000ms フェードイン）", False, 2000)])
+
+
 class BuildDispatchTest(BuilderTestCase):
     def test_unknown_kind_raises(self):
         from chime.scheduler import Scheduler

@@ -34,7 +34,11 @@
     "pip_lead_seconds": null,
     "prepare_lead_seconds": 45.0,
     "catchup_grace_seconds": 120.0,
-    "max_sleep_seconds": 30.0
+    "max_sleep_seconds": 30.0,
+    "closures": {
+      "dates": [],
+      "ranges": []
+    }
   },
   "audio": {
     "backend": "auto",
@@ -58,7 +62,13 @@
         "{path}"
       ]
     },
-    "mock_max_seconds": 3.0
+    "mock_max_seconds": 3.0,
+    "volume": {
+      "time_signal": 1.0,
+      "voice": 1.0,
+      "music": 1.0
+    },
+    "max_segment_seconds": 600
   },
   "time_signal": {
     "short_pip": {
@@ -143,6 +153,7 @@
   },
   "state": {
     "file": "cache/state.json",
-    "history_file": "cache/history.jsonl"
+    "history_file": "cache/history.jsonl",
+    "pause_file": "cache/pause.json"
   }
 }

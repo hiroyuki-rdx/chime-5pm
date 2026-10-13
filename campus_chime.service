@@ -19,6 +19,9 @@ ExecStart=/usr/bin/python3 /home/pi/campus-chime/campus_chime.py
 # 専用機のため、正常終了・異常終了を問わず必ず復帰させる
 Restart=always
 RestartSec=10
+# 停止要求（SIGTERM）を受けた再生は 1 秒ほどで止まる。30 秒は止まらなかったときの保険
+# （既定の 90 秒を待たずに強制終了する）
+TimeoutStopSec=30
 # 音声デバイスへのアクセスに必要
 SupplementaryGroups=audio
 # 最低限の保護（cache/ への書き込みが必要なため ProtectHome は設定しない）

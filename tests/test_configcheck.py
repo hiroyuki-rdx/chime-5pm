@@ -32,20 +32,22 @@ import tracemalloc
 import types
 import unittest
 import urllib.error
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from unittest import mock
 from zoneinfo import ZoneInfo
 
 from tests.support import ASSETS_DIR, REPO_ROOT, block_network, logs_enabled
 
-from chime import audio, configcheck, phrases, timesignal, weather
+from chime import audio, closures, configcheck, phrases, timesignal, weather
 from chime.app import ChimeApp
 from chime.audio import create_player
 from chime.cli import logging_settings
 from chime.config import (DEFAULT_CONFIG, EXAMPLE_CONFIG_PATH, REMOVED_KEYS, Config,
                           deep_merge, load_config, redundant_keys)
+from chime.closures import ClosureCalendar
 from chime.configcheck import (ERROR, INFO, WARNING, Finding, _TEMPLATE_FIELDS, check_config,
                                sanitized, validate, walk_overrides)
+from chime.pause import PauseStore
 from chime.logsetup import setup_logging
 from chime.scheduler import MAX_LOOKAHEAD_DAYS, Scheduler
 from chime.tts import TTSError, TTSService
@@ -165,6 +167,14 @@ class FakeMixer(object):
         def stop():
             pass
 
+        @staticmethod
+        def set_volume(volume):
+            pass
+
+        @staticmethod
+        def fadeout(milliseconds):
+            pass
+
     @staticmethod
     def init(**kwargs):
         for name, value in kwargs.items():
@@ -181,6 +191,27 @@ class FakeMixer(object):
 
 
 FAKE_PYGAME = types.SimpleNamespace(mixer=FakeMixer)
+
+
+class FakeProcess(object):
+    """``subprocess.Popen`` の代わり。外部コマンドは起動せず、すぐ正常に終わったことにする。"""
+
+    returncode = 0
+
+    def __init__(self, command, *args, **kwargs):
+        self.command = command
+
+    def poll(self):
+        return 0
+
+    def wait(self, timeout=None):
+        return 0
+
+    def terminate(self):
+        pass
+
+    def kill(self):
+        pass
 
 
 def count_wakeups(settings, seconds=1.0, cap=200):
@@ -216,6 +247,21 @@ def isolated_logging():
     finally:
         root.handlers[:] = handlers
         root.setLevel(level)
+
+
+@contextlib.contextmanager
+def captured_records(logger_name):
+    """``logger_name`` のログを拾う（ブロックの間だけ、テスト全体のログ抑制を外す）。"""
+    records = []
+    handler = logging.Handler(logging.NOTSET)
+    handler.emit = records.append
+    logger = logging.getLogger(logger_name)
+    logger.addHandler(handler)
+    try:
+        with logs_enabled():
+            yield records
+    finally:
+        logger.removeHandler(handler)
 
 
 def logging_outcome(config):
@@ -350,8 +396,7 @@ def run_runtime(config):
             # 実機の ``aplay`` と ``mpg123`` だけが見つかる。コマンドの名前が違えば見つからない
             with mock.patch.object(audio.env, "has_command",
                                    side_effect=lambda name: name in ("aplay", "mpg123")), \
-                    mock.patch.object(audio.subprocess, "run",
-                                      return_value=types.SimpleNamespace(returncode=0)):
+                    mock.patch.object(audio.subprocess, "Popen", FakeProcess):
                 try:
                     audio.CommandPlayer(section).play(segments)
                 except audio.PlaybackError as exc:
@@ -373,6 +418,10 @@ class RuntimeTestCase(unittest.TestCase):
         super().setUp()
         block_network(self)
         patcher = mock.patch.object(configcheck, "_reference_moments", _fixed_moments)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # ``audio`` は同じ設定ミスの警告をプロセスで 1 回しか出さない。テストどうしで引きずらない
+        patcher = mock.patch.object(audio, "_warned", set())
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -732,6 +781,61 @@ TOLERATED = [
     ("降水確率の刻みが 0", nested("weather.prerecord.pop_step", 0), "weather.prerecord.pop_step"),
     ("降水確率の刻みが負", nested("weather.prerecord.pop_step", -10), "weather.prerecord.pop_step"),
     ("降水確率の刻みが文字列 x", nested("weather.prerecord.pop_step", "x"), "weather.prerecord.pop_step"),
+    # -- 休館日（書き方の正しくない項目は、その項目だけ無視する。その日は鳴る） --
+    ("休館日の日付の書き方が違う", nested("schedule.closures.dates", ["2026/10/12"]), "schedule.closures.dates"),
+    ("休館日の日付がカレンダーにない", nested("schedule.closures.dates", ["2026-02-30"]), "schedule.closures.dates"),
+    ("休館日の日付が数値", nested("schedule.closures.dates", [20261012]), "schedule.closures.dates"),
+    ("休館日の日付が null", nested("schedule.closures.dates", [None]), "schedule.closures.dates"),
+    ("休館日の項目に date が無い", nested("schedule.closures.dates", [{"name": "学園祭"}]), "schedule.closures.dates"),
+    ("休館日の名前が文字でない", nested("schedule.closures.dates", [{"date": "2026-10-12", "name": 5}]), "schedule.closures.dates"),
+    ("休館日の一覧が文字列", nested("schedule.closures.dates", "2026-10-12"), "schedule.closures.dates"),
+    ("休館日の一覧が辞書", nested("schedule.closures.dates", {"date": "2026-10-12"}), "schedule.closures.dates"),
+    ("休館日の期間に to が無い", nested("schedule.closures.ranges", [{"from": "2026-10-12"}]), "schedule.closures.ranges"),
+    ("休館日の期間が逆", nested("schedule.closures.ranges", [{"from": "2026-10-15", "to": "2026-10-12"}]), "schedule.closures.ranges"),
+    ("休館日の期間が文字列", nested("schedule.closures.ranges", ["2026-10-12"]), "schedule.closures.ranges"),
+    ("休館日の期間の一覧が数値", nested("schedule.closures.ranges", 5), "schedule.closures.ranges"),
+    ("休館日の節が null", nested("schedule.closures", None), "schedule.closures"),
+    ("休館日の節が数値", nested("schedule.closures", 5), "schedule.closures"),
+    ("休館日の節がリスト", nested("schedule.closures", ["2026-10-12"]), "schedule.closures"),
+    ("休館日の一覧が null", nested("schedule.closures.dates", None), None),
+    ("休館日の一覧が空", nested("schedule.closures.ranges", []), None),
+    ("休館日を正しく書いた", nested("schedule.closures", {
+        "dates": ["2026-10-12", {"date": "2026-10-13", "name": "学園祭"}],
+        "ranges": [{"from": "2026-12-28", "to": "2027-01-04", "name": "年末年始"}]}), None),
+    # -- 音量（数として読めなければ 1.0、範囲外は 0〜1 に丸める） --
+    ("音量が文字列", nested("audio.volume.voice", "0.5"), "audio.volume.voice"),
+    ("音量が文字列 x", nested("audio.volume.time_signal", "x"), "audio.volume.time_signal"),
+    ("音量が null", nested("audio.volume.music", None), "audio.volume.music"),
+    ("音量が true", nested("audio.volume.voice", True), "audio.volume.voice"),
+    ("音量がリスト", nested("audio.volume.voice", [0.5]), "audio.volume.voice"),
+    ("音量が NaN", nested("audio.volume.voice", NAN), "audio.volume.voice"),
+    ("音量が 1 より大きい", nested("audio.volume.voice", 1.5), "audio.volume.voice"),
+    ("音量が無限大", nested("audio.volume.music", INF), "audio.volume.music"),
+    ("音量が負", nested("audio.volume.time_signal", -0.5), "audio.volume.time_signal"),
+    ("音量が 10**400", nested("audio.volume.voice", HUGE), "audio.volume.voice"),
+    ("音量の節が null", nested("audio.volume", None), "audio.volume"),
+    ("音量の節が数値", nested("audio.volume", 0.5), "audio.volume"),
+    ("蛍の光の音量を絞る", nested("audio.volume.music", 0.5), None),
+    ("音量 0（無音にする意図）", nested("audio.volume.voice", 0), None),
+    ("音量が整数 1", nested("audio.volume.voice", 1), None),
+    # -- 音源の打ち切り秒数（正の有限の数でなければ 600 秒） --
+    ("打ち切りが 0", nested("audio.max_segment_seconds", 0), "audio.max_segment_seconds"),
+    ("打ち切りが負", nested("audio.max_segment_seconds", -1), "audio.max_segment_seconds"),
+    ("打ち切りが文字列", nested("audio.max_segment_seconds", "600"), "audio.max_segment_seconds"),
+    ("打ち切りが null", nested("audio.max_segment_seconds", None), "audio.max_segment_seconds"),
+    ("打ち切りが true", nested("audio.max_segment_seconds", True), "audio.max_segment_seconds"),
+    ("打ち切りが無限大", nested("audio.max_segment_seconds", INF), "audio.max_segment_seconds"),
+    ("打ち切りが NaN", nested("audio.max_segment_seconds", NAN), "audio.max_segment_seconds"),
+    ("打ち切りが 10**400", nested("audio.max_segment_seconds", HUGE), "audio.max_segment_seconds"),
+    ("打ち切りを短くした", nested("audio.max_segment_seconds", 90), None),
+    ("打ち切りが小数", nested("audio.max_segment_seconds", 12.5), None),
+    # -- 休止の記録の保存先（Config.path が文字に直す。例外にはならない） --
+    ("休止の記録の保存先が null", nested("state.pause_file", None), "state.pause_file"),
+    ("休止の記録の保存先が数値", nested("state.pause_file", 5), "state.pause_file"),
+    ("休止の記録の保存先が true", nested("state.pause_file", True), "state.pause_file"),
+    ("休止の記録の保存先がリスト", nested("state.pause_file", ["cache/pause.json"]), "state.pause_file"),
+    ("休止の記録の保存先が空文字列", nested("state.pause_file", ""), None),
+    ("休止の記録の保存先を変えた", nested("state.pause_file", "/var/lib/chime/pause.json"), None),
     # -- 大きいが日時の範囲に収まる値（指摘なし） --
     ("準備の秒数が 5e10", nested("schedule.prepare_lead_seconds", 5e10), None),
     ("先行の秒数が -1e10", nested("schedule.pip_lead_seconds", -1e10), None),
@@ -1679,7 +1783,9 @@ class NumbersTest(RuntimeTestCase):
                    | {field.key for field in configcheck._FIELDS}
                    | {configcheck._START_HOUR, configcheck._END_HOUR}
                    | {"weather.prerecord.temp_min", "weather.prerecord.temp_max",
-                      "weather.prerecord.pop_step"})
+                      "weather.prerecord.pop_step"}
+                   # ``chime.audio`` が数として読むもの（文字列を読まないので ``_NUMBERS`` とは別の表）
+                   | set(configcheck._VOLUME_KEYS) | {configcheck._MAX_SEGMENT})
         numeric = {path for path, base in configcheck._default_paths()
                    if isinstance(base, (int, float)) and not isinstance(base, bool)}
         self.assertEqual(numeric - covered, set())
@@ -2999,6 +3105,380 @@ class PrerecordTest(RuntimeTestCase):
         self.assertEqual(keys_of(found), [self.HIGH])
 
 
+class StuckMixer(FakeMixer):
+    """鳴り終わらない ``pygame.mixer``（``get_busy`` がいつまでも真）。"""
+
+    class music(FakeMixer.music):
+        @staticmethod
+        def get_busy():
+            return True
+
+
+class ClosuresTest(RuntimeTestCase):
+    """休館日（``schedule.closures``）。書き方の正しくない項目は、その項目だけ無視され、その日は鳴る。"""
+
+    KEY = "schedule.closures"
+    LISTS = ("schedule.closures.dates", "schedule.closures.ranges")
+
+    def baseline(self):
+        return run_runtime(make_config()).events
+
+    def bad_rows(self):
+        return [row for row in TOLERATED if row[2] in self.LISTS]
+
+    def test_the_lists_checked_are_the_lists_the_calendar_reads(self):
+        names = [name for name, _ in configcheck._CLOSURE_LISTS]
+        self.assertEqual(names, list(DEFAULT_CONFIG["schedule"]["closures"]))
+        for name in names:
+            with self.subTest(name):
+                self.assertEqual(len(ClosureCalendar({name: [5]}).problems), 1)
+        self.assertEqual(ClosureCalendar({"other": [5]}).problems, [])
+
+    def test_valid_entries_close_their_days_and_have_no_findings(self):
+        override = nested(self.KEY, {
+            "dates": ["2026-10-12", {"date": "2026-10-13", "name": "学園祭"}],
+            "ranges": [{"from": "2026-10-14", "to": "2026-10-15", "name": "点検"}]})
+        self.assertEqual(validate(make_config(override)), [])
+        run = run_runtime(make_config(override))
+        self.assertEqual(run.failures, {})
+        for day in ("2026-10-12", "2026-10-13", "2026-10-14", "2026-10-15"):
+            self.assertEqual(run.events[day], [], day)
+        self.assertEqual(run.events["2026-10-16"], self.baseline()["2026-10-16"])
+        self.assertTrue(run.events["2026-10-16"])
+
+    def test_the_fix_for_a_range_written_backwards_says_the_order_of_from_and_to(self):
+        # 期間の書き間違いの「直し方」は、from が to と同じ日か前であることまで言う（日付の形だけでは足りない）。
+        config = make_config(nested(self.KEY, {"ranges": [{"from": "2026-12-05", "to": "2026-12-01"}]}))
+        [finding] = [f for f in validate(config) if f.key == "schedule.closures.ranges"]
+        self.assertEqual(finding.level, WARNING)
+        self.assertIn("from は to と同じ日か、それより前の日付にします", finding.hint)
+
+    def test_there_are_rows_for_every_list_and_kind_of_mistake(self):
+        rows = self.bad_rows()
+        self.assertGreaterEqual(len(rows), 10)
+        self.assertEqual({key for _, _, key in rows}, set(self.LISTS))
+
+    def test_a_bad_entry_is_ignored_by_the_runtime_so_the_days_still_chime(self):
+        baseline = self.baseline()
+        for label, override, key in self.bad_rows():
+            with self.subTest(label):
+                config = make_config(override)
+                run = run_runtime(config)
+                self.assertEqual(run.failures, {})
+                self.assertEqual(run.events, baseline)
+                found = validate(config)
+                self.assertEqual([(f.level, f.key) for f in found], [(WARNING, key)])
+
+    def test_the_findings_are_what_the_runtime_logs_as_errors_word_for_word(self):
+        for label, override, key in self.bad_rows():
+            with self.subTest(label):
+                config = make_config(override)
+                found = validate(config)
+                with captured_records("chime.closures") as records:
+                    Scheduler(config.section("schedule"), TZ, 3.0)
+                logged = [record.args[0] for record in records if record.levelno == logging.ERROR]
+                self.assertEqual([f.message for f in found], logged)
+                for finding in found:
+                    self.assertIn(finding.key, finding.message)
+                    self.assertRegex(finding.hint, _JAPANESE)
+
+    def test_a_good_entry_next_to_a_bad_one_still_closes_its_day(self):
+        override = nested("schedule.closures.dates", ["2026/10/12", "2026-10-13"])
+        found = self.assert_tolerated(override, "schedule.closures.dates")
+        self.assertEqual(len(found), 1)
+        events = run_runtime(make_config(override)).events
+        self.assertEqual(events["2026-10-12"], self.baseline()["2026-10-12"])
+        self.assertEqual(events["2026-10-13"], [])
+
+    def test_a_section_that_is_not_an_object_is_reported_once_by_the_section_check(self):
+        baseline = self.baseline()
+        for value in (None, 5, "x", [], ["2026-10-12"], True):
+            with self.subTest(value=value):
+                found = self.assert_tolerated(nested(self.KEY, value), self.KEY)
+                self.assertEqual(len(found), 1)
+                self.assertIn("休館日は 1 日もありません", found[0].message)
+                self.assertEqual(run_runtime(make_config(nested(self.KEY, value))).events, baseline)
+
+    def test_checking_does_not_log_the_problems_a_second_time(self):
+        override = nested("schedule.closures.dates", ["x", 5])
+        with captured_records("chime.closures") as records:
+            ClosureCalendar(make_config(override).get(self.KEY))  # 対照: 作ればログに出る
+        self.assertEqual(len(records), 2)
+        with captured_records("chime.closures") as records:
+            found = validate(make_config(override))
+        self.assertEqual((len(found), records), (2, []))
+
+    def test_the_log_is_switched_back_on_afterwards_even_if_building_the_calendar_fails(self):
+        override = nested("schedule.closures.dates", ["x"])
+        self.assertFalse(closures.logger.disabled)
+        with mock.patch.object(configcheck, "ClosureCalendar", side_effect=RuntimeError("内部の不具合")):
+            found = validate(make_config(override))
+        self.assertFalse(closures.logger.disabled)
+        self.assertEqual([(f.level, f.key) for f in found], [(WARNING, self.KEY)])
+        self.assertIn("検査できませんでした", found[0].message)
+        closures.logger.disabled = True  # 元から止めてあれば、止めたまま戻す
+        self.addCleanup(setattr, closures.logger, "disabled", False)
+        validate(make_config(override))
+        self.assertTrue(closures.logger.disabled)
+
+    def test_many_bad_entries_are_shown_up_to_a_limit_and_then_counted(self):
+        limit = configcheck._MAX_CLOSURE_PROBLEMS
+        found = warnings_of(nested("schedule.closures.dates", ["x"] * (limit + 15)))
+        self.assertEqual(keys_of(found), ["schedule.closures.dates"] * (limit + 1))
+        self.assertIn("ほかにも使えない項目が 15 件", found[-1].message)
+        self.assertEqual(len(warnings_of(nested("schedule.closures.dates", ["x"] * limit))), limit)
+
+    def test_each_list_is_reported_on_its_own_key(self):
+        found = warnings_of(nested(self.KEY, {"dates": ["x"], "ranges": [5]}))
+        self.assertEqual(keys_of(found), list(self.LISTS))
+        self.assertIn("schedule.closures.dates の 1 番目", found[0].message)
+        self.assertIn("schedule.closures.ranges の 1 番目", found[1].message)
+
+    def test_a_misspelled_key_under_closures_is_found_by_the_walk(self):
+        found = walk_overrides({"schedule": {"closures": {"date": ["2026-10-12"]}}})
+        self.assertEqual([(f.level, f.key) for f in found], [(WARNING, "schedule.closures.date")])
+        self.assertIn("schedule.closures.dates", found[0].hint)
+
+    def test_a_check_file_names_the_file_that_holds_the_bad_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "pi.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"schedule": {"closures": {"dates": ["2026/11/03"]}}}, handle)
+            findings = check_config(load_config(path, base_dir=tmp))
+        self.assertEqual([(f.level, f.key, f.source) for f in findings],
+                         [(WARNING, "schedule.closures.dates", path)])
+
+    def test_a_huge_integer_in_a_list_is_never_an_exception_or_an_error(self):
+        """Python 3.11 以降は、4300 桁を超える整数を文字にできない（``ClosureCalendar`` の中でも）。"""
+        for digits, value in ((400, HUGE), (5000, 10 ** 5000)):
+            for name in ("dates", "ranges"):
+                with self.subTest(name=name, digits=digits):
+                    config = make_config(nested(self.KEY + "." + name, [value, {"date": value}]))
+                    found = validate(config)
+                    self.assertEqual([f for f in found if f.level == ERROR], [])
+                    self.assertTrue(all(f.key.startswith(self.KEY) for f in found))
+                    self.assertEqual(sanitized(config)[0], config)
+
+
+class VolumeTest(RuntimeTestCase):
+    """``audio.volume``。数として読めなければ 1.0、範囲外は 0〜1 に丸める。どちらも warning。"""
+
+    VALUES = [0, 0.0, 0.5, 1, 1.0, 1e-9, 1.5, 2, 100, -0.5, -1, INF, -INF, NAN, "0.5", "x", "",
+              None, True, False, [0.5], {"a": 1}, HUGE, -HUGE]
+
+    @staticmethod
+    def runtime_volume(kind, value):
+        """``audio.volume_for`` が実際に返す音量と、警告を出したか。"""
+        with captured_records("chime.audio") as records, mock.patch.object(audio, "_warned", set()):
+            volume = audio.volume_for(audio.Segment("x.wav", kind=kind), {"volume": {kind: value}})
+        return volume, any(record.levelno == logging.WARNING for record in records)
+
+    def test_the_kinds_are_the_ones_the_runtime_and_the_default_config_have(self):
+        self.assertEqual(set(configcheck._VOLUME_KINDS), set(audio.SEGMENT_KINDS))
+        self.assertEqual(set(configcheck._VOLUME_KINDS), set(DEFAULT_CONFIG["audio"]["volume"]))
+        self.assertEqual(configcheck._VOLUME_KEYS,
+                         tuple("audio.volume." + kind for kind in DEFAULT_CONFIG["audio"]["volume"]))
+
+    def test_a_number_is_read_the_way_the_runtime_reads_it(self):
+        # 検査が数として読む値は、chime.audio が読む値と同じ（桁数の多い整数は、符号どおりの無限大）
+        for value in self.VALUES + [-10 ** 4301, 10 ** 4301]:
+            label = "桁数の多い整数" if isinstance(value, int) and abs(value) > 10 ** 300 else repr(value)
+            with self.subTest(value=label):
+                mine, theirs = configcheck._audio_number(value), audio._as_number(value)
+                self.assertEqual(mine is None, theirs is None)
+                if mine is not None:
+                    self.assertEqual(mine, theirs)
+        self.assertEqual(configcheck._audio_number(-HUGE), -INF)
+        self.assertEqual(configcheck._audio_number(HUGE), INF)
+
+    def test_a_finding_appears_exactly_when_the_runtime_warns_and_names_the_volume_it_uses(self):
+        for kind in configcheck._VOLUME_KINDS:
+            key = "audio.volume." + kind
+            for value in self.VALUES:
+                with self.subTest(key=key, value=value):
+                    volume, warned = self.runtime_volume(kind, value)
+                    config = make_config(nested(key, value))
+                    found = [f for f in validate(config) if f.key == key]
+                    self.assertEqual(bool(found), warned)
+                    self.assertEqual(errors_of_config(config), [])
+                    if found:
+                        self.assertEqual([f.level for f in found], [WARNING])
+                        self.assertIn(str(volume), found[0].message)
+                        self.assertIn(configcheck._show(value), found[0].message)
+                        self.assertRegex(found[0].hint, _JAPANESE)
+                        self.assertNotIn("直るまで", found[0].hint)
+
+    def test_a_value_in_range_is_used_as_it_is(self):
+        for value in (0, 0.0, 0.25, 1, 1.0):
+            with self.subTest(value=value):
+                self.assertEqual(self.runtime_volume("voice", value), (float(value), False))
+                self.assertEqual(validate(make_config(nested("audio.volume.voice", value))), [])
+
+    def test_a_negative_volume_is_silence_and_the_message_says_so(self):
+        for kind, label in configcheck._VOLUME_KINDS.items():
+            with self.subTest(kind):
+                found = warnings_of(nested("audio.volume." + kind, -0.5))
+                self.assertIn("無音", found[0].message)
+                self.assertIn(label, found[0].message)
+                self.assertEqual(self.runtime_volume(kind, -0.5), (0.0, True))
+
+    def test_text_is_not_read_as_a_number_even_when_it_looks_like_one(self):
+        """設定の数をふつうに ``float()`` で読むほかのキーと違い、``"0.5"`` は 1.0 になる。"""
+        self.assertEqual(self.runtime_volume("voice", "0.5"), (1.0, True))
+        found = warnings_of(nested("audio.volume.voice", "0.5"))
+        self.assertIn("1.0（絞らない音量）として鳴らします", found[0].message)
+        self.assertNotIn("として読みます", found[0].message)
+
+    def test_the_whole_broadcast_plays_with_a_bad_volume_and_nothing_is_replaced(self):
+        for value in ("loud", None, -3, 7, NAN):
+            with self.subTest(value=value):
+                self.assert_tolerated({"audio": {"volume": {
+                    "time_signal": value, "voice": value, "music": value}}}, "audio.volume.voice")
+
+    def test_a_replaced_volume_section_means_full_volume_for_every_kind(self):
+        for value in (None, 5, "x", []):
+            with self.subTest(value=value):
+                for kind in configcheck._VOLUME_KINDS:
+                    self.assertEqual(
+                        audio.volume_for(audio.Segment("x.wav", kind=kind), {"volume": value}), 1.0)
+                found = self.assert_tolerated(nested("audio.volume", value), "audio.volume")
+                self.assertIn("1.0", found[0].message)
+
+    def test_a_misspelled_kind_is_found_by_the_walk(self):
+        found = walk_overrides({"audio": {"volume": {"voic": 0.5}}})
+        self.assertEqual([(f.level, f.key) for f in found], [(WARNING, "audio.volume.voic")])
+        self.assertIn("audio.volume.voice", found[0].hint)
+
+
+class MaxSegmentSecondsTest(RuntimeTestCase):
+    """``audio.max_segment_seconds``。正の有限の数でなければ 600 秒として扱う（warning）。"""
+
+    KEY = "audio.max_segment_seconds"
+    VALUES = [600, 1, 0.5, 1e-9, 1e9, 1e300, 0, 0.0, -1, -0.5, INF, -INF, NAN, "600", "x", "",
+              None, True, False, [600], {"a": 1}, HUGE, -HUGE]
+
+    @staticmethod
+    def runtime_limit(value):
+        """``audio.max_segment_seconds`` が実際に返す秒数と、警告を出したか。"""
+        with captured_records("chime.audio") as records, mock.patch.object(audio, "_warned", set()):
+            seconds = audio.max_segment_seconds({"max_segment_seconds": value})
+        return seconds, any(record.levelno == logging.WARNING for record in records)
+
+    #: 偽の時計で待つ回数の上限。上限の既定 600 秒を 0.05 秒刻みで待っても 12000 回。これを超えても
+    #: 打ち切られないなら、秒数が効いていない（``NaN`` や ``inf`` は期限に届かず、待ち続ける）。
+    SLEEP_LIMIT = 20000
+
+    def seconds_until_cut(self, value):
+        """鳴り終わらない mp3 を、設定の秒数でどれだけ鳴らして打ち切るか（時計は進めるだけ）。
+
+        打ち切りが効かなくなった退行で、テスト全体が固まらないよう、待つ回数に上限を置く。
+        """
+        clock = {"now": 0.0, "sleeps": 0}
+
+        def sleep(seconds):
+            clock["now"] += seconds
+            clock["sleeps"] += 1
+            if clock["sleeps"] > self.SLEEP_LIMIT:
+                raise AssertionError("{0!r} では打ち切られません（{1} 回待ちました）".format(value, self.SLEEP_LIMIT))
+
+        section = make_config(nested(self.KEY, value)).section("audio")
+        player = audio.PygamePlayer(section, StuckMixer, sleep=sleep, clock=lambda: clock["now"])
+        with self.assertRaises(audio.PlaybackError):
+            player.play([audio.Segment(os.path.join(ASSETS_DIR, "hotaru.mp3"))])
+        return clock["now"]
+
+    def test_the_default_is_what_the_runtime_falls_back_to(self):
+        self.assertEqual(DEFAULT_CONFIG["audio"]["max_segment_seconds"], audio.DEFAULT_MAX_SEGMENT_SECONDS)
+        self.assertEqual(audio.max_segment_seconds({}), audio.DEFAULT_MAX_SEGMENT_SECONDS)
+
+    def test_a_finding_appears_exactly_when_the_runtime_warns_and_names_the_seconds_it_uses(self):
+        for value in self.VALUES:
+            with self.subTest(value=value):
+                seconds, warned = self.runtime_limit(value)
+                config = make_config(nested(self.KEY, value))
+                found = [f for f in validate(config) if f.key == self.KEY]
+                self.assertEqual(bool(found), warned)
+                self.assertEqual(errors_of_config(config), [])
+                if found:
+                    self.assertEqual([f.level for f in found], [WARNING])
+                    self.assertEqual(seconds, audio.DEFAULT_MAX_SEGMENT_SECONDS)
+                    self.assertIn("600 秒として扱います", found[0].message)
+                    self.assertIn(configcheck._show(value), found[0].message)
+                    self.assertRegex(found[0].hint, _JAPANESE)
+                    self.assertNotIn("直るまで", found[0].hint)
+                else:
+                    self.assertEqual(seconds, float(value))
+
+    def test_a_stuck_mp3_is_cut_at_the_configured_seconds_or_at_600_when_the_value_is_unusable(self):
+        for value, expected in ((5, 5), (90.5, 90.5), (0, 600), (-1, 600), ("x", 600), ("30", 600),
+                                (None, 600), (True, 600), (INF, 600), (NAN, 600)):
+            with self.subTest(value=value):
+                self.assertAlmostEqual(self.seconds_until_cut(value), expected, delta=0.1)
+                self.assertEqual(bool(warnings_of(nested(self.KEY, value))), expected == 600)
+
+    def test_a_bad_value_does_not_stop_the_broadcast_and_is_not_replaced(self):
+        for value in (0, -1, "x", None, INF):
+            with self.subTest(value=value):
+                self.assert_tolerated(nested(self.KEY, value), self.KEY)
+
+
+class PauseFileTest(RuntimeTestCase):
+    """``state.pause_file``。保存先は ``Config.path`` が読む。文字列でなくても例外にはならない（warning）。"""
+
+    KEY = "state.pause_file"
+    TODAY = date(2026, 10, 9)
+
+    def setUp(self):
+        super().setUp()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.base = tmp.name
+
+    def config(self, value):
+        return Config(deep_merge(DEFAULT_CONFIG, nested(self.KEY, value)), base_dir=self.base)
+
+    def store(self, value):
+        return PauseStore(self.config(value).path(self.KEY), lambda: self.TODAY)
+
+    def test_text_is_never_a_finding(self):
+        for value in ("cache/pause.json", "", "/var/lib/chime/pause.json", "~/pause.json"):
+            with self.subTest(value=value):
+                self.assertEqual(validate(make_config(nested(self.KEY, value))), [])
+
+    def test_null_means_an_empty_place_so_nothing_can_be_read_or_written(self):
+        config = self.config(None)
+        self.assertEqual(config.path(self.KEY), "")
+        store = self.store(None)
+        self.assertIsNone(store.current())
+        self.assertFalse(store.covers(self.TODAY))  # 読めない → 止めていない（鳴らす側）
+        with self.assertRaises(OSError):
+            store.set(date(2026, 10, 10))
+        found = self.assert_tolerated(nested(self.KEY, None), self.KEY)
+        self.assertIn("保存先が空として扱われる", found[0].message)
+
+    def test_a_number_or_a_flag_is_turned_into_text_and_recorded_in_the_wrong_place(self):
+        for value in (5, 2.5, True):
+            with self.subTest(value=value):
+                path = self.config(value).path(self.KEY)
+                self.assertEqual(path, os.path.join(self.base, str(value)))
+                store = self.store(value)
+                store.set(date(2026, 10, 10))
+                self.assertTrue(store.covers(self.TODAY))  # 動きはする
+                self.assertTrue(os.path.exists(path))
+                self.assertFalse(os.path.exists(os.path.join(self.base, "cache", "pause.json")))
+                found = self.assert_tolerated(nested(self.KEY, value), self.KEY)
+                self.assertIn("意図した場所に記録されません", found[0].message)
+                self.assertIn("文字列で書いてください", found[0].hint)
+
+    def test_the_finding_shows_the_default_place(self):
+        found = warnings_of(nested(self.KEY, 5))
+        self.assertIn("cache/pause.json", found[0].hint)
+        self.assertNotIn("直るまで", found[0].hint)
+
+    def test_the_default_place_is_a_text_in_the_default_config(self):
+        self.assertIsInstance(DEFAULT_CONFIG["state"]["pause_file"], str)
+
+
 class SectionsTest(RuntimeTestCase):
     def test_a_missing_time_signal_section_loses_the_pips_but_not_the_announcement(self):
         run = run_runtime(make_config(nested("time_signal", None)))
@@ -3113,8 +3593,10 @@ class FindingQualityTest(RuntimeTestCase):
 
     BAD_WARNINGS = {
         "schedule": {"hourly": {"start_hour": 17, "weekdays": ["0"], "skip_hours": [24]},
-                     "closing": {"hour": 16.5}},
-        "audio": {"backend": "pygam"},
+                     "closing": {"hour": 16.5},
+                     "closures": {"dates": ["2026/11/02"], "ranges": [{"from": "2026-12-28"}]}},
+        "audio": {"backend": "pygam", "volume": {"voice": 1.5}, "max_segment_seconds": 0},
+        "state": {"pause_file": 5},
         "tts": {"engines": ["voice"]},
         "weather": {"sentence_temp": "{temp",
                     "open_meteo": {"locations": [{"label": "x", "latitude": 135.0, "longitude": 35.0}]},
@@ -3153,7 +3635,9 @@ class FindingQualityTest(RuntimeTestCase):
              "schedule.closing.hour", "audio.backend", "tts.engines", "weather.sentence_temp",
              "weather.open_meteo.locations", "weather.prerecord.temp_max",
              "weather.prerecord.pop_step", "time_signal.announce_template",
-             "time_signal.noon_template", "time_signal.volume", "extra_segment.weather_hours"})
+             "time_signal.noon_template", "time_signal.volume", "extra_segment.weather_hours",
+             "schedule.closures.dates", "schedule.closures.ranges", "audio.volume.voice",
+             "audio.max_segment_seconds", "state.pause_file"})
 
     def test_warnings_say_how_to_fix_it_in_japanese_and_never_promise_a_default(self):
         for finding in warnings_of(self.BAD_WARNINGS):

@@ -4,23 +4,28 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import json
 import os
 import socket
 import tempfile
+import threading
 import unittest
 import urllib.error
 from datetime import date, datetime, timedelta
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from tests.support import (SHIPPED_QUOTES, RecordingPlayer, block_network,
                            logs_enabled, make_event, make_wav)
 
 from chime import buildinfo, phrases
-from chime.app import ChimeApp, PlayOutcome, describe_exception, exception_text
-from chime.audio import Player, PlaybackError
+from chime.app import (INTERRUPTED_TEXT, NO_EVENTS_RECHECK_SECONDS, RETRY_SECONDS, ChimeApp,
+                       PlayOutcome, describe_exception, exception_text, pause_reason)
+from chime.audio import Player, PlaybackError, PlaybackInterrupted
 from chime.config import DEFAULT_CONFIG, Config
 from chime.history import History
-from chime.scheduler import Event, Scheduler
+from chime.pause import Pause
+from chime.scheduler import Event, Scheduler, format_events
 from chime.sequence import PlaybackPlan
 from chime.audio import Segment
 from chime.state import State
@@ -110,6 +115,16 @@ class StubBuilder:
 
 
 class AppTestCase(unittest.TestCase):
+    """設定を一時フォルダに置いた ``ChimeApp``（再生は記録するだけの偽物）。
+
+    本物の待機（``sleep_until`` の中の ``stop_event.wait``）には入らない。時計が進まない・
+    予定が無いなどで本物の待機に入ると、数分から 1 時間は戻らない。退行（再生済みにならない、
+    休止を見逃す、割り込みの結果を無視する、など）があるとテストが固まって CI が止まって
+    しまうので、``stop_event.wait`` を数えるだけの代用品に差し替え、``self.guard`` が上限
+    （``CALL_LIMIT``）を超えて数えたら ``RunawayLoop`` で打ち切る。待ち方を調べるテストは、
+    ``mock.patch.object(self.app.stop_event, "wait", …)`` で、さらに上から差し替える。
+    """
+
     def setUp(self):
         block_network(self)
         self.tmp = tempfile.TemporaryDirectory()
@@ -125,6 +140,13 @@ class AppTestCase(unittest.TestCase):
         self.player = RecordingPlayer()
         self.app._player = self.player
         self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")])
+        self.guard = CallGuard()
+        self.app.stop_event.wait = self.never_really_wait
+
+    def never_really_wait(self, timeout=None):
+        """``stop_event.wait`` の代わり。待たずに数えて、止まったかを返す（上限を超えたら ``RunawayLoop``）。"""
+        self.guard.tick("stop_event.wait")
+        return self.app.stop_event.is_set()
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -165,9 +187,9 @@ class RunEventTest(AppTestCase):
         calls = []
         real = self.app.scheduler.sleep_until
 
-        def spying(target, stop=None, precise=False):
+        def spying(target, stop=None, precise=False, interrupt=None):
             calls.append((target, precise))
-            return real(target, stop, precise)
+            return real(target, stop, precise, interrupt)
 
         self.app.scheduler.sleep_until = spying
         self.app.run_event(event)
@@ -332,14 +354,22 @@ class PendingEventHelpersTest(AppTestCase):
 
         self.app.scheduler.next_event = fake_next
         self.assertIs(self.app._next_pending_event(), sentinel)
-        self.assertEqual(calls, [((), {"is_fired": self.app._is_fired})])
+        [(args, kwargs)] = calls
+        self.assertEqual((args, list(kwargs)), ((), ["is_fired"]))
+        # 再生済みかどうかは、呼ぶ時点の state を見る（休止の判定も同じ関数に入っている）。
+        event = self.past_event()
+        self.assertFalse(kwargs["is_fired"](event))
+        self.app.state.mark_fired(event.key, event.day)
+        self.assertTrue(kwargs["is_fired"](event))
 
     def test_next_pending_event_reads_the_scheduler_at_call_time(self):
         event = self.past_event()
         self.app.scheduler = mock.Mock()
         self.app.scheduler.next_event.return_value = event
         self.assertIs(self.app._next_pending_event(), event)
-        self.app.scheduler.next_event.assert_called_once_with(is_fired=self.app._is_fired)
+        self.app.scheduler.next_event.assert_called_once()
+        args, kwargs = self.app.scheduler.next_event.call_args
+        self.assertEqual((args, list(kwargs)), ((), ["is_fired"]))
 
     def test_next_pending_event_skips_an_event_already_fired(self):
         wednesday = datetime(2026, 8, 26, 9, 0, tzinfo=self.app.tzinfo)
@@ -410,8 +440,15 @@ class BuildPlanTest(AppTestCase):
 
 class RunForeverTest(AppTestCase):
     def _drive(self, event):
-        """イベントを 1 件だけ返し、再生済みになったら停止するスケジューラ。"""
+        """イベントを 1 件だけ返し、再生済みになったら停止するスケジューラ。
+
+        再生済みにならない退行（``is_fired`` が効かない）では、同じ放送を鳴らし続けて止まらない。
+        呼び出し回数を数え、上限を超えたら ``RunawayLoop`` で打ち切る。
+        """
+        guard = CallGuard()
+
         def fake_next(is_fired=None):
+            guard.tick("next_event")
             if is_fired is not None and is_fired(event):
                 self.app.stop_event.set()
                 return None
@@ -450,8 +487,10 @@ class RunForeverTest(AppTestCase):
         ``self.state`` を見る（構築後に差し替えても追従する）。"""
         event = self.past_event()
         calls = []
+        guard = CallGuard()
 
         def fake_next(*args, **kwargs):
+            guard.tick("next_event")
             calls.append((args, sorted(kwargs)))
             if kwargs["is_fired"](event):
                 self.app.stop_event.set()
@@ -499,7 +538,7 @@ class RunForeverTest(AppTestCase):
             guard.tick("next_event")
             return event
 
-        def stopping_sleep_until(target, stop=None, precise=False):
+        def stopping_sleep_until(target, stop=None, precise=False, interrupt=None):
             self.app.stop_event.set()
             return False
 
@@ -1210,8 +1249,10 @@ class HistoryFailureTest(HistoryTestCase):
         first = self.past_event(10.0)
         second = make_event(first.at + timedelta(seconds=5), key="hourly:11", hour=11)
         events = [first, second]
+        guard = CallGuard()
 
         def fake_next(is_fired=None):
+            guard.tick("next_event")
             for event in events:
                 if not is_fired(event):
                     return event
@@ -1228,7 +1269,10 @@ class RunForeverHistoryTest(HistoryTestCase):
     """常駐ループの中の履歴。例外で終わった回も「error」として残す。"""
 
     def drive(self, event):
+        guard = CallGuard()
+
         def fake_next(is_fired=None):
+            guard.tick("next_event")      # 再生済みにならない退行で、止まらずに回り続けないように
             if is_fired is not None and is_fired(event):
                 self.app.stop_event.set()
                 return None
@@ -1550,7 +1594,9 @@ class RunForeverResilienceTest(AppTestCase):
                   if record.getMessage().startswith("次回以降の予定:")]
         self.assertEqual(len(listed), 1)
 
-    def test_no_pending_event_still_waits_60_seconds_with_the_same_message(self):
+    def test_no_pending_event_waits_in_interruptible_steps_and_warns(self):
+        # 予定が無いときの待ちは、停止要求に応えられるよう scheduler.sleep_until の
+        # 刻み（max_sleep_seconds ずつ）で待つ。1 度の警告に、再確認の間隔を書く。
         waits = self.stub_waits(stop_after=1)
 
         def no_event(is_fired=None):
@@ -1559,9 +1605,10 @@ class RunForeverResilienceTest(AppTestCase):
         self.app.scheduler.next_event = no_event
         with logs_enabled(), self.assertLogs("chime.app", level="WARNING") as captured:
             self.assertEqual(self.app.run_forever(), 0)
-        self.assertEqual(waits, [(60, 0)])
-        self.assertIn("予定されたイベントがありません。60 秒後に再確認します。",
-                      [record.getMessage() for record in captured.records])
+        self.assertEqual(waits, [(30.0, 0)])
+        [warning] = [record.getMessage() for record in captured.records
+                     if record.getMessage().startswith("予定されたイベントがありません")]
+        self.assertIn("60 分ごとに再確認します", warning)
 
     def test_a_changed_schedule_is_logged_and_recalculated(self):
         self.stub_waits()
@@ -1592,6 +1639,1047 @@ class RunForeverResilienceTest(AppTestCase):
         self.app.scheduler.next_event = fake_next
         self.app.run_forever()
         self.assertFalse(self.app.state.is_fired(event.key, event.day))
+
+
+# ---------------------------------------------------------------------------
+# 休止（「今日だけ止める」）・中断・予定が無いときの待ち
+# ---------------------------------------------------------------------------
+TOKYO = ZoneInfo("Asia/Tokyo")
+
+#: 2026-10-14 は水曜日。既定のスケジュールでは、時報（10〜16 時）と閉館放送（16:57）が鳴る日。
+WEDNESDAY = datetime(2026, 10, 14, 9, 30, tzinfo=TOKYO)
+THURSDAY_DATE = date(2026, 10, 15)
+
+
+class PauseTestCase(HistoryTestCase):
+    """時計を水曜の朝に止めた ``ChimeApp``。休止の記録は一時フォルダの ``cache/pause.json``。
+
+    時計は止まっているので、本物の待機に入ると時刻が進まず永久に終わらない。``AppTestCase`` の
+    ``stop_event.wait`` の代用品（``self.guard`` で数えて、``CALL_LIMIT`` を超えたら ``RunawayLoop``）が
+    それを打ち切る。偽の ``sleep_until``（:meth:`install_sleeper`）も同じ ``guard`` で数える。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.moment = WEDNESDAY
+        self.app.now = lambda: self.moment
+        self.app.scheduler = Scheduler(DEFAULT_CONFIG["schedule"], self.app.tzinfo, 3.0,
+                                       clock=self.app.now)
+
+    def set_pause(self, last_day=date(2026, 10, 14), reason="点検"):
+        """現地で ``--pause-today`` / ``--pause-until`` を実行したのと同じ記録を書く。"""
+        return self.app.pause.set(last_day, reason, now=self.moment)
+
+    def write_pause(self, first_day, last_day, reason=""):
+        """今日より先から始まる記録など、``set`` では作れない記録を直接書く。"""
+        os.makedirs(os.path.dirname(self.app.pause.path), exist_ok=True)
+        with open(self.app.pause.path, "w", encoding="utf-8") as handle:
+            json.dump({"v": 1, "first_day": first_day.isoformat(), "last_day": last_day.isoformat(),
+                       "set_at": self.moment.isoformat(), "reason": reason}, handle)
+
+    def scheduled(self, key="hourly:10", day=date(2026, 10, 14)):
+        """スケジュールどおりのイベント（日付と key で選ぶ）。"""
+        [found] = [event for event in self.app.scheduler.events_for_date(day) if event.key == key]
+        return found
+
+    def install_sleeper(self, *behaviours):
+        """``scheduler.sleep_until`` の代わり。呼び出しを記録し、呼び出しごとの振る舞いを順に実行する。
+
+        振る舞いは ``(target, interrupt)`` を受けて、戻り値（待ち終えたか）を返す関数。
+        尽きたあとは、すぐ ``True``（待ち終えた）を返す。呼び出しは ``self.guard`` で数え、
+        ``CALL_LIMIT`` 回を超えたら ``RunawayLoop``（ループが止まらない退行で固まらない）。
+        """
+        calls = []
+        script = list(behaviours)
+
+        def fake(target, stop=None, precise=False, interrupt=None):
+            self.guard.tick("sleep_until")   # 尽きたあとも True を返し続けるので、止まらないループは打ち切る
+            calls.append({"target": target, "stop": stop, "precise": precise, "interrupt": interrupt})
+            return script.pop(0)(target, interrupt) if script else True
+
+        self.app.scheduler.sleep_until = fake
+        return calls
+
+    def skipped_entry(self):
+        entry = self.only_entry()
+        self.assertEqual(entry["result"], "skipped", entry)
+        return entry
+
+
+class PauseStoreWiringTest(PauseTestCase):
+    def test_the_record_lives_in_the_configured_place(self):
+        self.assertEqual(self.app.pause.path, os.path.join(self.root, "cache", "pause.json"))
+        self.assertEqual(self.app.pause.path, self.app.config.path("state.pause_file"))
+
+    def test_today_follows_the_apps_clock_in_the_configured_zone(self):
+        self.moment = datetime(2026, 10, 14, 23, 30, tzinfo=TOKYO)
+        self.assertEqual(self.set_pause().first_day, date(2026, 10, 14))
+        self.moment = datetime(2026, 10, 15, 0, 30, tzinfo=TOKYO)
+        self.assertIsNone(self.app.pause.current())  # 翌日 0 時を過ぎれば、今日だけの休止は切れる
+
+    def test_an_empty_place_means_pausing_is_not_used(self):
+        config = Config(DEFAULT_CONFIG, base_dir=self.root)
+        config.data["state"]["pause_file"] = ""
+        app = ChimeApp(config, backend="mock")
+        self.assertEqual(app.pause.path, "")
+        self.assertIsNone(app.pause.current())
+        self.assertFalse(app.pause.changed())
+        self.assertFalse(app.pause.changed())
+
+    def test_pause_reason_reads_well_in_the_log_and_the_history(self):
+        pause = Pause(date(2026, 10, 14), date(2026, 10, 14), WEDNESDAY, "学園祭の準備")
+        self.assertEqual(pause_reason(pause), "休止: 学園祭の準備")
+        self.assertEqual(pause_reason(Pause(date(2026, 10, 14), date(2026, 10, 14), WEDNESDAY, "")),
+                         "休止")
+
+
+class PauseSelectionTest(PauseTestCase):
+    """休止中の日のイベントは、選ばれない（再生済みにはしない）。"""
+
+    def test_without_a_pause_the_next_event_is_the_ten_oclock_chime(self):
+        event = self.app._next_pending_event()
+        self.assertEqual((event.key, event.day), ("hourly:10", "2026-10-14"))
+
+    def test_a_paused_day_is_skipped_and_the_next_day_comes_first(self):
+        self.set_pause()
+        event = self.app._next_pending_event()
+        self.assertEqual((event.key, event.day), ("hourly:10", "2026-10-15"))
+
+    def test_a_pause_over_a_weekend_resumes_on_monday(self):
+        self.set_pause(date(2026, 10, 16))
+        event = self.app._next_pending_event()
+        self.assertEqual((event.key, event.day), ("hourly:10", "2026-10-19"))
+
+    def test_a_pause_for_another_day_changes_nothing(self):
+        self.write_pause(THURSDAY_DATE, THURSDAY_DATE)
+        event = self.app._next_pending_event()
+        self.assertEqual((event.key, event.day), ("hourly:10", "2026-10-14"))
+
+    def test_an_event_of_the_first_unpaused_day_is_still_chosen_by_its_own_day(self):
+        self.write_pause(date(2026, 10, 14), date(2026, 10, 14))
+        self.moment = datetime(2026, 10, 14, 16, 0, tzinfo=TOKYO)
+        self.assertEqual(self.app._next_pending_event().day, "2026-10-15")
+
+    def test_a_pause_that_has_ended_does_not_matter(self):
+        self.write_pause(date(2026, 10, 12), date(2026, 10, 13))
+        self.assertEqual(self.app._next_pending_event().day, "2026-10-14")
+
+    def test_a_broken_pause_file_is_not_a_pause_and_warns_once(self):
+        os.makedirs(os.path.dirname(self.app.pause.path))
+        with open(self.app.pause.path, "w", encoding="utf-8") as handle:
+            handle.write("{ this is not json")
+        with logs_enabled(), self.assertLogs("chime.pause", level="WARNING") as captured:
+            first = self.app._next_pending_event()
+            second = self.app._next_pending_event()
+        self.assertEqual((first.day, second.day), ("2026-10-14", "2026-10-14"))
+        self.assertEqual(len(captured.records), 1)
+        self.assertIn("放送は通常どおり行います", captured.records[0].getMessage())
+
+    def test_a_failing_pause_store_does_not_stop_the_selection(self):
+        with mock.patch.object(self.app.pause, "current", side_effect=RuntimeError("壊れた")), \
+                logs_enabled(), self.assertLogs("chime.app", level="WARNING") as captured:
+            event = self.app._next_pending_event()
+        self.assertEqual(event.day, "2026-10-14")
+        self.assertIn("放送は通常どおり行います", captured.records[0].getMessage())
+        self.assertIn("RuntimeError: 壊れた", captured.records[0].getMessage())
+
+    def test_the_pause_is_read_once_per_selection(self):
+        self.set_pause(date(2026, 10, 30))
+        with mock.patch.object(self.app.pause, "current",
+                               wraps=self.app.pause.current) as current:
+            event = self.app._next_pending_event()
+        self.assertEqual(event.day, "2026-11-02")  # 10/30 は金曜。週末を挟んで、次は月曜
+        self.assertEqual(current.call_count, 1)
+
+    def test_a_just_missed_event_plays_once_the_pause_is_lifted_within_the_grace(self):
+        self.moment = datetime(2026, 10, 14, 10, 0, 30, tzinfo=TOKYO)  # 再生開始 9:59:57 の 33 秒後
+        self.set_pause()
+        self.assertEqual(self.app._next_pending_event().day, "2026-10-15")
+        self.app.pause.clear()
+        event = self.app._next_pending_event()
+        self.assertEqual((event.key, event.day), ("hourly:10", "2026-10-14"))
+
+    def test_a_pause_lifted_after_the_grace_does_not_replay_the_missed_event(self):
+        self.moment = datetime(2026, 10, 14, 10, 3, 0, tzinfo=TOKYO)  # 猶予の 120 秒を過ぎた
+        self.set_pause()
+        self.app.pause.clear()
+        self.assertEqual(self.app._next_pending_event().key, "hourly:11")
+
+    def test_a_paused_event_is_not_marked_fired(self):
+        self.set_pause()
+        event = self.scheduled()
+        self.app._next_pending_event()
+        self.assertFalse(self.app._is_fired(event))
+
+
+class RunEventPauseTest(PauseTestCase):
+    """``run_event`` は、組み立てる直前と再生する直前に休止を確かめる。"""
+
+    def test_a_pause_before_the_build_plays_nothing_and_does_not_mark_fired(self):
+        self.set_pause()
+        event = self.scheduled()
+        self.app.run_event(event)
+        self.assertEqual(self.app.builder.built, [])
+        self.assertEqual(self.player.played, [])
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+
+    def test_the_skip_is_recorded_in_the_history_with_the_reason(self):
+        self.set_pause(reason="学園祭の準備")
+        event = self.scheduled()
+        self.app.run_event(event)
+        entry = self.skipped_entry()
+        self.assertEqual((entry["kind"], entry["key"], entry["day"]), ("hourly", "hourly:10", "2026-10-14"))
+        self.assertEqual(entry["at"], event.at.isoformat(timespec="seconds"))
+        self.assertEqual((entry["played"], entry["total"]), (0, 0))
+        self.assertEqual(entry["reason"], "休止: 学園祭の準備")
+        self.assertNotIn("error", entry)
+
+    def test_a_pause_without_a_reason_says_just_paused(self):
+        self.set_pause(reason="")
+        self.app.run_event(self.scheduled())
+        self.assertEqual(self.skipped_entry()["reason"], "休止")
+
+    def test_a_pause_set_while_waiting_for_the_play_time_skips(self):
+        event = self.scheduled()
+
+        def operator_pauses(target, interrupt):
+            self.set_pause()
+            self.assertTrue(interrupt())  # 待機の割り込みの確認が、休止に気づく
+            return False
+
+        calls = self.install_sleeper(operator_pauses)
+        self.app.run_event(event)
+        self.assertEqual(self.app.builder.built, [event])  # 組み立ては、休止の前に済んでいた
+        self.assertEqual(self.player.played, [])
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+        self.assertEqual(len(calls), 1)
+        self.skipped_entry()
+
+    def test_a_pause_set_in_the_last_moment_is_still_noticed_right_before_playing(self):
+        # 待機が（割り込みを見ないまま）終わり、そのあとで休止が書かれた。
+        event = self.scheduled()
+
+        def operator_pauses_at_the_last_moment(target, interrupt):
+            self.set_pause()
+            return True
+
+        self.install_sleeper(operator_pauses_at_the_last_moment)
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [])
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+        self.skipped_entry()
+
+    def test_the_wait_is_given_an_interrupt_that_is_true_only_while_the_pause_covers_the_event(self):
+        event = self.scheduled()
+        seen = []
+
+        def look(target, interrupt):
+            seen.append(interrupt())            # 休止なし
+            self.write_pause(THURSDAY_DATE, THURSDAY_DATE)
+            seen.append(interrupt())            # 別の日の休止
+            self.set_pause()
+            seen.append(interrupt())            # このイベントの日の休止
+            self.app.pause.clear()
+            seen.append(interrupt())            # 解除
+            return True
+
+        calls = self.install_sleeper(look)
+        self.app.run_event(event)
+        self.assertEqual(seen, [False, False, True, False])
+        self.assertEqual(calls[0]["target"], event.play_at)
+        self.assertIs(calls[0]["precise"], True)
+        self.assertIs(calls[0]["stop"], self.app.stop_event)
+        self.assertEqual(self.player.played, [self.wav])  # 解除されたので、鳴らす
+
+    def test_a_pause_lifted_right_after_the_interrupt_waits_again_instead_of_playing_early(self):
+        event = self.scheduled()
+
+        def paused_then_lifted(target, interrupt):
+            self.set_pause()
+            self.assertTrue(interrupt())
+            self.app.pause.clear()
+            return False                          # 休止が効いたので待ちを打ち切った、が、もう解けた
+
+        calls = self.install_sleeper(paused_then_lifted)
+        self.app.run_event(event)
+        # 再生の時刻より前に鳴らさない。もう一度、再生の時刻まで待つ（こんどは休止では打ち切らない）。
+        self.assertEqual([call["target"] for call in calls], [event.play_at, event.play_at])
+        self.assertIsNotNone(calls[0]["interrupt"])
+        self.assertIsNone(calls[1]["interrupt"])
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+        self.assertEqual(self.entries()[0]["result"], "ok")
+
+    def test_a_stop_request_beats_a_pause_and_leaves_no_skip_entry(self):
+        event = self.scheduled()
+
+        def stop_and_pause(target, interrupt):
+            self.app.stop_event.set()
+            self.set_pause()
+            return False
+
+        self.install_sleeper(stop_and_pause)
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [])
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+        self.assertEqual(self.entries(), [])
+
+    def test_the_skip_is_logged(self):
+        self.set_pause(reason="点検")
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_event(self.scheduled())
+        messages = [record.getMessage() for record in captured.records]
+        self.assertTrue(any(message.startswith("休止中のため鳴らしません（休止: 点検）") for message in messages),
+                        messages)
+
+    def test_a_pause_for_another_day_plays_normally(self):
+        self.write_pause(THURSDAY_DATE, THURSDAY_DATE)
+        event = self.past_event()
+        self.install_sleeper()
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+        self.assertEqual(self.only_entry()["result"], "ok")
+
+    def test_a_broken_pause_file_plays_normally(self):
+        os.makedirs(os.path.dirname(self.app.pause.path))
+        with open(self.app.pause.path, "wb") as handle:
+            handle.write(b"\xff\xfe not utf-8")
+        event = self.scheduled()
+        self.install_sleeper()
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+    def test_a_pause_that_is_a_directory_plays_normally(self):
+        os.makedirs(self.app.pause.path)
+        event = self.scheduled()
+        self.install_sleeper()
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [self.wav])
+
+    def test_a_failing_pause_store_never_stops_the_broadcast(self):
+        event = self.scheduled()
+        self.install_sleeper()
+        with mock.patch.object(self.app.pause, "current", side_effect=RuntimeError("壊れた")), \
+                logs_enabled(), self.assertLogs("chime.app", level="WARNING"):
+            self.app.run_event(event)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+
+    def test_a_failing_pause_store_does_not_break_the_real_wait(self):
+        # 本物の sleep_until の上で（偽の待機に置き換えない）。休止の確認が失敗しても鳴る。
+        self.moment = datetime(2026, 10, 14, 9, 59, 57, tzinfo=TOKYO)
+        event = self.scheduled()
+        with mock.patch.object(self.app.pause, "current", side_effect=RuntimeError("壊れた")), \
+                logs_enabled(), self.assertLogs(level="WARNING"):
+            self.app.run_event(event)
+        self.assertEqual(self.player.played, [self.wav])
+
+    def test_a_dry_run_skips_without_writing_a_history(self):
+        self.app.dry_run = True
+        self.set_pause()
+        event = self.scheduled()
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [])
+        self.assertEqual(self.app.builder.built, [])
+        self.assertFalse(os.path.exists(self.history_path))
+
+    def test_the_quote_is_not_used_up_by_a_paused_broadcast(self):
+        self.app.builder = StubBuilder([Segment(self.wav, label="テスト音")], quote="ひとこと")
+        self.set_pause()
+        self.app.run_event(self.scheduled())
+        self.assertEqual(self.app.state.recent_quotes(), [])
+
+
+class PauseLoopTest(PauseTestCase):
+    """常駐ループ: 待っているあいだに休止が書かれたら、待つのをやめて選び直す。"""
+
+    def test_the_prepare_wait_is_interrupted_by_a_change_of_the_pause_record(self):
+        calls = self.install_sleeper(lambda target, interrupt: self.app.stop_event.set() or False)
+        self.app.run_forever()
+        self.assertEqual(calls[0]["target"], self.scheduled().prepare_at)
+        self.assertEqual(calls[0]["interrupt"], self.app.pause.changed)
+        self.assertIs(calls[0]["stop"], self.app.stop_event)
+
+    def test_a_pause_set_while_waiting_means_no_chime_that_day(self):
+        today, tomorrow = self.scheduled(), self.scheduled(day=THURSDAY_DATE)
+
+        def operator_pauses(target, interrupt):
+            self.assertFalse(interrupt())    # 待ち始めは、変化なし
+            self.set_pause()                  # 現地で --pause-today
+            self.assertTrue(interrupt())     # 待機中の確認が、書き換わりに気づく
+            return False
+
+        def stop(target, interrupt):
+            self.app.stop_event.set()
+            return False
+
+        calls = self.install_sleeper(operator_pauses, stop)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.assertEqual(self.app.run_forever(), 0)
+        # 選び直した次の待ちは、翌日の 10 時の準備。今日のイベントは何も起きない。
+        self.assertEqual([call["target"] for call in calls], [today.prepare_at, tomorrow.prepare_at])
+        self.assertEqual(self.app.builder.built, [])
+        self.assertEqual(self.player.played, [])
+        self.assertFalse(self.app.state.is_fired(today.key, today.day))
+        self.assertEqual(self.entries(), [])
+        self.assertIn("休止の記録が変わりました。予定を選び直します。",
+                      [record.getMessage() for record in captured.records])
+
+    def test_the_change_baseline_is_taken_before_the_pause_is_read(self):
+        # 変化の基準は、休止の記録を読む前に取る。読んだあとに取ると、その間の書き換えを見逃す。
+        self.install_sleeper(lambda target, interrupt: self.app.stop_event.set() or False)
+        order = []
+        real_changed, real_pending = self.app.pause.changed, self.app._next_pending_event
+        self.app.pause.changed = lambda: order.append("changed") or real_changed()
+        self.app._next_pending_event = lambda: order.append("pending") or real_pending()
+        self.app.run_forever()
+        self.assertEqual(order[:2], ["changed", "pending"])
+
+    def test_a_pause_lifted_within_the_grace_plays_the_just_missed_chime(self):
+        self.moment = datetime(2026, 10, 14, 10, 0, 30, tzinfo=TOKYO)
+        self.set_pause()
+        missed, next_one = self.scheduled(), self.scheduled("hourly:11")
+
+        def operator_lifts(target, interrupt):
+            self.assertFalse(interrupt())
+            self.app.pause.clear()           # 現地で --pause-off
+            self.assertTrue(interrupt())
+            return False
+
+        def stop(target, interrupt):
+            self.app.stop_event.set()
+            return False
+
+        # 1 回目: 翌日の準備を待つ（解除で中断）。2・3 回目: 取りこぼした 10 時の準備と再生の時刻
+        # （どちらも過去）。4 回目: その次（11 時）の準備を待って、停止する。
+        calls = self.install_sleeper(operator_lifts, lambda t, i: True, lambda t, i: True, stop)
+        self.assertEqual(self.app.run_forever(), 0)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(missed.key, missed.day))
+        self.assertEqual(calls[1]["target"], missed.prepare_at)
+        self.assertEqual(calls[3]["target"], next_one.prepare_at)
+        self.assertEqual(self.only_entry()["result"], "ok")
+
+    def test_a_pause_that_starts_after_the_prepare_wait_is_caught_by_the_recheck(self):
+        # 待機が（割り込みなしで）終わった直後に休止が書かれた。再確認が、別の予定を選び直す。
+        today, tomorrow = self.scheduled(), self.scheduled(day=THURSDAY_DATE)
+
+        def pause_then_wake(target, interrupt):
+            self.set_pause()
+            return True
+
+        def stop(target, interrupt):
+            self.app.stop_event.set()
+            return False
+
+        calls = self.install_sleeper(pause_then_wake, stop)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_forever()
+        self.assertEqual(self.app.builder.built, [])
+        self.assertEqual(calls[1]["target"], tomorrow.prepare_at)
+        self.assertFalse(self.app.state.is_fired(today.key, today.day))
+        self.assertIn("待機中に予定が変わりました。再計算します。",
+                      [record.getMessage() for record in captured.records])
+
+    def test_startup_tells_that_a_pause_is_in_effect(self):
+        self.set_pause(reason="点検")
+        self.install_sleeper(lambda target, interrupt: self.app.stop_event.set() or False)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_forever()
+        messages = [record.getMessage() for record in captured.records]
+        self.assertIn("休止の記録があります（2026-10-14〜2026-10-14。休止: 点検）。この間の放送は鳴らしません。",
+                      messages)
+
+    def test_startup_says_nothing_about_the_pause_when_there_is_none(self):
+        self.install_sleeper(lambda target, interrupt: self.app.stop_event.set() or False)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_forever()
+        self.assertFalse([record for record in captured.records if "休止" in record.getMessage()])
+
+
+class NoEventsWaitTest(PauseTestCase):
+    """予定が無いときの待ち: 警告は途切れごとに 1 度、再確認は 1 時間おき。"""
+
+    def no_events(self):
+        self.guard = CallGuard()
+
+        def none(is_fired=None):
+            self.guard.tick("next_event")
+
+        self.app.scheduler.next_event = none
+
+    def stop_after(self, count):
+        """``count`` 回目の待ちで停止を求める ``sleep_until`` の代わり。"""
+        waits = []
+
+        def sleeping(target, stop=None, precise=False, interrupt=None):
+            self.guard.tick("sleep_until")
+            waits.append((target, stop, interrupt))
+            if len(waits) >= count:
+                self.app.stop_event.set()
+            return False
+
+        self.app.scheduler.sleep_until = sleeping
+        return waits
+
+    def warnings(self, captured):
+        return [record.getMessage() for record in captured.records
+                if record.getMessage().startswith("予定されたイベントがありません")]
+
+    def test_the_recheck_interval_is_an_hour(self):
+        self.assertEqual(NO_EVENTS_RECHECK_SECONDS, 3600)
+        self.assertEqual(RETRY_SECONDS, 60)   # 例外のあとのやり直しは、今までどおり
+
+    def test_the_warning_is_logged_once_for_a_whole_stretch(self):
+        self.no_events()
+        waits = self.stop_after(5)
+        with logs_enabled(), self.assertLogs("chime.app", level="WARNING") as captured:
+            self.assertEqual(self.app.run_forever(), 0)
+        self.assertEqual(len(waits), 5)
+        [warning] = self.warnings(captured)
+        self.assertEqual(warning, "予定されたイベントがありません。60 分ごとに再確認します"
+                                  "（この警告は予定が見つかるまで繰り返しません）。")
+
+    def test_it_waits_an_hour_at_a_time_and_can_be_woken_by_stop_or_pause(self):
+        self.no_events()
+        waits = self.stop_after(2)
+        self.app.run_forever()
+        for target, stop, interrupt in waits:
+            self.assertEqual(target, WEDNESDAY + timedelta(seconds=3600))
+            self.assertIs(stop, self.app.stop_event)
+            self.assertEqual(interrupt, self.app.pause.changed)
+
+    def test_the_warning_comes_back_after_an_event_has_been_found(self):
+        self.guard = CallGuard()
+        event = self.scheduled()
+        answers = [None, None, event, None, None]
+
+        def next_event(is_fired=None):
+            self.guard.tick("next_event")
+            return answers.pop(0) if answers else None
+
+        self.app.scheduler.next_event = next_event
+        # 見つかったイベントの準備の待ち（3 回目の選択）は、中断して選び直す。
+        sleeps = []
+
+        def sleeping(target, stop=None, precise=False, interrupt=None):
+            self.guard.tick("sleep_until")
+            sleeps.append(target)
+            if len(sleeps) >= 6:
+                self.app.stop_event.set()
+            return False
+
+        self.app.scheduler.sleep_until = sleeping
+        with logs_enabled(), self.assertLogs("chime.app", level="WARNING") as captured:
+            self.app.run_forever()
+        self.assertEqual(len(self.warnings(captured)), 2)
+
+    def test_a_change_of_the_pause_record_wakes_the_wait(self):
+        # 本物の sleep_until の上で。待ち始めた時点の基準と比べ、書き換わっていたらすぐ戻る。
+        self.app.pause.changed()
+        self.set_pause()
+        with mock.patch.object(self.app.stop_event, "wait",
+                               side_effect=AssertionError("待ってはいけない")):
+            self.app._wait_without_events()
+
+    def test_a_stop_request_ends_the_wait(self):
+        self.app.stop_event.set()
+        with mock.patch.object(self.app.stop_event, "wait",
+                               side_effect=AssertionError("待ってはいけない")):
+            self.app._wait_without_events()
+
+    def test_the_loop_stays_quiet_in_the_log_apart_from_the_one_warning(self):
+        self.no_events()
+        self.stop_after(4)
+        with logs_enabled(), self.assertLogs("chime.app", level="WARNING") as captured:
+            self.app.run_forever()
+        warnings = [record for record in captured.records if record.levelno >= 30]
+        self.assertEqual(len([r for r in warnings if "予定されたイベントがありません" in r.getMessage()]), 1)
+
+
+class FailFastGuardTest(PauseTestCase):
+    """退行しても、休止まわりのテストは固まらずに失敗する（``PauseTestCase`` の guard が効いている）。"""
+
+    def test_a_real_wait_on_the_frozen_clock_is_cut_off(self):
+        # 休止を見逃す退行（_skip_if_paused が常に False）を作る。本物の待機に入るが、時計が止まって
+        # いるので終わらない。数えるだけの stop_event.wait が、上限で RunawayLoop にする。
+        self.set_pause()
+        self.app._skip_if_paused = lambda event: False
+        with self.assertRaises(RunawayLoop):
+            self.app.run_event(self.scheduled())
+        self.assertEqual(self.guard.counts["stop_event.wait"], CALL_LIMIT + 1)
+        self.assertEqual(self.player.played, [])
+
+    def test_a_fake_sleeper_that_keeps_saying_yes_is_cut_off(self):
+        # 休止を飛ばせない退行（選んだイベントがいつまでも残る）を作る。偽の待機は尽きたあとも
+        # すぐ True を返すので、ループは自分では止まらない。
+        event = self.scheduled()
+        self.app.scheduler.next_event = lambda is_fired=None: event
+        calls = self.install_sleeper()
+        with self.assertRaises(RunawayLoop):
+            self.app.run_forever()
+        self.assertEqual(len(calls), CALL_LIMIT)
+
+    def test_the_real_wait_is_replaced_in_every_pause_test(self):
+        self.assertEqual(self.app.stop_event.wait(30), False)
+        self.app.stop_event.set()
+        self.assertEqual(self.app.stop_event.wait(30), True)
+        self.assertEqual(self.guard.counts["stop_event.wait"], 2)
+
+    def test_a_missed_pause_in_the_wait_fails_instead_of_hanging(self):
+        # 待機が割り込みの結果を無視する退行（本物の sleep_until で、interrupt が True でも続ける）。
+        self.set_pause()
+        event = self.scheduled()
+        real = self.app.scheduler.sleep_until
+
+        def ignoring_the_interrupt(target, stop=None, precise=False, interrupt=None):
+            return real(target, stop, precise, interrupt=None)
+
+        self.app.scheduler.sleep_until = ignoring_the_interrupt
+        self.app._skip_if_paused = lambda e: False
+        with self.assertRaises(RunawayLoop):
+            self.app._wait_for_play_time(event)
+
+
+class PauseCoversByAtDateKiller(PauseTestCase):
+    """休止は、イベントの **鳴る予定の日**（``Event.at`` の日付）で照らす（再生を始める日ではない）。
+
+    ``hourly.start_hour`` が 0 の設定では、0 時の時報は前日の 23:59:57 に鳴り始める。それは
+    「次の日の放送」として扱う。今日だけの休止では止まらず、翌日までの休止なら止まる。
+    既定の設定（時報は 10〜16 時）では起きない。
+    """
+
+    def setUp(self):
+        super().setUp()
+        settings = dict(DEFAULT_CONFIG["schedule"],
+                        hourly=dict(DEFAULT_CONFIG["schedule"]["hourly"], start_hour=0, end_hour=0,
+                                    skip_hours=[], weekdays=[0, 1, 2, 3, 4, 5, 6]),
+                        closing=dict(DEFAULT_CONFIG["schedule"]["closing"], enabled=False))
+        self.app.scheduler = Scheduler(settings, self.app.tzinfo, 3.0, clock=self.app.now)
+        self.moment = datetime(2026, 10, 14, 23, 30, tzinfo=TOKYO)
+        self.midnight = self.scheduled("hourly:00", date(2026, 10, 15))
+
+    def test_the_midnight_chime_starts_playing_on_the_previous_day(self):
+        self.assertEqual(self.midnight.at, datetime(2026, 10, 15, 0, 0, tzinfo=TOKYO))
+        self.assertEqual(self.midnight.play_at, datetime(2026, 10, 14, 23, 59, 57, tzinfo=TOKYO))
+        self.assertEqual(self.midnight.day, "2026-10-15")
+
+    def test_A1_pause_for_today_does_not_cover_a_midnight_chime_whose_at_date_is_tomorrow(self):
+        self.set_pause(date(2026, 10, 14))
+        self.assertIsNone(self.app._pause_covering(self.midnight))
+        self.assertFalse(self.app._paused_for(self.midnight)())
+
+    def test_a_pause_through_tomorrow_covers_it(self):
+        pause = self.set_pause(date(2026, 10, 15))
+        self.assertEqual(self.app._pause_covering(self.midnight), pause)
+        self.assertTrue(self.app._paused_for(self.midnight)())
+
+    def test_selection_uses_the_same_day_as_the_check(self):
+        self.set_pause(date(2026, 10, 14))
+        self.assertEqual(self.app._next_pending_event().key, "hourly:00")
+        self.assertEqual(self.app._next_pending_event().day, "2026-10-15")
+        self.set_pause(date(2026, 10, 15))
+        self.assertEqual(self.app._next_pending_event().day, "2026-10-16")
+
+    def test_a_midnight_chime_is_listed_at_startup_after_a_pause_for_the_day_before(self):
+        # 起動時の「次回以降の予定」も、止める日は選ぶときと同じ（Event.at の日付）で決める。0 時の時報（再生開始は
+        # 前日の 23:59:57）は、前の日だけの休止では止まらないので、並べる。再生開始の日で決めると、並べ損なう。
+        self.set_pause(date(2026, 10, 14))
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app._log_upcoming()
+        [message] = [record.getMessage() for record in captured.records]
+        self.assertIn("  - 時報 2026-10-15 00:00:00（再生開始 23:59:57）", message)
+        self.assertEqual(self.app._next_pending_event().day, "2026-10-15")     # 選ぶときも同じ
+
+    def test_the_midnight_chime_plays_after_a_pause_for_today_only(self):
+        self.set_pause(date(2026, 10, 14))
+        self.install_sleeper()
+        self.app.run_event(self.midnight)
+        self.assertEqual(self.player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(self.midnight.key, self.midnight.day))
+        self.assertEqual(self.only_entry()["result"], "ok")
+
+    def test_the_midnight_chime_is_skipped_after_a_pause_through_tomorrow(self):
+        self.set_pause(date(2026, 10, 15), "年末の点検")
+        self.install_sleeper()
+        self.app.run_event(self.midnight)
+        self.assertEqual(self.player.played, [])
+        entry = self.skipped_entry()
+        self.assertEqual((entry["day"], entry["reason"]), ("2026-10-15", "休止: 年末の点検"))
+        self.assertFalse(self.app.state.is_fired(self.midnight.key, self.midnight.day))
+
+
+class StartupUpcomingTest(PauseTestCase):
+    """起動時の「次回以降の予定」: 休止中は、止めている日の予定を鳴るように並べない。"""
+
+    def logged(self):
+        """``_log_upcoming`` が残した行（INFO 以上の ``chime.app``）。"""
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app._log_upcoming()
+        return [record.getMessage() for record in captured.records]
+
+    def test_without_a_pause_the_list_is_the_next_five_as_before(self):
+        [message] = self.logged()
+        expected = format_events(self.app.scheduler.upcoming(limit=5))
+        self.assertEqual(message, "次回以降の予定:\n" + expected)
+        self.assertIn("2026-10-14 10:00:00", message)
+
+    def test_the_paused_days_events_are_not_listed_as_upcoming(self):
+        self.set_pause(date(2026, 10, 14), "試験")
+        [message] = self.logged()
+        self.assertNotIn("2026-10-14 10:00:00", message)
+        self.assertNotIn("2026-10-14", message)
+        self.assertTrue(message.startswith("次回以降の予定（休止のあいだは省いています）:\n"), message)
+        self.assertIn("  - 時報 2026-10-15 10:00:00（再生開始 09:59:57）", message)
+
+    def test_the_list_starts_after_the_pause_like_the_schedule_command(self):
+        self.set_pause(date(2026, 10, 16))     # 金曜まで。土日は鳴らない
+        [message] = self.logged()
+        lines = message.splitlines()[1:]
+        self.assertEqual(len(lines), 5)
+        self.assertTrue(lines[0].startswith("  - 時報 2026-10-19 10:00:00"), lines)
+        self.assertEqual(lines, format_events(
+            self.app.scheduler.upcoming(datetime(2026, 10, 17, 0, 0, tzinfo=TOKYO), 5)).splitlines())
+
+    def test_a_pause_that_starts_later_leaves_the_days_before_it_listed(self):
+        self.moment = datetime(2026, 10, 14, 14, 30, tzinfo=TOKYO)
+        self.write_pause(date(2026, 10, 15), date(2026, 10, 15))
+        [message] = self.logged()
+        self.assertIn("2026-10-14 15:00:00", message)
+        self.assertIn("2026-10-14 16:57:00", message)
+        self.assertNotIn("2026-10-15", message)
+        self.assertIn("2026-10-16 11:00:00", message)    # 5 件目まで数えなおして、休止の日を飛ばす
+
+    def test_an_empty_list_after_a_pause_says_so(self):
+        settings = dict(DEFAULT_CONFIG["schedule"],
+                        hourly=dict(DEFAULT_CONFIG["schedule"]["hourly"], enabled=False),
+                        closing=dict(DEFAULT_CONFIG["schedule"]["closing"], enabled=False))
+        self.app.scheduler = Scheduler(settings, self.app.tzinfo, 3.0, clock=self.app.now)
+        self.set_pause()
+        [message] = self.logged()
+        self.assertEqual(message, "次回以降の予定（休止のあいだは省いています）:\n"
+                                  + format_events([]))
+
+    def test_a_broken_pause_record_lists_everything_as_before(self):
+        os.makedirs(os.path.dirname(self.app.pause.path))
+        with open(self.app.pause.path, "w", encoding="utf-8") as handle:
+            handle.write("{ this is not json")
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured, \
+                self.assertLogs("chime.pause", level="WARNING"):
+            self.app._log_upcoming()
+        [message] = [record.getMessage() for record in captured.records]
+        self.assertIn("2026-10-14 10:00:00", message)
+        self.assertTrue(message.startswith("次回以降の予定:\n"))
+
+    def test_a_failing_pause_store_lists_everything_as_before(self):
+        with mock.patch.object(self.app.pause, "current", side_effect=RuntimeError("壊れた")), \
+                logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app._log_upcoming()
+        messages = [record.getMessage() for record in captured.records]
+        listing = [message for message in messages if message.startswith("次回以降の予定")]
+        self.assertEqual(len(listing), 1)
+        self.assertIn("2026-10-14 10:00:00", listing[0])
+
+    def test_failing_to_build_the_list_does_not_stop_startup(self):
+        self.set_pause()
+        with mock.patch.object(self.app.scheduler, "iter_events", side_effect=RuntimeError("一覧を作れない")), \
+                logs_enabled(), self.assertLogs("chime.app", level="ERROR") as captured:
+            self.app._log_upcoming()
+        self.assertEqual(captured.records[0].getMessage(),
+                         "次回以降の予定を求められませんでした（継続します）: 一覧を作れない")
+
+    def test_startup_says_the_pause_and_then_a_list_that_agrees_with_it(self):
+        self.set_pause(reason="点検")
+        self.install_sleeper(lambda target, interrupt: self.app.stop_event.set() or False)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_forever()
+        messages = [record.getMessage() for record in captured.records]
+        said = [i for i, m in enumerate(messages) if m.startswith("休止の記録があります")]
+        listed = [i for i, m in enumerate(messages) if m.startswith("次回以降の予定")]
+        self.assertEqual((len(said), len(listed)), (1, 1))
+        self.assertLess(said[0], listed[0])
+        self.assertIn("休止のあいだは省いています", messages[listed[0]])
+        self.assertNotIn("2026-10-14", messages[listed[0]])
+
+
+class InterruptedPlaybackTest(HistoryTestCase):
+    """停止要求（``stop_event``）で再生を打ち切ったとき。"""
+
+    def two_segments(self):
+        return [Segment(self.wav, label="一つ目"), Segment(self.wav, label="二つ目")]
+
+    def interrupting_player(self, played=1):
+        """``Player.play`` が ``PlaybackInterrupted`` を出す代用品。"""
+        player = mock.Mock(name="player")
+        player.name = "interrupting"
+        player.play.side_effect = PlaybackInterrupted("止めた", played=played)
+        return player
+
+    def test_the_stop_event_is_handed_to_the_player(self):
+        self.app._player = mock.Mock()
+        self.app._player.play.return_value = 1
+        plan = PlaybackPlan(event=None, segments=self.two_segments())
+        self.app.play_with_result(plan)
+        self.app._player.play.assert_called_once_with(plan.segments, stop=self.app.stop_event)
+
+    def test_the_outcome_of_an_interrupted_playback(self):
+        self.app._player = self.interrupting_player(played=1)
+        outcome = self.app.play_with_result(PlaybackPlan(event=None, segments=self.two_segments()))
+        self.assertEqual(outcome, PlayOutcome(ok=False, played=1, total=2, error="停止要求で中断",
+                                              interrupted=True))
+        self.assertEqual(INTERRUPTED_TEXT, "停止要求で中断")
+
+    def test_play_returns_false_for_an_interrupted_playback(self):
+        self.app._player = self.interrupting_player()
+        self.assertFalse(self.app.play(PlaybackPlan(event=None, segments=self.two_segments())))
+
+    def test_it_is_logged_as_a_warning_not_an_error(self):
+        self.app._player = self.interrupting_player(played=1)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.play_with_result(PlaybackPlan(event=None, segments=self.two_segments()))
+        records = [r for r in captured.records if "中断" in r.getMessage()]
+        self.assertEqual([(r.levelname, r.getMessage()) for r in records],
+                         [("WARNING", "停止要求のため再生を中断しました（1/2 件を鳴らしました）")])
+        self.assertFalse([r for r in captured.records if r.levelname == "ERROR"])
+
+    def test_an_ordinary_failure_is_not_marked_interrupted(self):
+        outcome = self.app.play_with_result(
+            PlaybackPlan(event=None, segments=[Segment("/nonexistent.wav", label="欠落")]))
+        self.assertFalse(outcome.interrupted)
+        self.assertFalse(PlayOutcome(ok=True, played=1, total=1).interrupted)
+
+    def test_a_stop_during_the_playback_is_an_interrupted_entry_and_the_event_is_marked_fired(self):
+        class StoppingPlayer(RecordingPlayer):
+            def __init__(self, app):
+                super().__init__()
+                self.app = app
+
+            def play_one(self, segment):
+                super().play_one(segment)
+                self.app.stop_event.set()   # 1 つ鳴らしたところで、サービスの停止が求められた
+
+        self.app._player = StoppingPlayer(self.app)
+        self.app.builder = StubBuilder(self.two_segments(), quote="ひとこと")
+        event = self.past_event()
+        self.app.run_event(event)
+        self.assertEqual(self.player.played, [])           # 差し替えたので、記録は新しい方
+        self.assertEqual(self.app._player.played, [self.wav])
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+        entry = self.only_entry()
+        self.assertEqual(entry["result"], "interrupted")
+        self.assertEqual((entry["played"], entry["total"]), (1, 2))
+        self.assertNotIn("error", entry)
+        self.assertEqual(self.app.state.recent_quotes(), [])  # 最後まで鳴らせなかったひとことは使ったことにしない
+
+    def test_an_interrupted_event_is_not_played_again_after_the_restart(self):
+        self.app._player = self.interrupting_player(played=1)
+        event = self.past_event()
+        self.app.run_event(event)
+        self.assertTrue(self.app._is_fired(event))
+
+    def test_a_stop_in_the_middle_ends_the_loop_with_exit_code_0(self):
+        class StoppingPlayer(RecordingPlayer):
+            def play_one(inner, segment):
+                super().play_one(segment)
+                self.app.stop_event.set()
+
+        self.app._player = StoppingPlayer()
+        self.app.builder = StubBuilder(self.two_segments())
+        event = self.past_event()
+        guard = CallGuard()
+
+        def fake_next(is_fired=None):
+            guard.tick("next_event")      # 再生済みにならない退行で、止まらずに回り続けないように
+            return None if is_fired(event) else event
+
+        self.app.scheduler.next_event = fake_next
+        self.assertEqual(self.app.run_forever(), 0)
+        self.assertEqual(self.only_entry()["result"], "interrupted")
+
+    def test_the_interrupted_entry_is_written_even_if_the_history_is_unwritable(self):
+        self.app._player = self.interrupting_player()
+        os.makedirs(self.history_path)   # ファイルの場所がフォルダ: 追記できない
+        event = self.past_event()
+        with logs_enabled(), self.assertLogs(level="WARNING") as captured:
+            self.app.run_event(event)
+        self.assertTrue(self.app._is_fired(event))
+        self.assertTrue(any("放送の履歴を書けません" in record.getMessage() for record in captured.records))
+
+    def test_a_dry_run_leaves_no_interrupted_entry(self):
+        self.app.dry_run = True
+        self.app._player = self.interrupting_player()
+        self.app.run_event(self.past_event())
+        self.assertFalse(os.path.exists(self.history_path))
+        self.app._player.play.assert_not_called()
+
+
+class StopBeforeAnySoundTest(PauseTestCase):
+    """停止要求が、音を出す前に届いたとき（``PlayOutcome.started`` が偽）。
+
+    何も鳴っていないので、再生済みにも履歴にも残さない。再起動したあと、追いかけ再生の猶予
+    （``catchup_grace_seconds``）のうちは、同じ放送を鳴らし直せる。音が出始めたあとの中断は、
+    今までどおり再生済みにして ``interrupted`` を残す（鳴らし直すと、頭から二重に鳴ってしまう）。
+    """
+
+    def early_stop(self, played=0):
+        """再生側（``chime/audio.py``）が、デバイスを開く前の停止で出す例外と同じ印を持つ例外。"""
+        error = PlaybackInterrupted("再生の開始前", played=played)
+        error.started = False       # 再生側が付ける印。ここでは直接付けて、再生側の実装に頼らない
+        return error
+
+    def late_stop(self, played=1):
+        error = PlaybackInterrupted("再生の途中", played=played)
+        error.started = True
+        return error
+
+    def player_raising(self, error):
+        player = mock.Mock(name="player")
+        player.name = "stopping"
+        player.play.side_effect = error
+        return player
+
+    def run_with(self, error, quote=None):
+        """``error`` で再生が終わる放送を 1 回、ふつうに流す。``(イベント, プレーヤー)`` を返す。"""
+        player = self.player_raising(error)
+        self.app._player = player
+        self.app.builder = StubBuilder([Segment(self.wav, label="一つ目"), Segment(self.wav, label="二つ目")],
+                                       quote=quote)
+        event = self.scheduled()
+        self.install_sleeper()
+        self.app.run_event(event)
+        return event, player
+
+    # -- 結果の印 ---------------------------------------------------------
+    def test_started_is_true_by_default_and_does_not_change_the_comparison(self):
+        self.assertTrue(PlayOutcome(ok=True, played=1, total=1).started)
+        self.assertEqual(PlayOutcome(ok=False, played=1, total=2, error="停止要求で中断", interrupted=True),
+                         PlayOutcome(ok=False, played=1, total=2, error="停止要求で中断", interrupted=True,
+                                     started=True))
+
+    def test_the_outcome_says_that_nothing_had_started(self):
+        self.app._player = self.player_raising(self.early_stop())
+        plan = PlaybackPlan(event=None, segments=[Segment(self.wav), Segment(self.wav)])
+        self.assertEqual(self.app.play_with_result(plan),
+                         PlayOutcome(ok=False, played=0, total=2, error=INTERRUPTED_TEXT,
+                                     interrupted=True, started=False))
+
+    def test_an_interruption_after_the_sound_started_says_started(self):
+        self.app._player = self.player_raising(self.late_stop(played=1))
+        plan = PlaybackPlan(event=None, segments=[Segment(self.wav), Segment(self.wav)])
+        outcome = self.app.play_with_result(plan)
+        self.assertEqual((outcome.interrupted, outcome.started, outcome.played), (True, True, 1))
+
+    def test_a_player_that_gives_no_mark_counts_as_started(self):
+        # 印を付けない再生側（古い実装・別の実装）でも、音は出たものとして扱う（二重に鳴らさない側に倒す）。
+        error = PlaybackInterrupted("止めた", played=1)
+        error.__dict__.pop("started", None)
+        self.app._player = self.player_raising(error)
+        outcome = self.app.play_with_result(PlaybackPlan(event=None, segments=[Segment(self.wav)]))
+        self.assertEqual((outcome.interrupted, outcome.started), (True, True))
+
+    def test_only_an_interruption_can_be_not_started(self):
+        for player_error in (PlaybackError("失敗"), RuntimeError("想定外")):
+            with self.subTest(error=player_error), logs_enabled(), self.assertLogs("chime.app"):
+                self.app._player = self.player_raising(player_error)
+                outcome = self.app.play_with_result(PlaybackPlan(event=None, segments=[Segment(self.wav)]))
+                self.assertFalse(outcome.interrupted)
+                self.assertTrue(outcome.started)
+
+    # -- run_event --------------------------------------------------------
+    def test_a_stop_before_any_sound_marks_nothing_and_writes_no_history(self):
+        event, player = self.run_with(self.early_stop(), quote="ひとこと")
+        player.play.assert_called_once()
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+        self.assertFalse(os.path.exists(self.history_path))
+        self.assertEqual(self.entries(), [])
+        self.assertEqual(self.app.state.recent_quotes(), [])
+
+    def test_it_is_logged_for_the_operator(self):
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.run_with(self.early_stop())
+        records = [(record.levelname, record.getMessage()) for record in captured.records]
+        self.assertIn(("WARNING", "停止要求のため再生を中断しました（0/2 件を鳴らしました）"), records)
+        [note] = [message for level, message in records
+                  if message.startswith("音を出す前に停止要求を受けたため、再生済みにしません")]
+        self.assertIn("追いかけて鳴らします", note)
+        self.assertIn("2026-10-14 10:00:00", note)
+        self.assertFalse([level for level, _ in records if level == "ERROR"])
+
+    def test_the_event_plays_after_a_restart_within_the_grace(self):
+        event, _ = self.run_with(self.early_stop())
+        self.moment = event.play_at + timedelta(seconds=15)       # 再起動して戻ってきた
+        restarted = ChimeApp(Config(DEFAULT_CONFIG, base_dir=self.root), backend="mock")
+        restarted.now = lambda: self.moment
+        restarted.scheduler = Scheduler(DEFAULT_CONFIG["schedule"], restarted.tzinfo, 3.0,
+                                        clock=restarted.now)
+        with logs_enabled(), self.assertLogs("chime.scheduler", level="WARNING"):
+            again = restarted._next_pending_event()
+        self.assertEqual((again.key, again.day), (event.key, event.day))
+
+    def test_a_stop_after_the_sound_started_is_marked_fired_and_not_replayed(self):
+        event, _ = self.run_with(self.late_stop(played=1))
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+        entry = self.only_entry()
+        self.assertEqual((entry["result"], entry["played"], entry["total"]), ("interrupted", 1, 2))
+        self.moment = event.play_at + timedelta(seconds=15)
+        self.assertEqual(self.app._next_pending_event().key, "hourly:11")
+
+    def test_a_stop_during_the_very_first_segment_still_counts_as_started(self):
+        # 最初の部品が鳴り出したあとの停止は、まだ 1 件も鳴り終えていなくても「鳴り始めた」。
+        event, _ = self.run_with(self.late_stop(played=0))
+        self.assertTrue(self.app.state.is_fired(event.key, event.day))
+        entry = self.only_entry()
+        self.assertEqual((entry["result"], entry["played"]), ("interrupted", 0))
+
+    def test_a_dry_run_never_plays_so_it_never_has_this_case(self):
+        self.app.dry_run = True
+        self.app._player = self.player_raising(self.early_stop())
+        self.install_sleeper()
+        self.app.run_event(self.scheduled())
+        self.app._player.play.assert_not_called()
+
+    def test_the_loop_ends_cleanly_when_the_stop_comes_before_any_sound(self):
+        event = self.scheduled()
+
+        def stop_then_refuse(segments, stop=None):
+            self.app.stop_event.set()           # サービスの停止（SIGTERM）が、再生の入り口で届いた
+            raise self.early_stop()
+
+        self.app._player = mock.Mock(name="player")
+        self.app._player.name = "stopping"
+        self.app._player.play.side_effect = stop_then_refuse
+        self.install_sleeper()
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO"):
+            self.assertEqual(self.app.run_forever(), 0)
+        self.app._player.play.assert_called_once()
+        self.assertFalse(self.app.state.is_fired(event.key, event.day))
+        self.assertEqual(self.entries(), [])
+
+    def test_the_stop_flag_of_the_real_player_reaches_the_app(self):
+        # 本物の Player.play を通して（偽の例外ではなく）、開く前の停止要求が started=False になるか。
+        # 再生側（chime/audio.py）がまだ印を付けない版なら、ここは確かめられないので飛ばす。
+        probe = threading.Event()
+        probe.set()
+        try:
+            RecordingPlayer().play([Segment(self.wav)], stop=probe)
+        except PlaybackInterrupted as exc:
+            if getattr(exc, "started", None) is not False:
+                self.skipTest("再生側が、音を出す前の中断に started=False を付けていない")
+        else:
+            self.fail("停止要求が立っていても、再生が始まってしまった")
+
+        recording = RecordingPlayer()
+        self.app._player = recording
+        event = self.scheduled()
+        self.install_sleeper(lambda target, interrupt: self.app.stop_event.set() or True)   # 待ち終えた直後に SIGTERM
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO"):
+            self.app.run_event(event)
+        self.assertEqual((recording.played, recording.opened), ([], 0))     # 何も聞こえていない
+        self.assertFalse(self.app.state.is_fired(event.key, event.day),
+                         "何も鳴っていないのに再生済みにすると、再起動しても鳴らし直されない")
+        self.assertEqual(self.entries(), [])
 
 
 class LogEnvironmentTest(AppTestCase):
