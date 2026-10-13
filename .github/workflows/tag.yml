@@ -37,11 +37,11 @@ jobs:
     if: github.ref == 'refs/heads/main'
     steps:
       # 版が最初に現れたコミットを探すため、全履歴と既存のタグが要る。
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 

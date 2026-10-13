@@ -4,7 +4,8 @@ Raspberry Pi の現地で「この機械はちゃんと放送できる状態か�
 確かめる。点検するのは次の 4 つ。
 
 設定
-    書き方の問題（:func:`chime.configcheck.check_config`）。
+    書き方の問題（:func:`chime.configcheck.check_config`）。休館日（``schedule.closures``）の
+    使えない項目も、そこで 1 件ずつ警告として挙がる（その項目だけ無視されて、その日は鳴る）。
 作り置きの音声
     放送で読み上げる全文言に、使える作り置き（``assets/voice/``）の声があるか。
     ``tts.engines`` に ``prerecorded`` が無いと、放送は作り置きを引かないので、声が
@@ -21,6 +22,9 @@ Raspberry Pi の現地で「この機械はちゃんと放送できる状態か�
     放送が書き込む場所に書けるか。NG にするのは、再生済みの記録（``state.json``）が
     残せなくなるものだけ（残せないと、再起動のたびに同じ回が鳴り直しうる）。放送の
     履歴や音声のキャッシュは、書けなくても放送が止まらないので警告にとどめる。
+    休止の記録（``pause.json``）も同じ節で見る。止めている最中なら情報として知らせ、
+    フォルダだった・読めない・中身が使えないときは警告にする（どれも放送は止まらず、
+    止めていないものとして鳴る）。
     ``state.json`` は一時ファイルに書いて置き換えるので、root 所有のファイルが残って
     いても、置き場所のフォルダに書ければ困らない（所有者は NG にしない）。ただし sticky
     ビットのあるフォルダ（``/tmp`` など）は別で、フォルダも既存の ``state.json`` も自分の
@@ -38,18 +42,24 @@ Raspberry Pi の現地で「この機械はちゃんと放送できる状態か�
 
 from __future__ import annotations
 
+import contextlib
+import logging
 import os
+import re
 import shlex
 import stat
 import sys
 import unicodedata
 import wave
 from dataclasses import dataclass
-from typing import Any, Dict, List, Mapping, Optional, Sequence, TextIO, Tuple
+from datetime import date, datetime
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence, TextIO, Tuple
+from zoneinfo import ZoneInfo
 
 from . import configcheck
 from .config import DEFAULT_CONFIG, Config
 from .jsonfile import JsonFileError, read_json
+from .pause import Pause, PauseStore
 from .phrases import PHRASE_KINDS, Coverage, CoverageTooLarge, coverage
 from .quotes import FALLBACK_QUOTES
 from .tts import PrerecordedEngine
@@ -111,6 +121,14 @@ _ROLE_KEYS = {STATE: "state.file", HISTORY: "state.history_file", CACHE: "tts.ca
 
 _GENERIC_FIX = "サービスを動かす利用者が書き込めるようにしてください"
 
+#: 点検の結果とは別にログへ出す読み込みの問題（二重にならないよう、点検中は止める）のロガー。
+_QUIET_LOGGERS = ("chime.pause",)
+
+#: 休止の記録の ``last_day`` の書き方（期限が切れているかを、記録の中身を調べずに見分けるため）。
+_DAY_PATTERN = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})")
+
+PAUSE_OFF_COMMAND = "python3 campus_chime.py --pause-off"
+
 
 @dataclass(frozen=True)
 class Result:
@@ -164,6 +182,25 @@ def summarize(results: Sequence[Result]) -> str:
     if warnings:
         parts.append("警告 {0} 件".format(warnings))
     return "結果: {0}。".format("・".join(parts))
+
+
+def pause_span(first_day: date, last_day: date) -> str:
+    """止める期間の表示。``10/01〜10/05``（1 日だけなら ``10/01``）。"""
+    first = first_day.strftime("%m/%d")
+    if first_day == last_day:
+        return first
+    return "{0}〜{1}".format(first, last_day.strftime("%m/%d"))
+
+
+def describe_pause(pause: Pause) -> str:
+    """止めている期間と理由。``10/01〜10/05（学園祭）``（理由が無ければ期間だけ）。
+
+    理由は人が打った文字なので、改行などの制御文字は空白にして 1 行に保つ。
+    """
+    span = pause_span(pause.first_day, pause.last_day)
+    reason = " ".join("".join(
+        " " if unicodedata.category(char) in ("Cc", "Cs") else char for char in pause.reason).split())
+    return "{0}（{1}）".format(span, reason) if reason else span
 
 
 def shown_path(config: Config, path: str) -> str:
@@ -743,6 +780,7 @@ def check_writable(config: Config, euid: Optional[int] = None,
     results = [_directory_result(config, directory, roles, account, euid)
                for directory, roles in write_roles(config).items()]
     results.extend(_file_results(config, account, euid))
+    results.extend(_pause_results(config, account, euid))
     if euid == 0:
         results.append(Result(
             INFO, "所有者",
@@ -802,11 +840,14 @@ def _directory_fix(directory: str, probe: str, keys: Sequence[str], account: str
     return "sudo chown -R {0} {1}".format(account, quoted)
 
 
-def _file_fix(path: str, account: str, euid: Optional[int]) -> str:
-    """既にあるファイルに書けるようにする直し方（1 つのファイルだけ。再帰しない）。"""
+def _file_fix(path: str, account: str, euid: Optional[int], mode: str = "u+w") -> str:
+    """既にあるファイルに書けるようにする直し方（1 つのファイルだけ。再帰しない）。
+
+    ``mode`` は自分の持ち物のときに足す権限（既定は書き込み。読めないファイルは ``u+r``）。
+    """
     quoted = shlex.quote(path)
     if euid is not None and _uid_of(path) == euid:
-        return "chmod u+w {0}".format(quoted)
+        return "chmod {0} {1}".format(mode, quoted)
     if not account:
         return _GENERIC_FIX
     return "sudo chown {0} {1}".format(account, quoted)
@@ -900,6 +941,98 @@ def _file_results(config: Config, account: str, euid: Optional[int]) -> List[Res
             "追記できません（放送の履歴を残せません。放送は止まりません）",
             _file_fix(history, account, euid)))
     return results
+
+
+@contextlib.contextmanager
+def _quiet_logs() -> Iterator[None]:
+    """休止の記録の読み込みが出すログを、このブロックの間だけ止める（結果は点検の画面に出すため）。"""
+    loggers = [logging.getLogger(name) for name in _QUIET_LOGGERS]
+    previous = [logger.disabled for logger in loggers]
+    for logger in loggers:
+        logger.disabled = True
+    try:
+        yield
+    finally:
+        for logger, disabled in zip(loggers, previous):
+            logger.disabled = disabled
+
+
+def _today(config: Config) -> date:
+    """設定のタイムゾーンでの今日（解決できなければこの機械の今日）。"""
+    try:
+        return datetime.now(ZoneInfo(str(config.get("timezone", "Asia/Tokyo")))).date()
+    except Exception:  # 未知の名前や tzdata 欠落でも点検は止めない
+        return date.today()
+
+
+def _expired(data: Any, today: date) -> bool:
+    """休止の記録の中身が、期限（``last_day``）の切れたものか。日付として読めなければ ``False``。"""
+    last_day = data.get("last_day") if isinstance(data, Mapping) else None
+    match = _DAY_PATTERN.fullmatch(last_day) if isinstance(last_day, str) else None
+    if match is None:
+        return False
+    try:
+        return date(*(int(part) for part in match.groups())) < today
+    except ValueError:
+        return False
+
+
+def _pause_results(config: Config, account: str, euid: Optional[int],
+                   path: Optional[str] = None, today: Optional[date] = None) -> List[Result]:
+    """休止の記録（``state.pause_file``）の状態。止めているなら情報、使えないなら警告。
+
+    無い・期限が切れている・場所が空（休止を使わない設定）のときは何も出さない。放送は、
+    記録がどんな状態でも止まらない（使えない記録は「止めていない」ものとして鳴る）ので、
+    NG にはしない。何も書かない。``path`` と ``today`` は、省くと設定の場所と設定のタイムゾーン
+    での今日（:func:`pause_record_unusable` が、動いているアプリの場所と日付を渡す）。
+    """
+    path = config.path("state.pause_file") if path is None else path
+    if not path:
+        return []
+    shown = shown_path(config, path)
+    if os.path.isdir(path):
+        return [Result(
+            WARNING, shown,
+            "ファイルではなくフォルダです（「今日だけ止める」が使えません。放送は止まりません）",
+            "そのフォルダを移すか消してください（中身を確かめてから）")]
+    if os.path.isfile(path) and not os.access(path, os.R_OK):
+        return [Result(
+            WARNING, shown,
+            "読めません（止めているかどうか分かりません。放送は止めていないものとして鳴ります）",
+            _file_fix(path, account, euid, "u+r"))]
+    try:
+        data = read_json(path)
+    except JsonFileError as exc:
+        if exc.kind == "missing":
+            return []
+        return [_unusable_pause(shown, str(exc))]
+    except RecursionError:
+        return [_unusable_pause(shown, "JSON の入れ子が深すぎて読めません")]
+    today = _today(config) if today is None else today
+    with _quiet_logs():
+        pause = PauseStore(path, lambda: today).current()
+    if pause is not None:
+        return [Result(INFO, shown, "止めています: {0}。再開するには {1} を実行します".format(
+            describe_pause(pause), PAUSE_OFF_COMMAND))]
+    if _expired(data, today):
+        return []
+    return [_unusable_pause(shown, "中身を使えません（書き方か版が違います）")]
+
+
+def pause_record_unusable(config: Config, path: str, today: date) -> bool:
+    """休止の記録が、あるのに使えない（壊れている・読めない・フォルダ・知らない版など）か。
+
+    ``--check`` の「書き込み」の節が警告にするものと同じ判定。無い・期限が切れている・場所が
+    空のときは ``False``。``--status`` が「止めていません」に案内を添えるために使う。何も書かない。
+    """
+    return any(result.level == WARNING for result in _pause_results(config, "", None, path, today))
+
+
+def _unusable_pause(shown: str, problem: str) -> Result:
+    """読めない・中身の使えない休止の記録の警告。"""
+    return Result(
+        WARNING, shown, "{0}（止めていないものとして放送します）".format(problem),
+        "{0} で消せます（または、そのファイルを手で消してください）".format(PAUSE_OFF_COMMAND))
 
 
 # ---------------------------------------------------------------------------

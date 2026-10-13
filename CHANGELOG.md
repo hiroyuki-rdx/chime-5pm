@@ -3,6 +3,58 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [6.2.0] - 2026-10-13
+
+新機能の版（改善 4 段階の 4）。休館日の指定・放送の一時休止・種類ごとの音量を追加し、停止要求で
+再生がすぐ止まるようにした。**既定の設定で動かしている場合、放送の時刻と内容は変わらない**
+（休館日なし・休止なし・音量はすべて 1.0）。読み上げ文言と作り置き音声も変わらない（作り直しは不要）。
+
+### 追加
+
+- **休館日**（`schedule.closures`）: `dates`（`"2026-11-02"` または `{"date": …, "name": "学園祭"}`）と
+  `ranges`（`{"from": …, "to": …, "name": "年末年始"}`。両端を含む）に書いた日は、時報も閉館放送も
+  鳴らさない。祝日も開館するため、祝日は自動では休まない（休む祝日はここに書く）。書き方の誤った項目は
+  その項目だけ無視して ERROR を残し（その日は通常どおり鳴る）、`--check` が直し方を出す。
+  `--schedule` は休館日を「休館 2026-12-28（月） 年末年始」の行で挟んで表示する。長い休館でも次の予定を
+  見つけられるよう、予定を探す範囲を 400 日にした
+- **放送の一時休止**: `--pause-today`（今日いっぱい）・`--pause-until YYYY-MM-DD`（その日まで。今日から
+  最長 31 日）・`--pause-off`（再開）・`--reason TEXT`。常駐中のサービスにそのまま効く（再起動は不要。
+  最大で `schedule.max_sleep_seconds`、既定 30 秒で気づく）。止めている日の放送は鳴らさず、再生の準備に
+  入っていた回は履歴に「止めていた」と残す。解除が追いかけ再生の猶予（`catchup_grace_seconds`、既定
+  120 秒）に間に合えば、その回は遅れて鳴る。記録は `cache/pause.json`（`state.pause_file`）。root では
+  実行できない（`cache/` の持ち主が root になるのを防ぐ）
+- **種類ごとの音量**（`audio.volume`）: `time_signal`（時報音）・`voice`（読み上げと閉館アナウンス）・
+  `music`（蛍の光）を 0.0〜1.0 で。ALSA の音量は高めに固定し、ここで絞る。command 方式では変えられない
+  （警告を 1 回出す）
+- `--status` に放送の休止と近い休館日（14 日以内）、`--check` に休館日の書き間違い・休止中であること・
+  休止の記録の異常を表示する。放送の履歴の結果に「止めていた（skipped）」「中断（interrupted）」を追加
+
+### 変更
+
+- **停止要求で再生がすぐ止まる**: `systemctl stop` / `restart` を受けると、再生中の音を 0.3 秒で
+  フェードアウトして約 1 秒以内に終わる（6.1.0 までは放送が終わるまで止まらず、蛍の光の途中なら
+  systemd が約 90 秒後に強制終了していた）。途中で止めた放送は「中断」として履歴に残し、再起動しても
+  最初から鳴らし直さない。音が出る前に止めた回は鳴らした扱いにせず、再起動後の追いかけ再生で鳴らせる。
+  ユニットに `TimeoutStopSec=30`
+- **再生の頑健化**: 1 つの音源が終わらないときは打ち切る（WAV は長さ＋10 秒、そのほかは
+  `audio.max_segment_seconds`、既定 600 秒）。pygame の初期化は 1 秒おきに 3 回まで試す。command 方式は
+  再生プログラムをプロセスグループごと止める（ラッパー経由でも残らない）
+- 予定が 1 件も無いときの警告は、続くあいだ 1 回だけにした（それまでは 1 分ごと）
+- GitHub Actions: `actions/checkout@v5`・`actions/setup-python@v6`（Node.js 24）に上げた
+
+### 移行
+
+16:55〜17:02（閉館放送の前後）を避けて行う。
+
+```bash
+cd /home/pi/campus-chime
+bash scripts/update.sh
+```
+
+休館日を使うときは `config.json` の `schedule.closures` に書き、`python3 campus_chime.py --check` で
+書き方を確かめ、`sudo systemctl restart campus_chime.service` のあと `python3 campus_chime.py --schedule 40`
+で「休館」の行を確認する。
+
 ## [6.1.0] - 2026-10-09
 
 運用の道具を足した版（改善 4 段階の 3）。設置状態の点検（`--check`）・いまの状態（`--status`）・
@@ -666,6 +718,7 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[6.2.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.2.0
 [6.1.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.1.0
 [6.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.0.0
 [5.3.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.3.0

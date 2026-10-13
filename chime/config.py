@@ -63,6 +63,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "catchup_grace_seconds": 120.0,
         # 待機ループが一度に sleep する最大秒数（NTP による時刻補正への追従用）。
         "max_sleep_seconds": 30.0,
+        # 休館日（この日は時報も閉館放送も鳴らさない）。祝日は自動では休まない。
+        # dates: "2026-11-02" または {"date": "2026-11-02", "name": "学園祭"}
+        # ranges: {"from": "2026-12-28", "to": "2027-01-04", "name": "年末年始"}（両端を含む）
+        "closures": {
+            "dates": [],
+            "ranges": [],
+        },
     },
     "audio": {
         # auto: pygame → コマンド（aplay/mpg123）→ mock の順に利用可能なものを選ぶ
@@ -84,6 +91,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         # mock バックエンドが 1 ファイルあたりに費やす最大秒数
         "mock_max_seconds": 3.0,
+        # 種類ごとの音量（0.0〜1.0）。ALSA の音量は高めに固定し、ここで絞る。
+        "volume": {
+            "time_signal": 1.0,
+            "voice": 1.0,
+            "music": 1.0,
+        },
+        # 1 つの音源を鳴らし続けてよい最大秒数（再生が終わらないときの打ち切り）。
+        "max_segment_seconds": 600,
     },
     "time_signal": {
         "short_pip": {"frequency": 440.0, "duration_ms": 100},
@@ -208,6 +223,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "file": "cache/state.json",
         # 放送ごとの結果を 1 行ずつ残す（--status で直近の放送を見るため）。
         "history_file": "cache/history.jsonl",
+        # 「今日だけ止める」（--pause-today / --pause-until）の記録。
+        "pause_file": "cache/pause.json",
     },
 }
 
