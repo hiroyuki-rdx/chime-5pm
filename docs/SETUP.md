@@ -1,7 +1,7 @@
 # 再構築手順書（SETUP）
 
 SD カードへの OS 書き込みから、放送が自動で流れる状態になるまでの全手順。
-**上から順に実行すれば完了します。** 所要時間はおよそ 60〜90 分（大半は OS の書き込みと `apt upgrade` の待ち時間）。
+**上から順に実行すれば完了します。** 所要時間はおよそ 60〜90 分（大半は OS の書き込みと `apt full-upgrade` の待ち時間）。
 
 ---
 
@@ -47,17 +47,38 @@ microSD カードを選択します。
 |---|---|
 | ホスト名 | `campus-chime`（任意。あとで `ssh pi@campus-chime.local` で接続できます） |
 | ユーザー名 | **`pi`** ← **必ず `pi` にしてください** |
-| パスワード | 任意（忘れないもの） |
+| パスワード | **長いランダムな文字列**（パスワード管理ソフトで作って保管する。覚えやすい言葉にしない） |
 | Wi-Fi SSID / パスワード | **2.4GHz 帯の** SSID |
 | Wi-Fi の国 | `JP` |
 | ロケール設定 タイムゾーン | **`Asia/Tokyo`** |
 | キーボードレイアウト | `jp` |
 
+> **パスワードについて:** `pi` は誰もが知っているユーザー名なので、パスワードが短い・推測しやすいと、SSH で当てられます。パスワード管理ソフトで作った、20 文字以上のランダムな文字列にします（キーボードレイアウトを `jp` にしたあと、Pi に直接つないだキーボードで打つことがあるので、記号を避けて英数字を長くするのも手です）。このパスワードは、`sudo` と、Pi に直接つないだときのログインに使います。控えをなくさないでください。
+>
 > **ユーザー名が `pi` でなければならない理由:** systemd ユニットと設置パスが `/home/pi/campus-chime` を前提にしているためです。別のユーザー名にする場合は `campus_chime.service` の `User` / `Group` / `WorkingDirectory` / `ExecStart` をすべて書き換える必要があります。
 
 **サービスタブ**
 
-- **`SSH を有効化する`** にチェック → `パスワード認証を使う`
+- **`SSH を有効化する`** にチェックを入れ、**`公開鍵認証のみ許可する`** を選んで、自分の PC で作った**公開鍵**を貼り付けることをおすすめします（パスワードでの SSH ログインを、最初から止められます）。公開鍵の作り方は次のとおりです。
+- `パスワード認証を使う` を選んでも導入はできます。その場合は、導入のあとで `sudo bash scripts/harden.sh ssh` を実行して、SSH を鍵だけにしてください（[SECURITY.md](SECURITY.md)）。
+
+**公開鍵の作り方（作業用 PC で）**
+
+Windows（PowerShell）:
+
+```powershell
+ssh-keygen -t ed25519
+Get-Content $env:USERPROFILE\.ssh\id_ed25519.pub
+```
+
+macOS・Linux:
+
+```bash
+ssh-keygen -t ed25519
+cat ~/.ssh/id_ed25519.pub
+```
+
+鍵を作るときに、パスフレーズ（鍵の合言葉）を聞かれます。決めておいてください。表示された `ssh-ed25519 AAAA…` で始まる **1 行（`.pub` のほう）** を、Imager の公開鍵の欄に貼り付けます。拡張子のない `id_ed25519` は**秘密鍵**です。貼り付けず、PC の外へ出さないでください（なくすと入れなくなるので、パスフレーズつきでバックアップを取ります）。
 
 **保存** → `はい`（設定を適用）→ 書き込み開始。10〜20 分ほどかかります。
 
@@ -617,8 +638,10 @@ python3 campus_chime.py --check
 1. PC で VOICEVOX ENGINE を起動する（エンジンが `http://127.0.0.1:50021` で待ち受けます）。Docker で起動する場合は例えば次のようにします。
 
 ```bash
-docker run -d --name voicevox -p 50021:50021 voicevox/voicevox_engine:cpu-latest
+docker run -d --name voicevox -p 127.0.0.1:50021:50021 voicevox/voicevox_engine:cpu-latest
 ```
+
+`-p 127.0.0.1:50021:50021` は、この PC の中（`127.0.0.1`）からだけ ENGINE に届くようにする指定です。VOICEVOX ENGINE にはログインの仕組みが無いので、`-p 50021:50021` と書いて全部のインターフェースで待ち受けると、学内のほかの人にも届いてしまいます。以前の手順（`-p 50021:50021`）で作ったコンテナは、全部のインターフェースで待ち受けているので、`docker rm -f voicevox` で消して、上の書き方で作り直してください。
 
 `-d` はバックグラウンド実行の指定で、付けないとターミナルが占有され続けて `curl` や生成スクリプトを実行できません。また `--rm` は付けません。付けると停止時にコンテナごと削除され、`docker start` で再開できなくなるためです。イメージのタグ（`cpu-latest` の部分）は環境によって異なることがあるため、`docker images` で手元にあるタグを確認して読み替えてください。
 
@@ -673,6 +696,8 @@ python3 scripts/generate_voicevox.py --include-quotes --prune
 
 Docker Desktop（Windows）で VOICEVOX ENGINE を動かしている場合、WSL2 側から `127.0.0.1` では届かないことがあります。その場合は `--base-url` で Windows ホスト側の IP を指定してください。
 
+この方法では、ENGINE が Windows ホストのアドレスでも待ち受けている必要があるので、上の `127.0.0.1:` を付けずに、コンテナを作り直します（`docker rm -f voicevox` のあと `docker run -d --name voicevox -p 50021:50021 voicevox/voicevox_engine:cpu-latest`）。**これで学内のほかの人にも届くようになるので、作業の間だけにして、終わったら `docker stop voicevox` で止めてください**（[SECURITY.md](SECURITY.md)）。普段の作業用には、`127.0.0.1:` を付けたコンテナに戻します。
+
 ```bash
 python3 scripts/generate_voicevox.py --include-quotes --prune --base-url http://<ホストのIP>:50021
 ```
@@ -726,7 +751,7 @@ python3 campus_chime.py --test-hourly
 
 > **16:55〜17:02（閉館放送の前後）は、更新も再起動もしないでください。** `update.sh` は放送の時間帯が終わるまで待ってから再起動するので、この時間帯に実行すると、`update.sh` は最大約 6 分（放送の時間帯の余裕を含む、待つ上限です。閉館放送そのものの長さではありません）待つことがあります。手でサービスを止める・再起動すると、再生は停止の要求から 1 秒ほどで止まります（フェードアウト）が、**その回の放送は途中で終わります**。音を出し始めていた回は再生済みとして記録するので、鳴り直しません（`--status` の「直近の放送」に「中断」と残ります）。音を出す前に止まった回は何も記録しないので、再起動のあと、開始から 120 秒以内なら鳴り直します。サービスの停止の待ち時間は 30 秒です（`campus_chime.service` の `TimeoutStopSec`。止まらなかったときの保険で、`setup.sh` がサービスを登録し直すときに反映されます）。
 
-`pi` ユーザーで（`sudo` は付けずに）実行します。
+`pi` ユーザーで（`sudo` は付けずに）実行します。`sudo bash scripts/harden.sh sudo` で `sudo` にパスワードを求めるようにした Pi では、`setup.sh` の `sudo` の行で `pi` のパスワードを聞かれるので、入力して続けます（手で入力できる、SSH の画面で実行します）。
 
 ```bash
 cd /home/pi/campus-chime
@@ -1200,11 +1225,22 @@ python3 campus_chime.py --test-hourly 12
 - [ ] `python3 campus_chime.py --status` の「放送の休止」が「止めていません」（試しに止めたなら、`--pause-off` で戻してある）
 - [ ] スピーカーの音量が実際の運用位置で適切
 - [ ] 実際の正時（例: 14:00）に立ち会って放送を確認した
+- [ ] `bash scripts/security_check.sh` で `[要対応]` が 0 件（直し方は次の「最後に」と [SECURITY.md](SECURITY.md)）
+
+**最後に、安全にします。** 導入が終わったら、安全面の点検をして、見つかった点を直します。`bash scripts/security_check.sh` は読むだけで、何も変えません。直すときは `sudo bash scripts/harden.sh ssh` のように手順を選んで実行します（どれも元に戻せます）。
+
+```bash
+cd /home/pi/campus-chime
+bash scripts/security_check.sh
+```
+
+進める順（鍵の設定 → 防火壁 → `sudo` → ログ …）、手順ごとの放送への影響、締め出されたときの戻し方、毎月の点検は **[SECURITY.md](SECURITY.md)** にあります。
 
 ---
 
 ## 13. 困ったときの参照先
 
 - 運用中のトラブルと対処: [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md)
+- 安全面の点検と強化、毎月の点検、脆弱性の報告: [SECURITY.md](SECURITY.md)
 - 設定項目の全一覧: [SPECIFICATION.md](SPECIFICATION.md) 3 章
 - なぜこの構成なのか: [REQUIREMENTS.md](REQUIREMENTS.md)

@@ -1,7 +1,7 @@
 # キャンパス時報システム 仕様書
 
 **プロジェクト名:** Campus Chime System
-**バージョン:** 6.2.0
+**バージョン:** 6.2.0（新機能: 休館日・放送の一時休止・種類ごとの音量・停止要求ですぐ止まる再生、安全面の点検と強化）
 **対応要件定義:** `docs/REQUIREMENTS.md` v6.2.0
 **作成日:** 2026/08/26
 
@@ -37,9 +37,9 @@
 │   ├── pause.json             #   「今日だけ止める」の記録（4.21 章。--pause-* が書く。無ければ止めていない）
 │   ├── deployed_commit        #   サービスに反映した版のコミット（setup.sh が書き、update.sh が読む。4.19 章）
 │   └── tts/
-├── scripts/                   # 導入・更新・音声の作り直しなど（4.19 章）
+├── scripts/                   # 導入・更新・安全面の点検と強化・音声の作り直しなど（4.19 章）
 ├── tests/
-└── docs/
+└── docs/                      # 要件定義・仕様・再構築手順・運用ナレッジ・セキュリティの手引き（SECURITY.md）など
 ```
 
 ### 2.1 v2.0.0 設計案からの構成変更
@@ -55,6 +55,11 @@
 | `campus_chime.service` | `TimeoutStopSec=30` を追加（v6.2.0） | 停止要求で再生が止まるようにしたため、止まらなかったときの保険の待ち時間を、既定の 90 秒から縮める（6 章、FR-17） |
 | `scripts/update.sh` | 新規追加（v6.1.0） | 運用中の Pi を、放送を途切れさせずに最新版へ更新するため（4.19 章、FR-13） |
 | `tests/` | 新規追加 | NFR-07 |
+| `scripts/security_check.sh` | 新規追加（v6.2.0） | 運用中の Pi の安全面を、読むだけで点検するため。Pi のアドレスが学外から届きうるか（大学はクラス B/C のアドレスを持つことがあり、Pi がグローバルアドレスを持つ可能性がある）、SSH・sudo・防火壁・OS とカーネルの更新・時刻の同期などを調べ、直し方を出す（4.19 章、NFR-08） |
+| `scripts/harden.sh` | 新規追加（v6.2.0） | 点検で見つかった点を、手順ごとに選んで、元に戻せる形で直すため。締め出される恐れのある変更（SSH・防火壁）は、確定しなければ自動で元に戻る（4.19 章、NFR-08） |
+| `docs/SECURITY.md` | 新規追加（v6.2.0） | 点検と強化の進め方、手順ごとの影響と元に戻し方、締め出されたときの復旧、毎月の点検、GitHub 側の守り、脆弱性の報告の窓口（GitHub がリポジトリのセキュリティポリシーとして表示する）（NFR-08） |
+| `docs/SECURITY_REVIEW.md` | 新規追加（v6.2.0） | セキュリティレビューの記録。点検・強化のスクリプトを作る元になった評価と、対応の状況 |
+| `tests/test_security_check.py` / `tests/test_harden_script.py` | 新規追加（v6.2.0） | 点検と強化のスクリプトを、偽のシステムと偽のコマンドで動かして確かめるため。実機を触らず、CI でも動く（10.1 章） |
 | `scripts/` | 新規追加 | 導入手順の自動化・音声事前生成 |
 | `.github/workflows/ci.yml` | 新規追加 | NFR-07 |
 | `.github/workflows/tag.yml` | 新規追加 | `main` へのマージで版のタグを自動で付けるため（10.1 章） |
@@ -708,8 +713,8 @@ root 所有の**ファイル**は、それだけでは NG にしない。`state.
 |---|---|
 | `setup.sh` | 導入（冪等）。設置パスの確認 → 依存パッケージ → タイムゾーンと NTP の確認 → 空の `config.json` の用意 → 時報音の生成と、時刻アナウンスの音声の確認 → **設置状態の点検（`--check`）** → 予定表の表示 → systemd への登録・再起動。点検の終了コードが `2`（`config.json` を読めない）のときだけ、予定表の表示を省き、サービスを再起動しない（読めない設定で再起動すると、起動できないまま再起動を繰り返すため）。このとき最後に「導入は途中です」と表示して**終了コード 1** で終わる（途中で止めた導入を「完了」と言わず、`update.sh` が失敗と分かるようにする）。サービスを触らない指定の `--no-service` を付けても（再起動は元から行わない）、同じく「導入は途中です」と表示して終了コード 1 で終わる。`--generate-assets` が `2` のときは、作り置きが無いのではないので、PC で作り直す案内を出さない。点検が `1`（NG）のときは、「直し方」に従うよう警告して続ける。サービスの再起動に成功したときは、そのときのコミットを `cache/deployed_commit` に記録する（`update.sh` が、サービスが最新のコードで動いているかを見分けるのに使う。書くのは実行している利用者で、root で実行したときは書かない。書けなくても導入は止めない）。`--no-apt` / `--no-service` |
 | `update.sh` | 運用中の Pi を最新版へ更新する（冪等。`pi` ユーザーで実行し、root では拒否する）。現在の版の表示 → 手元の変更（Git 管理下のファイル。`config.json` は対象外）の確認 → ブランチ上かの確認 → `git pull --ff-only` → （新しい版が届いたとき、またはサービスに反映した版が違うとき）`--wait-idle` → `setup.sh --no-apt` → 旧い版と新しい版、`--status` の表示。止まる条件（root・手元の変更・`git` が状態を読めない（フォルダの持ち主が違うなど）・detached HEAD・取り込みの失敗）では、理由を表示して終了する（取り込みが権限またはディスクの問題で失敗したときを除き、**何も変えない**）。取り込み（`git pull`）の失敗は、`git` の表示（標準エラー出力。翻訳されて語句が合わなくならないよう、この 1 回だけ `LC_ALL=C` で実行する）から原因を見分けて、直し方を案内する。(1) ネットワークにつながらない、または履歴が GitHub の履歴と食い違っている（既定の案内。見分けられないもの、`Permission denied (publickey)` など GitHub への接続・認証の失敗も、ここに入る）。(2) 権限（`Permission denied`・`insufficient permission`・`unable to unlink`・`could not open`）: 以前に `sudo` で `git` を実行したなどで、リポジトリの中に別の持ち主（root など）のファイルが残っている。ネットワークの問題ではないと伝え、`sudo chown -R 利用者:グループ <リポジトリ>` を案内する。取り込みが途中まで進んでいることがあるので「何も変更していません」とは言わず、次の実行で「手元の変更」として案内が出ることを伝える。(3) ディスクの問題（`No space left on device`・`Read-only file system`・`Input/output error`・`Disk quota exceeded`）: このリポジトリのあるディスク（Pi では SD カード）がいっぱいになった、エラーのあとで読み取り専用に切り替わった（電源断や SD カードの劣化のあとに起きる）、容量の割り当てを超えた、など。持ち主を直しても直らないので、権限の語句（`unable to unlink`・`could not open` など）と一緒に出ても、**権限より先に**ディスクの問題として見分ける。ネットワークの問題ではないと伝え、確かめ方として `df -h <リポジトリ>`（空き容量。Use% が 100% に近い、または Avail が 0 ならいっぱい）と `dmesg \| tail -n 30`（ディスクのエラー。`I/O error` や `Remounting filesystem read-only`。権限が無いと言われたら `sudo dmesg \| tail -n 30`）を案内する。取り込みが途中まで進んでいることがあるので「何も変更していません」とは言わず、次の実行で「手元の変更」として案内が出ることを伝える。(4) Git 管理外のファイルが上書きされる（`would be overwritten`）: 手元にある Git 管理外のファイルが、新しい版のファイルと同じ名前なので `git` が止めた。そのファイルを移す（`mv`）か消してから、もう一度実行するよう案内する。手元の変更には、ファイルごとに `git restore --source=HEAD --staged --worktree -- <ファイル>` を案内する（`git add` 済みの変更も HEAD の内容に戻す。`git restore` が無い 2.23 より前の git では `git checkout HEAD -- <ファイル>`）。**すでに最新版でも**、`cache/deployed_commit`（サービスに反映した版）がいまの版と同じでなければ、前回の更新が取り込みのあとで止まって、サービスが古い版のままかもしれないので、警告して続き（放送の確認と `setup.sh --no-apt`）を行う。記録がいまの版と同じなら、`--status` を見せて終わる。取り込みのあとで止まるのは、次の 3 つ（いずれも終了コード `1`。最初の 2 つはサービスを再起動しない。`setup.sh` の失敗は、再起動の前に止まったことが多いが、再起動されたかは分からない）。`--wait-idle` が上限まで待っても終わらなかったとき、`--wait-idle` が `2`（`config.json` を読めず、放送の時間帯を調べられない）を返したとき（`config.json` を直してから再実行するよう案内する。急ぐときも先に直す。読めないままでは、`setup.sh` もサービスを再起動しない）、`setup.sh` が失敗したとき。どれも、もう一度 `update.sh` を実行すれば続きから反映する（記録が合わないため）。元の版への戻し方（`git reset --hard <元のコミット>` と `setup.sh --no-apt`）は、コードが更新された回（取り込みのあとで止まった回を含む）に表示するだけで、実行しない。続きから反映する回（コードが最新のとき）には表示しないので、止まった回の表示を控えておく |
-| `security_check.sh` | セキュリティの点検（読むだけ。何も書かず、何も変えない）。`pi` でも `sudo` 付きでも動き、root が要る項目は `pi` では「不明」と出す。アドレスがプライベートかグローバルか（学外から届きうるか）、SSH・sudo・防火壁・OS とカーネルの更新・時刻の同期・使っていないサービス・ログの保存・時報サービスの隔離・リポジトリを調べ、項目ごとに `[OK]`・`[情報]`・`[注意]`・`[要対応]`・`[不明]` と直し方（`harden.sh` の手順）を出す。終了コード 0（要対応なし）／1（要対応あり）／2（使い方の誤り）。`--user` |
-| `harden.sh` | セキュリティの強化（root で実行）。手順 `ssh`・`firewall`・`sudo`・`services`・`journal`・`updates`・`service`・`ntp`（`recommended` は `services journal ssh firewall`）を選んで実行する。どの手順も、変える前にすべての条件を確かめ、変えたあとに確かめ、確かめられなければ自分で戻す。`--rollback` で元に戻せる。`ssh` と `firewall` は、10 分以内に新しい画面から `--confirm` しなければ自動で元に戻る（締め出し防止）。`--dry-run`・`--user`・`--revert-after`・`--ssh-from`・`--ntp-server`・`--test-sound`・`--force` |
+| `security_check.sh` | セキュリティの点検（**読むだけ**。何も書かず（一時ファイルも作らない）、サービスにも触れない）。`pi` でも `sudo` 付きでも動き、root が要る項目は `pi` では `[不明]` と案内を出す（root でないときに使う `sudo` は、設定を一覧するだけの `sudo -n -l` のみ）。調べる項目: **ネットワーク**（IPv4・IPv6 のアドレスを、プライベート・共有（100.64.0.0/10）・リンクローカル・グローバルに分ける。**グローバルなら、大学が持つクラス B/C のアドレスの可能性があり、学外から届くかは大学の防火壁しだいであること**と、学外から確かめる方法（スマートフォンのテザリングで `nc -vz アドレス 22`）を示す。待ち受けているポート、防火壁の有無）・**SSH**（パスワードログインと root ログインが有効か（`sshd -T`、root でなければ設定ファイルから推定）、登録された鍵、失敗したログインの数、最近のログイン）・**sudo**（パスワードなしの規則）・**OS と更新**（Debian の版、カーネルの作成日が `KERNEL_FIXES_SINCE`（CISA KEV に載ったカーネルの権限昇格の修正が入った日の目安）より前でないか、更新したカーネルが使われているか、apt の更新の新しさ、自動更新）・**時刻の同期**（同期の有無と、同期元が chrony か `systemd-timesyncd` か）・**使っていない常駐**（bluetooth・ModemManager・Raspberry Pi Connect）・**ログの保存**・**時報サービス**（root で動いていないか、`harden.sh service` の追加設定の有無）・**リポジトリ**（取得元が `https` か、管理外のファイル、誰でも書けるファイル、Git フック）・`harden.sh` の確定待ち。項目ごとに `[OK]`・`[情報]`・`[注意]`・`[要対応]`・`[不明]` を出し、`[注意]` と `[要対応]` には直し方（`harden.sh` の手順）を添える。終了コード 0（`[要対応]` なし）／1（あり）／2（使い方の誤り）。`--user`（サービスと管理に使う利用者。既定 `pi`）・`--help`。進め方は `docs/SECURITY.md` |
+| `harden.sh` | セキュリティの強化（root で実行。`--dry-run` だけは `pi` でも試せる）。手順 `ssh`（鍵だけにする）・`firewall`（入ってくる通信を絞る。nftables の表 `inet campus_chime_filter` を 1 つ足す。`--ssh-from CIDR` で SSH を許すネットワーク）・`sudo`（`/etc/sudoers.d/` の `pi` 専用のパスワードなしの規則を外す）・`services`（bluetooth・hciuart・ModemManager を止めて `mask`）・`journal`（ログを残す。上限 200M）・`updates`（自動更新。apt のタイマーは 5 時台）・`service`（放送サービスへの保護の追加設定。6.3 章。`--test-sound`）・`ntp`（chrony にする。`--ntp-server HOST`）を選んで実行する（`recommended` は `services journal ssh firewall`。手順を付けなければ、状態の一覧）。**どの手順も**、(1) 変える前にすべての条件を確かめ、満たさなければ理由をすべて表示して**何も変えずに**止まる、(2) 変えたあとに効いたことを確かめ、確かめられなければ**その手順だけを自分で戻して**止まる、(3) 何度実行しても同じ（適用済みなら何もしない）。変える前のファイルは `/var/lib/campus-chime-harden`（root だけ）に控え、`--rollback [手順]` で内容と権限までそのまま戻せる。放送を止めうる手順（`service`・`updates`・`ntp`、nftables を入れる `firewall`）は、先に `--wait-idle` で放送の終わりを待つ。**`ssh` と `firewall` は「確定待ち」にする。** 変更を有効にする前に、確定待ちの記録と自動で戻す時計（`campus-chime-harden-revert.timer`。`--revert-after` 分、既定 10、1〜60）を用意し、`--confirm` されなければ時間が来たところで `--rollback-pending` を実行して元に戻す（再起動しても、起動の N 分後に戻す）。時計が実行するのは、リポジトリの版ではなく root だけが書ける `/var/lib/campus-chime-harden/harden.sh` の写し。`--confirm` は、変更より前に開いた SSH の画面から実行されたと見えるときは断る（目安。`--force` で飛ばせる）。`firewall` は、確定するまで実行時の設定だけで、確定したときに `campus-chime-firewall.service` で再起動後も読み込む。`--user`・`--revert-after`・`--ssh-from`・`--ntp-server`・`--dry-run`（何も書かず、書くはずの内容と実行するコマンドを表示）・`--confirm`・`--rollback`・`--rollback-pending`・`--test-sound`・`--force`・`--help`。終了コード 0（成功）／1（中止・失敗）／2（使い方の誤り）。進め方と手順ごとの影響は `docs/SECURITY.md` |
 | `generate_voicevox.py` | PC 側で作り置き（`assets/voice/`）を生成・整理する（`--config`・`--include-quotes`・`--prune`）。各 WAV は、同じフォルダの一時ファイルへ書いてから `os.replace` で置き換える（失敗・中断（Ctrl-C を含む）で欠けた WAV を残さない。残ると、次の実行で「生成済み」として飛ばされ、欠けた声がそのまま使われるため。`--force` で作り直すときも、置き換えるまで元の WAV は残る）。文言は `normalize_phrase()` で整える |
 | `dump_example_config.py` | `config.example.json` を `DEFAULT_CONFIG` から書き出す（3.1 章） |
 | `tag_releases.py` | 版のタグ付け（10.1 章） |
@@ -836,6 +841,25 @@ WantedBy=multi-user.target
 
 - `After=... audio.target` の `audio.target` は systemd の標準ターゲットとして存在しないため削除。サウンド関連は `sound.target` が正しい。
 
+### 6.3 追加設定（`harden.sh service` が足すもの）
+
+`sudo bash scripts/harden.sh service`（任意。4.19 章）は、上のユニットを書き換えず、systemd の**追加設定（drop-in）** `/etc/systemd/system/campus_chime.service.d/50-campus-chime-harden.conf` を足して、サービスに保護（sandbox）をかける。**ユニット本体（`campus_chime.service`、上の文面）は変えない。** そのため `setup.sh` が `sudo cp` でユニットを登録し直しても追加設定は残り、上の文面とリポジトリの `campus_chime.service` が一致することも変わらない（`tests/test_docs.py` が確かめる）。追加設定を消すには `sudo bash scripts/harden.sh --rollback service`。
+
+追加設定の `[Service]` に書く項目（`SANDBOX_PROPS` が唯一の定義で、`--test-sound` の `systemd-run` にも同じものを使う）:
+
+| 項目 | 目的 |
+|---|---|
+| `ProtectSystem=strict` / `ProtectHome=read-only` / `ReadWritePaths=-<ディレクトリ> …` | ファイルシステムを読み取り専用にし、書けるのは `ReadWritePaths` に挙げた場所だけにする（サービスが自分のコードを書き換えられない）。場所は、`campus_chime.py --print-config` の `state.file`・`state.history_file`・`state.pause_file`・`tts.cache_dir`・`time_signal.output_file` から求める（相対パスはリポジトリからの相対。`/`・`/etc`・`/usr`・`/var`・`/home`・利用者のホームそのものは断る）。`-` は、場所がまだ無くてもユニットを失敗させないための指定。6.1 章で `ProtectHome` を設定しないとしたのは書き込み先を決めずに保護すると書けなくなるためで、追加設定では書き込み先を列挙して使う |
+| `PrivateTmp=yes` | 一時ディレクトリを分ける |
+| `ProtectKernelTunables` / `ProtectKernelModules` / `ProtectKernelLogs` / `ProtectControlGroups` / `ProtectHostname` / `ProtectProc=invisible` | カーネルの設定・モジュール・ログ・cgroup・ホスト名・ほかのプロセスの情報に触れさせない |
+| `RestrictNamespaces` / `RestrictRealtime` / `RestrictSUIDSGID` / `LockPersonality` / `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK` | 使えない機能を断る（天気の取得は `AF_INET` / `AF_INET6`） |
+| `SystemCallArchitectures=native` / `SystemCallFilter=@system-service` / `SystemCallErrorNumber=EPERM` | システムコールを、サービスに要るものに絞る |
+| `CapabilityBoundingSet=`（空）/ `KeyringMode=private` | 特権（ケーパビリティ）を持たせない。キーリングを共有しない |
+
+**あえて使わない項目:** `PrivateDevices`・`DeviceAllow`・`DevicePolicy`（音声デバイス `/dev/snd` に届かなくなり、音が出ない）、`ProtectClock`（単独なら無害だが、これらのどれかと組み合わさると `/dev/snd` を塞ぐ。得られる効果も小さい）、`MemoryDenyWriteExecute`（pygame / SDL の実行時コード生成に差し支えうる）、`ProcSubset=pid`（SDL が `/proc/cpuinfo` を読む）、`RemoveIPC`・`PrivateUsers`（得るものが小さく、音声まわりを壊す恐れがある）。
+
+適用のとき、`systemd-analyze verify` の警告（知らない項目など）と、サービスの再起動後 5 秒の稼働、エラー出力の有無を確かめ、だめなら追加設定を消して再起動し直す。音が出るかは、`sudo bash scripts/harden.sh --test-sound` が、保護をかけたまま 12 時の時報を 1 回、実際に鳴らして確かめる。
+
 ---
 
 ## 7. 音声ファイル仕様
@@ -947,8 +971,8 @@ python3 -m unittest discover -s tests -t . -v
 | `tests/test_quotes.py` | 候補の抽出、直近除外、同梱データの健全性 |
 | `tests/test_tts.py` | エンジンのフォールバック、キャッシュ、事前生成音声の参照、VOICEVOX が HTTP ではないもので答えたときの扱い、文言の整え方（`normalize_phrase()`） |
 | `tests/test_state.py` | 永続化、日付をまたぐリセット、破損時の挙動 |
-| `tests/test_security_check.py` | セキュリティの点検（`scripts/security_check.sh`）。偽のシステム（`CHIME_SYSROOT`）と、読むだけの道具と偽のコマンドだけの PATH で本物のスクリプトを動かし、項目ごとのよい状態と悪い状態、IPv4（プライベート・CGNAT・リンクローカル・グローバル）と IPv6 の見分け、終了コード、root と一般ユーザー、**何も書かないこと**（前後のファイル一覧と、呼んだコマンドの許可リスト） |
-| `tests/test_harden_script.py` | セキュリティの強化（`scripts/harden.sh`）。偽のシステムと偽のコマンドで本物のスクリプトを動かし、手順ごとの事前確認での中止（何も変えない）、書く中身、二度目の実行、元に戻したときに元のファイルが内容と権限まで戻ること、`--dry-run` が何も書かないこと、確かめられなかったときの自動の取り消し、自動の取り消しのタイマーと `--confirm`・`--rollback-pending`、ロック。生成した防火壁の規則は、使えるときは本物の `nft -c -f` で確かめる |
+| `tests/test_security_check.py` | セキュリティの点検（`scripts/security_check.sh`、4.19 章）。偽のシステム（`CHIME_SYSROOT`）を作り、読み取りだけの本物の道具と、システムに触る道具の偽物（`ip`・`ss`・`systemctl`・`sshd`・`nft`・`journalctl`・`apt-*`・`dpkg-query`・`git` など。本物のサンプル出力を返す）だけを `PATH` に置いて、本物のスクリプトを動かす。項目ごと（`NET-ADDR4`・`SSH-PASSWORD` などの ID は、スクリプトのコメントにある）に、**よい状態と悪い状態の両方**でラベルと直し方が出ること、IPv4（プライベート・共有・リンクローカル・グローバル）と IPv6（ユニークローカル・グローバル）の見分け、終了コードとまとめの行、root と一般ユーザーの違い、**何も書かないこと**（実行の前後で、偽の `/`・リポジトリ・`TMPDIR` のパス・大きさ・更新時刻・権限・中身を比べ、書き込める道具は `PATH` に置かない） |
+| `tests/test_harden_script.py` | セキュリティの強化（`scripts/harden.sh`、4.19 章）。偽のシステム（`CHIME_SYSROOT`、`CHIME_PROC`）と、呼び出しを記録して状態を真似る偽のコマンド（`systemctl`・`sshd`・`nft`・`apt-get`・`runuser` など）で、本物のスクリプトを動かす（実機には触れない）。手順ごとに、(1) 事前確認での中止は**何も変えない**こと、(2) 書く中身（設定ファイル・ルール・ユニット）、(3) 二度目の実行は何もしないこと、(4) `--rollback` で元のファイルが**内容と権限まで**戻ること、(5) `--dry-run` が何も書かないこと、(6) 確かめられなかったときの自動の取り消し（`sshd -T` が変わらない・サービスが動かない・`sudo -v` が通らない）を確かめる。あわせて、自動の取り消しのタイマーが root の写しを指すこと、`--confirm` が変更より前の画面を断り `--force` で通ること、`--rollback-pending` が確定待ちだけを戻すこと、ロック、`--ssh-from` の検査と現在の接続元の確認。生成した防火壁の規則は、本物の `nft` が使えるときは検査モード（`nft -c -f`）だけで確かめる（`nft -f` は実行しない） |
 | `tests/test_pause.py` | 「今日だけ止める」の記録（4.21 章）。書いて読む、`set_at`、上限（31 日）と過去の日付の拒否、期限切れ、使えない記録（無い・壊れた・知らない版・型違い・深すぎる入れ子・フォルダ）が「止めていない」になり、警告は同じ問題につき 1 度だけであること、時計の失敗、`clear()`、`changed()`（作られた・消えた・置き換わった） |
 | `tests/test_sequence.py` | セグメント構成（天気を流す時刻・ひとことは毎回）、失敗時の縮退、音にならなかった文言（`plan.silent`）の記録と表示。セグメントの音量の区分（`kind`: 時報音・読み上げ・閉館アナウンス・蛍の光）、読み上げる文言が増えていないこと（作り置きに全部あること） |
 | `tests/test_audio.py` | 再生順序、デバイス解放、バックエンド選択、pygame のバナーを出さないこと（`PYGAME_HIDE_SUPPORT_PROMPT`）。音量（`volume_for()` が数でない・範囲外でも例外を出さず、キーごとに 1 度だけ警告すること）、打ち切りの秒数（WAV は長さ ＋ 10 秒、ほかは `audio.max_segment_seconds`）、停止要求（`PlaybackInterrupted`。再生の前から立っている・再生中・間隔の待ち・pygame のフェードアウト・外部コマンドの `terminate` から `kill`・mock）、pygame の初期化のやり直し（3 回）、外部コマンドの起動と終了（偽の mixer・偽の時計・偽のプロセス。本物の音も子プロセスも使わない） |
@@ -1021,6 +1045,8 @@ git fetch origin && git tag -a v5.2.0 <警告に書かれたコミットの sha>
 |---|---|
 | 状態確認 | `python3 campus_chime.py --status`（systemd 側の詳細は `sudo systemctl status campus_chime.service`） |
 | 設置状態の点検 | `python3 campus_chime.py --check` |
+| 安全面の点検 | `bash scripts/security_check.sh`（読むだけ。root が要る項目も調べるなら `sudo` を付ける。月に 1 回。進め方は `docs/SECURITY.md`） |
+| 安全面の強化・確定・元に戻す | `sudo bash scripts/harden.sh 手順名`（`ssh`・`firewall` は新しい端末から `sudo bash scripts/harden.sh --confirm`）／`sudo bash scripts/harden.sh --rollback 手順名`（4.19 章） |
 | 版の確認 | `python3 campus_chime.py --version` |
 | ログ追尾 | `journalctl -u campus_chime.service -f` |
 | 予定確認 | `python3 campus_chime.py --schedule` |

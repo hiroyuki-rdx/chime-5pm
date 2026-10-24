@@ -44,7 +44,7 @@
 | v5.3.0 | 2026/09 | **事故の芽の修正**（通信の途中切断や設定の書き間違いでも時報音は鳴る、UTF-8 以外で保存した `config.json` の原因が日本語で分かり、BOM 付き UTF-8 も読める、`journalctl -p err` が効く ほか）。詳細は [CHANGELOG.md](CHANGELOG.md) |
 | v6.0.0 | 2026/10 | 整理（設定キーの削除）。使えない気象庁の天気取得と、旧い「天気かひとことを抽選する」方式（`extra_segment.mode="choice"`）を削除し、時報のあとは「（12 時だけ）天気 → ひとこと」の 1 経路にした。`config.json` に残った廃止キーは警告して無視する（放送は止まらない）。読み上げ文言と作り置き音声は変わらない。詳細は [CHANGELOG.md](CHANGELOG.md) |
 | v6.1.0 | 2026/10 | 道具（点検・状態表示・更新）。`--check`（設置状態の点検）・`--status`（いまの状態と直近の放送）・`--wait-idle`・`bash scripts/update.sh`（更新を 1 行で）を追加。設定の書き間違いを候補つきで知らせ、そのままでは動かせない値だけを既定値に置き換える。放送ごとの結果を `cache/history.jsonl` に残す。放送の時刻と内容、読み上げ文言と作り置き音声は変わらない。詳細は [CHANGELOG.md](CHANGELOG.md) |
-| **v6.2.0** | **2026/10** | **新機能（休館日・一時休止・音量）**。休館日を `schedule.closures` に書ける（祝日も開館するため、祝日は自動では休まない）。`--pause-today` / `--pause-until` / `--pause-off` で放送を一時的に止める（再起動は不要）。種類ごとの音量（`audio.volume`）。`systemctl stop` / `restart` で再生がすぐ止まる。既定の設定では放送の時刻と内容、読み上げ文言と作り置き音声は変わらない。詳細は [CHANGELOG.md](CHANGELOG.md) |
+| **v6.2.0** | **2026/10** | **新機能（休館日・一時休止・音量）**。休館日を `schedule.closures` に書ける（祝日も開館するため、祝日は自動では休まない）。`--pause-today` / `--pause-until` / `--pause-off` で放送を一時的に止める（再起動は不要）。種類ごとの音量（`audio.volume`）。`systemctl stop` / `restart` で再生がすぐ止まる。あわせて、**安全面の点検と強化**を追加した（`bash scripts/security_check.sh` は読むだけで現状を点検し、`sudo bash scripts/harden.sh` は手順ごとに選んで強化する。どれも元に戻せる。運用の手引きは [docs/SECURITY.md](docs/SECURITY.md)）。既定の設定では放送の時刻と内容、読み上げ文言と作り置き音声は変わらない。詳細は [CHANGELOG.md](CHANGELOG.md) |
 
 v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです。
 
@@ -76,6 +76,7 @@ v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです�
 | 点検・状態の確認 | `--check` で設置状態（設定・作り置きの声・音源・書き込み先）を、`--status` でいまの状態（版・時刻の同期・サービス・放送の休止・直近の放送・次の予定・近い休館日）を確認。どちらも鳴らさず、何も書かない |
 | 放送の履歴 | 放送ごとの結果（成功・一部のみ・失敗・エラー・止めていた・中断）と、無音だった文言・音源ファイルが無くて鳴らせなかった部品を `cache/history.jsonl` に残す（`--status` で直近 8 件）。書けなくても放送は止めない |
 | 更新 | `bash scripts/update.sh` が、取り込み・放送中の待機・再起動・結果の表示までを行う |
+| 安全面の点検と強化 | `bash scripts/security_check.sh` が、Pi のアドレスが学外から届きうるものか・SSH・sudo・防火壁・OS とカーネルの更新・時刻の同期などを、読むだけで点検する。`sudo bash scripts/harden.sh 手順名` が、直し方を手順ごとに行う（変える前に条件を確かめ、変えたあとに確かめ、`--rollback` で元に戻せる。SSH と防火壁は、確定しなければ自動で元に戻るので、締め出されない）。読み方と進め方は [docs/SECURITY.md](docs/SECURITY.md) |
 | オフライン動作 | 天気取得に失敗しても時報・ひとこと・蛍の光は必ず鳴る（天気だけ黙って飛ばす） |
 | 声の統一 | 読み上げる文言をすべて事前生成して同梱（138 件）。**Pi 上で音声合成は発生しない** |
 | 環境自動判定 | WSL 等の開発環境では音を出さない Mock モード |
@@ -138,6 +139,8 @@ v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです�
     ├── SPECIFICATION.md       # 仕様書（どう実装するか）
     ├── SETUP.md               # 再構築手順書（OS 書き込みから）
     ├── KNOWLEDGE_BASE.md      # 運用ナレッジ・トラブル対応
+    ├── SECURITY.md            # セキュリティの手引き（点検と強化の進め方・脆弱性の報告の窓口）
+    ├── SECURITY_REVIEW.md     # セキュリティレビューの記録
     └── DEVELOPMENT_LOG.md     # 開発履歴
 ```
 
@@ -176,6 +179,16 @@ python3 campus_chime.py --check
 ```
 
 `scripts/setup.sh` は何度実行しても安全です（`config.json` は上書きしません）。途中で `--check` を実行し、NG があれば直し方を表示します（`config.json` を読めないときだけは、サービスを再起動せず（`--no-service` を付けても付けなくても）、「導入は途中です」と表示して終了コード 1 で終わります。直してから、もう一度実行してください）。
+
+### 導入のあと: 安全にする
+
+導入が終わったら、安全面を点検します。読むだけで、何も変えません（`pi` ユーザーで実行すると、root が要る項目は「不明」と出ます。`sudo` を付けると全項目を調べます）。
+
+```bash
+bash scripts/security_check.sh
+```
+
+Pi が大学のグローバルアドレスを持っていて、学外から届くかもしれないこと、SSH がパスワードで入れること、`sudo` にパスワードが要らないこと、防火壁が無いことなどを、直し方（`scripts/harden.sh` の手順）つきで表示します。直し方は `sudo bash scripts/harden.sh ssh` のように、手順を選んで実行します。SSH と防火壁は、新しい端末で入り直せることを確かめて `--confirm` するまで、自動で元に戻る仕組みです。**進める順、手順ごとの影響、元に戻し方、毎月の点検、GitHub 側の守りは [docs/SECURITY.md](docs/SECURITY.md) にあります。**あわせて、更新のたびに最新の `main` をそのまま実行する構成なので、`main` へのマージの前に Pull Request を必ず読んでください（[docs/SECURITY.md](docs/SECURITY.md) の 8 節）。
 
 ## 7. 使い方
 
@@ -381,6 +394,8 @@ git fetch origin && git tag -a v5.2.0 <警告に書かれたコミットの sha>
 | [docs/SPECIFICATION.md](docs/SPECIFICATION.md) | 仕様書。設定項目・モジュール・systemd・テスト仕様 |
 | [docs/SETUP.md](docs/SETUP.md) | 再構築手順書。OS 書き込みから運用開始まで |
 | [docs/KNOWLEDGE_BASE.md](docs/KNOWLEDGE_BASE.md) | 運用ナレッジ・トラブルシューティング |
+| [docs/SECURITY.md](docs/SECURITY.md) | セキュリティの手引き。点検（`security_check.sh`）と強化（`harden.sh`）の進め方、手順ごとの影響と元に戻し方、締め出されたときの復旧、毎月の点検、GitHub 側の守り、脆弱性の報告の窓口 |
+| [docs/SECURITY_REVIEW.md](docs/SECURITY_REVIEW.md) | セキュリティレビューの記録。見つけた問題の評価と、対応の状況 |
 | [docs/DEVELOPMENT_LOG.md](docs/DEVELOPMENT_LOG.md) | 開発履歴 |
 | [CHANGELOG.md](CHANGELOG.md) | 変更履歴 |
 

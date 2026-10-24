@@ -711,6 +711,8 @@ SETUP_MD = "docs/SETUP.md"
 KNOWLEDGE_BASE_MD = "docs/KNOWLEDGE_BASE.md"
 SPECIFICATION_MD = "docs/SPECIFICATION.md"
 REQUIREMENTS_MD = "docs/REQUIREMENTS.md"
+SECURITY_MD = "docs/SECURITY.md"
+SECURITY_REVIEW_MD = "docs/SECURITY_REVIEW.md"
 
 
 def doc(name: str) -> str:
@@ -818,6 +820,10 @@ class OptionExtractionTest(unittest.TestCase):
         self.assertIn("--help", cli_options())
         self.assertEqual(shell_options("setup.sh"), {"--help", "--no-apt", "--no-service"})
         self.assertEqual(shell_options("update.sh"), {"--help"})
+        self.assertEqual(shell_options("security_check.sh"), {"--help", "--user"})
+        self.assertEqual(shell_options("harden.sh"),
+                         {"--help", "--confirm", "--rollback", "--rollback-pending", "--dry-run", "--force",
+                          "--test-sound", "--user", "--revert-after", "--ssh-from", "--ntp-server"})
 
 
 class CliOptionsInDocsTest(unittest.TestCase):
@@ -854,7 +860,9 @@ class CliOptionsInDocsTest(unittest.TestCase):
     def test_the_options_written_after_the_commands_exist(self):
         programs = {"campus_chime.py": cli_options(),
                     "scripts/setup.sh": shell_options("setup.sh"),
-                    "scripts/update.sh": shell_options("update.sh")}
+                    "scripts/update.sh": shell_options("update.sh"),
+                    "scripts/security_check.sh": shell_options("security_check.sh"),
+                    "scripts/harden.sh": shell_options("harden.sh")}
         unknown = []
         for path in current_doc_paths():
             text = read_text(path)
@@ -1006,6 +1014,9 @@ class SectionReferencesInDocsTest(unittest.TestCase):
     def test_every_referenced_section_exists(self):
         headings = {name: heading_numbers(doc(name)) for name in
                     (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD)}
+        for path in current_doc_paths():
+            # 上の 5 つ以外の文書（SECURITY.md など）の「N 章」も、その文書自身の見出しと照らす
+            headings.setdefault(os.path.relpath(path, REPO_ROOT), heading_numbers(read_text(path)))
         problems = []
         for path in current_doc_paths():
             name = os.path.relpath(path, REPO_ROOT)
@@ -3479,6 +3490,400 @@ class KnowledgeBaseQuotesTest(DocTestCase):
         invented = ["「{0}」の「{1}」".format(quote, chunk) for quote, chunk in quoted_chunks(guide)
                     if chunk not in source]
         self.assertEqual(invented, [], "実装に無い文面が引用されています（表示される文面に直す）")
+
+
+# -- セキュリティの点検と強化（scripts/security_check.sh・scripts/harden.sh）の文書 -------------------
+
+HARDEN_SH = os.path.join(REPO_ROOT, "scripts", "harden.sh")
+
+#: harden.sh が引数を読む ``case`` の、手順の名前を並べた行。
+_HARDEN_STEP_CASE = re.compile(r'^\s+(ssh(?: \| [a-z]+)+)\) STEPS\+=\("\$\{arg\}"\)', re.MULTILINE)
+
+#: 文書に ``harden.sh ssh`` のように書かれた手順の名前（小文字で始まる語だけ。``STEP`` のような記号や、
+#: ``harden.sh --rollback`` のようなオプションは拾わない）。
+_HARDEN_WORD = re.compile(r"harden\.sh[ \t]+([a-z][a-z-]*)")
+
+
+def harden_steps() -> List[str]:
+    """harden.sh が受け付ける手順の名前（``recommended`` を除く）。"""
+    match = _HARDEN_STEP_CASE.search(read_text(HARDEN_SH))
+    assert match, "harden.sh の、手順の名前を読む case の行が見つかりません"
+    return match.group(1).split(" | ")
+
+
+def script_constant(script: str, name: str) -> str:
+    """シェルスクリプトの ``NAME=値`` の行の値（クォートの無い 1 語のもの）。"""
+    text = read_text(os.path.join(REPO_ROOT, "scripts", script))
+    match = re.search(r"^{0}=(\S+)$".format(name), text, re.MULTILINE)
+    assert match, "{0} に {1}= の行がありません".format(script, name)
+    return match.group(1)
+
+
+def subsections(text: str, prefix: str) -> dict:
+    """見出し ``### <prefix>N `名前` …`` ごとの本文（名前 → 次の見出しの手前まで）。"""
+    found = {}
+    pattern = re.compile(r"^### {0}\d+ `(\w+)`[^\n]*\n(.*?)(?=^#{{2,3}} |\Z)".format(re.escape(prefix)),
+                         re.MULTILINE | re.DOTALL)
+    for match in pattern.finditer(text):
+        found[match.group(1)] = match.group(2)
+    return found
+
+
+class HardenWordExtractionTest(unittest.TestCase):
+    """検査そのものが、``harden.sh`` に続く手順の名前だけを拾うこと。"""
+
+    def test_only_a_lowercase_word_right_after_the_script_name_is_read(self):
+        text = ("sudo bash scripts/harden.sh ssh\n`harden.sh firewall` と harden.sh --rollback ssh と\n"
+                "harden.sh STEP と harden.sh の説明、harden.sh\n")
+        self.assertEqual(_HARDEN_WORD.findall(text), ["ssh", "firewall"])
+
+    def test_the_steps_are_read_from_the_case_line_of_the_script(self):
+        self.assertEqual(sorted(harden_steps()),
+                         sorted(["ssh", "firewall", "sudo", "services", "journal", "updates", "service", "ntp"]))
+
+    def test_the_steps_are_the_ones_the_script_lists_and_recommended_is_accepted(self):
+        script = read_text(HARDEN_SH)
+        listed = re.search(r"^ALL_STEPS=\(([^)]*)\)", script, re.MULTILINE)
+        self.assertEqual(sorted(listed.group(1).split()), sorted(harden_steps()))
+        self.assertIsNotNone(re.search(r"^\s+recommended\) STEPS\+=", script, re.MULTILINE))
+
+    def test_subsections_are_split_at_their_headings(self):
+        text = "## 5. 手順\n\n### 5.1 `ssh` — 鍵\n本文 1\n\n### 5.2 `firewall` — 防火壁\n本文 2\n\n## 6. 次\n"
+        self.assertEqual(subsections(text, "5."), {"ssh": "本文 1\n\n", "firewall": "本文 2\n\n"})
+
+
+class HardenStepsInDocsTest(DocTestCase):
+    """文書に書いた ``harden.sh`` の手順とオプションが、スクリプトにあること。"""
+
+    def test_every_word_written_after_harden_sh_is_a_step(self):
+        valid = set(harden_steps()) | {"recommended"}
+        unknown = []
+        for path in current_doc_paths():
+            for number, line in enumerate(read_text(path).splitlines(), start=1):
+                unknown.extend("{0}:{1}: harden.sh {2}".format(os.path.relpath(path, REPO_ROOT), number, word)
+                               for word in _HARDEN_WORD.findall(line) if word not in valid)
+        self.assertEqual(unknown, [], "存在しない手順が書かれています（綴りの違い、または廃止）")
+
+    def test_the_security_guide_names_every_step_with_its_command_and_a_heading(self):
+        text = doc(SECURITY_MD)
+        for step in harden_steps():
+            with self.subTest(step=step):
+                self.assertIsNotNone(re.search(r"scripts/harden\.sh[ \t]+{0}\b".format(step), text),
+                                     "SECURITY.md に scripts/harden.sh {0} がありません".format(step))
+                self.assertIsNotNone(re.search(r"^### \d+\.\d+ `{0}` ".format(step), text, re.MULTILINE),
+                                     "SECURITY.md に手順 {0} の見出しがありません".format(step))
+        self.assertIsNotNone(re.search(r"scripts/harden\.sh[ \t]+recommended\b", text))
+
+    def test_every_step_is_explained_by_what_it_changes_its_effect_how_to_check_and_how_to_undo(self):
+        steps = subsections(doc(SECURITY_MD), "5.")
+        self.assertEqual(sorted(steps), sorted(harden_steps()))
+        for step, body in sorted(steps.items()):
+            for label in ("変えること", "放送への影響", "確かめ方", "元に戻す"):
+                with self.subTest(step=step, label=label):
+                    self.assertInDoc("**{0}".format(label), body, "{0} の手順 {1}".format(SECURITY_MD, step))
+            with self.subTest(step=step, what="rollback"):
+                self.assertInDoc("--rollback {0}".format(step), body, "{0} の手順 {1}".format(SECURITY_MD, step))
+
+    def test_the_security_guide_names_every_option_of_the_two_scripts(self):
+        text = doc(SECURITY_MD)
+        for script in ("security_check.sh", "harden.sh"):
+            for option in sorted(shell_options(script) - {"--help"}):
+                with self.subTest(script=script, option=option):
+                    self.assertInDoc(option, text, SECURITY_MD)
+
+    def test_the_specification_rows_of_the_scripts_name_every_option(self):
+        scripts = section(doc(SPECIFICATION_MD), "### 4.19", "### 4.20")
+        for script in ("security_check.sh", "harden.sh"):
+            row = next((line for line in scripts.splitlines() if line.startswith("| `{0}` |".format(script))), "")
+            self.assertTrue(row, "SPECIFICATION.md 4.19 章に {0} の行がありません".format(script))
+            for option in sorted(shell_options(script)):
+                with self.subTest(script=script, option=option):
+                    self.assertIn(option, row)
+            self.assertIn("docs/SECURITY.md", row)
+
+    def test_the_files_the_script_writes_are_named_in_the_security_guide(self):
+        text = doc(SECURITY_MD)
+        for name in ("STATE_REAL", "SSHD_DROPIN", "FW_NFT_FILE", "FW_UNIT", "REVERT_SERVICE", "REVERT_TIMER",
+                     "JOURNAL_DROPIN", "APT_UPGRADES_CONF", "SERVICE_DROPIN", "CHRONY_SOURCES"):
+            with self.subTest(name=name):
+                self.assertInDoc(script_constant("harden.sh", name), text, SECURITY_MD)
+
+    def test_the_revert_window_of_the_guide_is_the_default_and_the_limit_of_the_script(self):
+        script = read_text(HARDEN_SH)
+        default = script_constant("harden.sh", "REVERT_AFTER")
+        text = doc(SECURITY_MD)
+        self.assertInDoc("既定は {0}".format(default), text, SECURITY_MD)
+        self.assertInDoc("{0} 分".format(default), text, SECURITY_MD)
+        self.assertInDoc("{0} 分".format(default), section(doc(KNOWLEDGE_BASE_MD), "### 4-10.", "### 4-11."),
+                         KNOWLEDGE_BASE_MD)
+        self.assertIn('-gt 60', script)
+        self.assertInDoc("1〜60", text, SECURITY_MD)
+
+
+class SecurityGuideContentTest(DocTestCase):
+    """docs/SECURITY.md が、決めた内容（報告の窓口・前提・進め方・確定の仕組み・復旧・毎月の点検・GitHub・事故）を持つこと。"""
+
+    def setUp(self):
+        self.text = doc(SECURITY_MD)
+
+    def test_the_vulnerability_reporting_comes_first_and_says_privately_and_the_scope(self):
+        reporting = section(self.text, "## 1. ", "\n## 2. ")
+        self.assertTrue(reporting)
+        for needle in ("公開の Issue", "非公開", "Report a vulnerability", "Private vulnerability reporting",
+                       "Settings > Security", "対象にするもの", "対象にしないもの"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, reporting, SECURITY_MD)
+
+    def test_the_premise_and_the_way_to_test_from_outside_the_campus_are_written(self):
+        premise = section(self.text, "## 2. ", "\n## 3. ")
+        for needle in ("グローバルアドレス", "クラス B", "security_check.sh", "テザリング", "nc -vz"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, premise, SECURITY_MD)
+
+    def test_the_recommended_order_is_check_then_ssh_then_firewall_then_sudo_then_services(self):
+        order = section(self.text, "## 3. ", "\n## 4. ")
+        marks = ("scripts/security_check.sh", "scripts/harden.sh ssh", "scripts/harden.sh firewall --ssh-from",
+                 "scripts/harden.sh sudo", "scripts/harden.sh services journal", "`ntp`", "`service`")
+        positions = [order.find(mark) for mark in marks]
+        self.assertNotIn(-1, positions, dict(zip(marks, positions)))
+        self.assertEqual(positions, sorted(positions))
+        for needle in ("--dry-run", "ssh-keygen -t ed25519", "ssh-copy-id"):
+            self.assertInDoc(needle, order, SECURITY_MD)
+
+    def test_the_confirm_flow_says_why_the_terminal_must_be_new(self):
+        flow = section(self.text, "## 4. ", "\n## 5. ")
+        for needle in ("新しい端末", "--confirm", "--rollback-pending", "--force", "tmux",
+                       "Permission denied (publickey)", "閉じないでください", "再起動"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, flow, SECURITY_MD)
+
+    def test_the_lockout_recovery_waits_then_uses_the_console(self):
+        lockout = section(self.text, "## 7. ", "\n## 8. ")
+        for needle in ("まず待つ", "HDMI", "USB キーボード", "sudo bash scripts/harden.sh --rollback ssh"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, lockout, SECURITY_MD)
+        self.assertLess(lockout.find("まず待つ"), lockout.find("HDMI"))
+
+    def test_the_monthly_routine_updates_and_reboots_outside_the_broadcast_hours(self):
+        monthly = section(self.text, "## 6. ", "\n## 7. ")
+        for needle in ("bash scripts/security_check.sh", "sudo apt update && sudo apt full-upgrade", "sudo reboot",
+                       "9:55〜17:05", "python3 campus_chime.py --status"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, monthly, SECURITY_MD)
+
+    def test_the_github_protection_is_written(self):
+        github = section(self.text, "## 8. ", "\n## 9. ")
+        for needle in ("二要素認証", "パスキー", "ハードウェアセキュリティキー", "リカバリーコード", "オフライン", "Rulesets",
+                       "Require a pull request before merging", "Block force pushes", "Restrict deletions",
+                       "マージの前", "main"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, github, SECURITY_MD)
+
+    def test_the_pc_side_voicevox_listens_on_loopback(self):
+        pc = section(self.text, "## 9. ", "\n## 10. ")
+        self.assertInDoc("-p 127.0.0.1:50021:50021", pc, SECURITY_MD)
+        self.assertInDoc("SETUP.md", pc, SECURITY_MD)
+
+    def test_the_incident_runbook_has_its_steps(self):
+        incident = section(self.text, "## 10. ", "\n## 11. ")
+        for needle in ("電源を抜く", "SETUP.md", "Wi-Fi のパスフレーズ", "パスワード", "Security log", "取り消"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, incident, SECURITY_MD)
+
+    def test_the_section_numbers_written_in_the_guide_exist(self):
+        headings = heading_numbers(self.text)
+        self.assertTrue({"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"} <= headings)
+        cited = re.findall(r"(\d+(?:\.\d+)?)[ \t]*節", self.text)
+        self.assertTrue(cited)
+        self.assertEqual(sorted(set(cited) - headings), [])
+
+    def test_the_guide_describes_the_defence_and_not_how_to_attack(self):
+        # 公開リポジトリの運用者向けの手引き。攻撃のやり方（偽装の手順・エクスプロイト）は書かない
+        for word in ("なりすま", "偽装", "spoof", "Spoof", "exploit", "Exploit", "PoC", "CVE-"):
+            with self.subTest(word=word):
+                self.assertNotInDoc(word, self.text, SECURITY_MD)
+
+
+class SecurityGuideLinksTest(DocTestCase):
+    """README・仕様書・要件定義書が、新しい文書とスクリプトを載せていること。"""
+
+    def test_the_readme_points_at_the_guide_from_the_features_the_setup_and_the_document_list(self):
+        readme = doc(README_MD)
+        for start, end in (("## 3. できること", "## 4."), ("## 6. セットアップ", "## 7."),
+                           ("## 11. ドキュメント", "## 12.")):
+            with self.subTest(start=start):
+                self.assertInDoc("docs/SECURITY.md", section(readme, start, end), README_MD)
+
+    def test_the_readme_document_list_has_every_file_of_docs(self):
+        table = section(doc(README_MD), "## 11. ドキュメント", "## 12.")
+        self.assertEqual(sorted(re.findall(r"\[docs/(\w+\.md)\]\(docs/\1\)", table)),
+                         listed_files("docs", (".md",)))
+
+    def test_the_readme_tree_lists_every_file_of_docs(self):
+        tree = section(doc(README_MD), "└── docs/", "```")
+        self.assertEqual(sorted(re.findall(r"[├└]── (\w+\.md)", tree)), listed_files("docs", (".md",)))
+
+    def test_the_setup_and_the_knowledge_base_point_at_the_guide(self):
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("SECURITY.md", doc(name), name)
+        self.assertInDoc("SECURITY.md", section(doc(SETUP_MD), "## 13. ", "\n## 14."), SETUP_MD)
+
+    def test_the_specification_change_table_records_the_new_files(self):
+        table = section(doc(SPECIFICATION_MD), "### 2.1", "\n---\n")
+        for name in ("scripts/security_check.sh", "scripts/harden.sh", "docs/SECURITY.md", "docs/SECURITY_REVIEW.md",
+                     "tests/test_security_check.py", "tests/test_harden_script.py"):
+            with self.subTest(name=name):
+                self.assertInDoc("`{0}`".format(name), table, SPECIFICATION_MD)
+                row = next(line for line in table.splitlines() if "`{0}`".format(name) in line)
+                self.assertIn("v6.2.0", row)
+
+    def test_the_620_rows_mention_the_security_tools(self):
+        readme_row = re.search(r"^\|\s*(?:\*\*)?v6\.2\.0(?:\*\*)?\s*\|.*$", doc(README_MD), re.MULTILINE)
+        requirements_row = re.search(r"^\|\s*v6\.2\.0\s*\|.*$", doc(REQUIREMENTS_MD), re.MULTILINE)
+        for name, row in ((README_MD, readme_row), (REQUIREMENTS_MD, requirements_row)):
+            self.assertIsNotNone(row, "{0} に v6.2.0 の行がありません".format(name))
+            for needle in ("security_check.sh", "harden.sh", "docs/SECURITY.md"):
+                with self.subTest(doc=name, needle=needle):
+                    self.assertInDoc(needle, row.group(0), name)
+        for name in (SPECIFICATION_MD, REQUIREMENTS_MD):
+            header = doc(name).split("---", 1)[0]
+            with self.subTest(doc=name):
+                self.assertInDoc("安全面の点検と強化", header, name)
+
+    def test_the_requirements_have_the_security_requirement_and_an_acceptance_condition(self):
+        requirements = doc(REQUIREMENTS_MD)
+        nfr = section(requirements, "### NFR-08", "\n---\n")
+        for needle in ("scripts/security_check.sh", "scripts/harden.sh", "docs/SECURITY.md", "--rollback"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, nfr, REQUIREMENTS_MD)
+        row = next((line for line in requirements.splitlines() if line.startswith("| A-20 |")), "")
+        self.assertIn("security_check.sh", row)
+        self.assertIn("--confirm", row)
+
+    def test_the_requirements_revision_date_is_not_before_the_release_date_in_the_changelog(self):
+        revised = re.search(r"\*\*改訂日:\*\*\s*(\d{4})/(\d\d)/(\d\d)", doc(REQUIREMENTS_MD))
+        released = re.search(r"^## \[{0}\] - (\d{{4}})-(\d\d)-(\d\d)".format(re.escape(__version__)),
+                             read_text(CHANGELOG_PATH), re.MULTILINE)
+        self.assertIsNotNone(revised, "REQUIREMENTS.md のヘッダに改訂日がありません")
+        self.assertIsNotNone(released, "CHANGELOG.md に現行版の見出しがありません")
+        self.assertGreaterEqual(date(*map(int, revised.groups())), date(*map(int, released.groups())))
+
+
+class ServiceDropInInDocsTest(DocTestCase):
+    """放送サービスの保護は追加設定（drop-in）で足し、ユニット本体の文面は変えないこと。"""
+
+    def setUp(self):
+        self.spec = doc(SPECIFICATION_MD)
+        self.chapter = section(self.spec, "### 6.3", "\n---\n")
+
+    def test_the_specification_has_the_chapter_and_says_the_unit_itself_is_not_changed(self):
+        self.assertTrue(self.chapter, "SPECIFICATION.md に 6.3 章がありません")
+        self.assertInDoc(script_constant("harden.sh", "SERVICE_DROPIN"), self.chapter, SPECIFICATION_MD)
+        self.assertInDoc("ユニット本体", self.chapter, SPECIFICATION_MD)
+        self.assertInDoc("変えない", self.chapter, SPECIFICATION_MD)
+
+    def test_the_unit_file_of_the_repository_has_no_sandbox_of_its_own(self):
+        unit = read_text(os.path.join(REPO_ROOT, "campus_chime.service"))
+        for key in ("ProtectSystem", "ReadWritePaths", "SystemCallFilter", "CapabilityBoundingSet"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, unit)
+
+    def test_the_options_of_the_chapter_are_the_ones_the_script_writes(self):
+        script = read_text(HARDEN_SH)
+        block = section(script, "  SANDBOX_PROPS=(\n", "\n  )\n")
+        keys = re.findall(r'^\s+"?([A-Za-z]+)=', block, re.MULTILINE)
+        self.assertGreater(len(keys), 15)
+        missing = [key for key in keys if key not in self.chapter]
+        self.assertEqual(missing, [], "SPECIFICATION.md 6.3 章に載っていない保護の項目があります")
+        for key in ("PrivateDevices", "DeviceAllow", "DevicePolicy", "ProtectClock", "MemoryDenyWriteExecute",
+                    "ProcSubset", "RemoveIPC", "PrivateUsers"):
+            with self.subTest(unused=key):
+                self.assertNotIn(key, keys)
+                self.assertInDoc(key, self.chapter, SPECIFICATION_MD)
+
+
+class SecurityInSetupAndKnowledgeBaseTest(DocTestCase):
+    """SETUP.md と KNOWLEDGE_BASE.md の、安全面に関わる手順と対処。"""
+
+    def test_the_imager_step_recommends_a_public_key_and_a_random_password(self):
+        step = section(doc(SETUP_MD), "### 1-4.", "\n## 2.")
+        self.assertTrue(step)
+        for needle in ("公開鍵認証のみ許可する", "ssh-keygen -t ed25519", "id_ed25519.pub", "秘密鍵",
+                       "sudo bash scripts/harden.sh ssh", "パスワード管理ソフト", "ランダム"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, step, SETUP_MD)
+        self.assertNotInDoc("忘れないもの", step, SETUP_MD)
+
+    def test_the_last_step_runs_the_check_and_points_at_the_guide(self):
+        checklist = section(doc(SETUP_MD), "## 12. ", "\n## 13.")
+        self.assertInDoc("bash scripts/security_check.sh", checklist, SETUP_MD)
+        self.assertInDoc("SECURITY.md", checklist, SETUP_MD)
+
+    def test_voicevox_listens_on_loopback_except_in_the_documented_wsl2_workaround(self):
+        runs = []
+        for path in current_doc_paths():
+            runs.extend((os.path.relpath(path, REPO_ROOT), line) for line in read_text(path).splitlines()
+                        if "docker run" in line and "50021:50021" in line)
+        self.assertTrue(runs)
+        self.assertIn("-p 127.0.0.1:50021:50021", runs[0][1])
+        for name, line in runs:
+            if "-p 127.0.0.1:50021:50021" not in line:
+                # 全部のインターフェースで待ち受ける書き方は、注意と一緒にだけ
+                self.assertIn("学内のほかの人にも届く", line, name)
+        setup = doc(SETUP_MD)
+        self.assertInDoc("--base-url http://<ホストのIP>:50021", setup, SETUP_MD)
+        self.assertInDoc("docker stop voicevox", section(setup, "WSL2 側から", "生成した音声を WSL2"), SETUP_MD)
+
+    def test_the_update_procedure_tells_that_sudo_may_ask_for_the_password(self):
+        procedure = section(doc(SETUP_MD), "### A. Pi 側で反映する", "### B.")
+        self.assertInDoc("harden.sh sudo", procedure, SETUP_MD)
+        self.assertInDoc("パスワードを聞かれる", procedure, SETUP_MD)
+
+    def test_the_chrony_restart_is_written_next_to_the_timesyncd_restart(self):
+        blocks = [block for block in fenced_blocks(doc(KNOWLEDGE_BASE_MD))
+                  if "systemctl restart systemd-timesyncd" in block]
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("systemctl restart chrony", blocks[0])
+        self.assertInDoc("chronyc tracking", section(doc(KNOWLEDGE_BASE_MD), "### 4-5.", "### 4-6."),
+                         KNOWLEDGE_BASE_MD)
+
+    def test_the_monthly_routine_is_a_full_upgrade_and_a_reboot_outside_the_broadcast_hours(self):
+        table = section(doc(KNOWLEDGE_BASE_MD), "## 5. 定期点検の目安", "\n---\n")
+        row = next((line for line in table.splitlines() if "full-upgrade" in line), "")
+        self.assertTrue(row.startswith("| 毎月"), "毎月の行に apt full-upgrade がありません")
+        for needle in ("security_check.sh", "9:55〜17:05", "再起動", "--status", "SECURITY.md"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, row)
+        self.assertNotInDoc("学期ごと", table, KNOWLEDGE_BASE_MD)
+
+    def test_no_document_tells_the_reader_to_run_a_plain_apt_upgrade(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD, SECURITY_MD):
+            with self.subTest(doc=name):
+                self.assertIsNone(re.search(r"\bapt(?:-get)? upgrade\b", doc(name)),
+                                  "apt upgrade ではなく apt full-upgrade を書く")
+
+    def test_the_troubleshooting_has_an_entry_for_each_consequence_of_a_step(self):
+        chapter = section(doc(KNOWLEDGE_BASE_MD), "## 4. トラブル対処", "\n## 5.")
+
+        def entry(fragment: str) -> str:
+            match = re.search(r"^### 4-\d+\. [^\n]*{0}[^\n]*\n(.*?)(?=^### |\Z)".format(re.escape(fragment)),
+                              chapter, re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, "KNOWLEDGE_BASE.md 4 章に「{0}」の項目がありません".format(fragment))
+            return match.group(1)
+
+        ssh = entry("SSH で入れない")
+        for needle in ("--rollback ssh", "--rollback firewall", "HDMI", "--rollback-pending"):
+            with self.subTest(entry="ssh", needle=needle):
+                self.assertIn(needle, ssh)
+        password = entry("パスワードを聞くようになった")
+        for needle in ("update.sh", "setup.sh", "--rollback sudo", "harden.sh sudo"):
+            with self.subTest(entry="sudo", needle=needle):
+                self.assertIn(needle, password)
+        sound = entry("harden.sh service")
+        for needle in ("--rollback service", "--test-sound"):
+            with self.subTest(entry="service", needle=needle):
+                self.assertIn(needle, sound)
 
 
 if __name__ == "__main__":

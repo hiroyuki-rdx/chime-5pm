@@ -3,11 +3,14 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
-## [6.2.0] - 2026-10-13
+## [6.2.0] - 2026-10-24
 
 新機能の版（改善 4 段階の 4）。休館日の指定・放送の一時休止・種類ごとの音量を追加し、停止要求で
-再生がすぐ止まるようにした。**既定の設定で動かしている場合、放送の時刻と内容は変わらない**
+再生がすぐ止まるようにした。あわせて、運用中の Pi の安全面を点検する `scripts/security_check.sh` と、
+見つかった点を手順ごとに、元に戻せる形で直す `scripts/harden.sh`、その手引き `docs/SECURITY.md` を追加した。
+**既定の設定で動かしている場合、放送の時刻と内容は変わらない**
 （休館日なし・休止なし・音量はすべて 1.0）。読み上げ文言と作り置き音声も変わらない（作り直しは不要）。
+点検と強化のスクリプトは、運用者が自分で実行したときだけ働く（更新しただけでは Pi の設定は何も変わらない）。
 
 ### 追加
 
@@ -28,6 +31,37 @@
   （警告を 1 回出す）
 - `--status` に放送の休止と近い休館日（14 日以内）、`--check` に休館日の書き間違い・休止中であること・
   休止の記録の異常を表示する。放送の履歴の結果に「止めていた（skipped）」「中断（interrupted）」を追加
+- **安全面の点検**（`scripts/security_check.sh`）: 運用中の Pi を**読むだけ**で点検する（何も書かず、
+  一時ファイルも作らず、サービスにも触れない）。Pi のアドレスを一つずつ私的・共有・グローバルに分け
+  （大学がクラス B／C のアドレスの範囲を持つと、Pi がグローバルアドレスを持つことがある）、グローバルが
+  あれば学外から届くかを確かめる方法（`nc -vz`）を表示し、SSH のパスワードログインは「届くなら高」として扱う。
+  SSH・`sudo`・防火壁・OS とカーネルの更新（再起動待ちを含む）・時刻の同期・使っていないサービス・
+  放送サービスの隔離・リポジトリの状態を調べ、項目ごとに `[OK]`・`[情報]`・`[注意]`・`[要対応]`・`[不明]` と、
+  直し方（`harden.sh` の手順の名前）を出す。`pi` でも `sudo` 付きでも動く（root が要る項目は `pi` では
+  `[不明]`）。`--user NAME`。終了コードは `[要対応]` が無ければ 0、あれば 1、使い方の誤りは 2
+- **安全面の強化**（`scripts/harden.sh`、root で実行）: 手順は `ssh`（SSH を鍵だけにする）・`firewall`
+  （nftables で入ってくる通信を SSH・mDNS・DHCP・ICMP だけにする。`--ssh-from CIDR`）・`sudo`（`sudo` に
+  パスワードを求める）・`services`（`bluetooth`・`hciuart`・`ModemManager` を止める）・`journal`（ログを再起動の
+  あとも残す）・`updates`（セキュリティ更新を自動で入れる。再起動はしない）・`service`（放送サービスに保護
+  〔sandbox〕を追加設定として足す。`--test-sound`）・`ntp`（時刻の同期を `chrony` にする。`--ntp-server HOST`）。
+  `recommended` は `services journal ssh firewall`。**どの手順も任意で、元に戻せる**（`--rollback [手順…]`。
+  変える前の姿は `/var/lib/campus-chime-harden` に控える）。変える前に条件をすべて確かめ、満たさないものが
+  あれば理由をすべて表示して何も変えずに止まり、変えたあとに効いたことを確かめ、確かめられなければその手順を
+  自分で元に戻す。`--dry-run` は何も変えずに内容だけを表示する
+- **`ssh` と `firewall` は、確定しないと自動で元に戻る**: 締め出される恐れのある変更なので、適用すると
+  「確定待ち」になり、**新しい端末**で入り直せたことを確かめて `sudo bash scripts/harden.sh --confirm` するまで、
+  10 分（`--revert-after`、1〜60 分）で元に戻る（再起動しても戻る）。変更の前に開いた画面からの `--confirm` は
+  断る（`--force` で確定できる）。戻す処理は、リポジトリではなく root だけが書ける写しを実行する。
+  `--rollback-pending` で確定待ちをすぐ戻せる
+- `docs/SECURITY.md`: 運用者向けの手引き。**脆弱性の連絡先**（非公開の報告のしかたと、対象・対象外）、前提、
+  進める順、確定の仕組み、手順ごとの影響と元に戻し方、毎月の点検、閉め出されたときの復旧、GitHub 側の守り、
+  PC 側の VOICEVOX、乗っ取られたかもしれないときの手順
+- `docs/SECURITY_REVIEW.md`: 2026-10 のセキュリティレビューの記録（公開版）。指摘 17 件の重さ・対策・状況、
+  Pi と GitHub でやること、今後のコードの修正候補、確かめられなかったこと、参照（CISA KEV など）
+- `tests/test_security_check.py`・`tests/test_harden_script.py`: 偽のシステム（`CHIME_SYSROOT`）と偽の
+  コマンドで本物のスクリプトを動かす（実機の設定は変えない）。`tests/test_docs.py` は、文書に書いた
+  `harden.sh` の手順・オプション・ファイルの場所がスクリプトにあること、追加設定の項目が `SANDBOX_PROPS` と
+  一致することなどを確かめる
 
 ### 変更
 
@@ -41,6 +75,24 @@
   再生プログラムをプロセスグループごと止める（ラッパー経由でも残らない）
 - 予定が 1 件も無いときの警告は、続くあいだ 1 回だけにした（それまでは 1 分ごと）
 - GitHub Actions: `actions/checkout@v5`・`actions/setup-python@v6`（Node.js 24）に上げた
+- **`docs/SETUP.md`**: Imager の手順で、SSH は公開鍵認証を勧める（Windows・macOS の鍵の作り方つき。
+  パスワード認証を選んでも導入はでき、あとで `harden.sh ssh` で鍵だけにできる）。`pi` のパスワードは
+  「覚えやすいもの」ではなく、パスワード管理ソフトで作る長いランダムな文字列にする。12 章の最後に安全面の
+  手順（`bash scripts/security_check.sh`）、13 章に `SECURITY.md` へのリンクを足した。`harden.sh sudo` のあと
+  `update.sh`・`setup.sh` が `sudo` の行でパスワードを聞くことを書いた。VOICEVOX ENGINE の例は
+  `-p 127.0.0.1:50021:50021`（PC の中だけで待ち受ける）にした。WSL2 から Windows 側の ENGINE へ
+  `--base-url` で届かせる回避策は全部のインターフェースが要るので、`-p 50021:50021` でコンテナを作り直す手順に
+  「学内のほかの人にも届く」注意を付けた
+- **`docs/KNOWLEDGE_BASE.md`**: 学期ごとの `apt upgrade` を、**毎月**の `apt full-upgrade` と、放送のない
+  時間（9:55〜17:05 以外）の再起動と、`security_check.sh` の確認に替えた。4-5 に、`harden.sh ntp` で
+  `chrony` に替えた Pi の再同期（`sudo systemctl restart chrony`）を足した。トラブル対処に 4-10（`harden.sh` の
+  あとで SSH で入れない）・4-11（`harden.sh sudo` のあと `update.sh`・`setup.sh` がパスワードを聞く）・
+  4-12（`harden.sh service` のあとで音が出ない。`--rollback service`）を追加し、概要・コマンド・設計上の
+  決定にも安全面の行を足した
+- `README.md`・`docs/SPECIFICATION.md`（ヘッダ、2 章の変更表、4.19 章のスクリプトとテストの行、追加設定の
+  6.3 章、11 章）・`docs/REQUIREMENTS.md`（NFR-08、受け入れ条件 A-20）に、点検と強化を反映した。
+  `tests/test_docs.py` は、文書に書いたスクリプトの手順・オプション・ファイルの場所が実在することと、
+  `docs/` の全文書の「N 章」の参照が実在することを確かめる
 
 ### 移行
 
@@ -54,6 +106,13 @@ bash scripts/update.sh
 休館日を使うときは `config.json` の `schedule.closures` に書き、`python3 campus_chime.py --check` で
 書き方を確かめ、`sudo systemctl restart campus_chime.service` のあと `python3 campus_chime.py --schedule 40`
 で「休館」の行を確認する。
+
+安全面の点検と強化は、更新しただけでは働かない。まず `bash scripts/security_check.sh`（読むだけ）で現状を
+見て、直す点があれば、`docs/SECURITY.md` の順に `sudo bash scripts/harden.sh 手順名` を、放送のない時間
+（9:55〜17:05 以外）に 1 つずつ行う（迷ったら `--dry-run` で内容だけを見る）。`ssh` と `firewall` は、新しい
+端末から `sudo bash scripts/harden.sh --confirm` するまで 10 分で元に戻る。`pi` の公開鍵を登録してから
+`ssh` を適用すること。PC 側で VOICEVOX を `-p 50021:50021` で起動していたコンテナは、
+`docker rm -f voicevox` で消して `-p 127.0.0.1:50021:50021` で作り直す（`docs/SETUP.md` 8 章）。
 
 ## [6.1.0] - 2026-10-09
 
