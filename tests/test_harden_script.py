@@ -174,7 +174,7 @@ esac
 case "$1" in
   mkdir)
     case "$3" in
-      "$TEST_TMP"/*) exec mkdir "$@" ;;
+      "$TEST_TMP"/*) shift; exec mkdir "$@" ;;
       *) echo "stub: mkdir outside the test directory refused: $3" >&2; exit 1 ;;
     esac ;;
   sudo) shift; exec sudo "$@" ;;
