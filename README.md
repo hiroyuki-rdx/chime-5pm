@@ -127,6 +127,8 @@ v1.x で起きていた問題と、v3.0.0 での解決は次のとおりです�
 ├── scripts/
 │   ├── setup.sh               #   導入スクリプト（冪等）
 │   ├── update.sh              #   更新スクリプト（取り込み・放送中の待機・再起動・結果の表示）
+│   ├── security_check.sh      #   セキュリティの点検（読むだけ。何も変えない）
+│   ├── harden.sh              #   セキュリティの強化（段階ごとに選んで実行。どれも元に戻せる）
 │   ├── generate_voicevox.py   #   VOICEVOX で定型文を事前生成
 │   ├── dump_example_config.py #   config.example.json の再生成
 │   └── tag_releases.py        #   版のタグ付け（GitHub Actions が実行）
