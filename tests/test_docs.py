@@ -18,16 +18,37 @@
 ことがある）。設定の検査で何を置き換え、何を警告にとどめるかの表も、実装に値を入れて
 確かめた結果と一致させる。
 
+休館日（``schedule.closures``）・「今日だけ止める」（``--pause-*``）・種類ごとの音量（``audio.volume``）・
+停止要求での再生の停止については、設定例の JSON が実際に読めて効くこと、出力例（``--pause-*``・``--schedule``・
+``--status``）が実装に出させた文面と一致すること、既定値・上限・秒数が実装の定数と一致すること、
+「再生中は止まらない」「祝日判定は未対応」のような v6.1.0 までの記述が残っていないことを確かめる。
+止めた回の履歴は、言い過ぎない（先に止めた日の回は履歴にも回ごとのログにも残らず、準備に入っていた回だけが
+``skipped`` になる）ことを、本物の常駐ループで確かめる。設置場所の種類のような、裏づけのない事実も書かない
+（祝日も開館する、は運用者の判断として書く）。0 時の時報は鳴る予定の日で休止・休館日が決まること、休館日の行の頭は
+「休館」であること、休止の記録を書けない・消せないときの案内、``--check`` が警告するかどうかも、実装と同じに書く。
+
 数え間違い（表の行数と「上の N つ」の食い違い）、言い過ぎ（途中で切れた MP3 を見つけると
 書いたのに、先頭しか見ていなかった）、言い落とし（原因ごとの案内、上限の値、簡易の内容で
 鳴った放送の表示）も、実装の動きと定数に合わせて確かめる。ソースの書き方（無効な
 エスケープの警告）も、ここで確かめる。
+
+セキュリティの文書（``docs/SECURITY.md`` など）については、手順・オプション・ファイルの場所がスクリプトに
+あること、時刻（apt のタイマー）・秒数・上限・分数がスクリプトの値と同じであること、適用の前の注意（実機では
+未試験・コンソールの用意・放送のない時間）が手順より前にあること、確認の手順が ``sudo`` 付きの点検であること、
+「締め出されない」「どれも元に戻せる」のような言い切りが無いこと、新しい端末で打つ確定のコマンドが絶対パスで
+あること、運用の手順が点検の画面に出る分類の名前で書かれ、画面に出ない項目の ID を指していないことを確かめる。
+点検の ``harden.sh`` の確定待ちの項目（``ssh``・``firewall`` の確定と、``sudo`` だけが止まったときの案内の分け方、
+``window`` の読み方）と、``setup.sh`` が再起動の前に作るフォルダ（``cache/``・``assets/generated/``）についても、
+文書の記述がスクリプトと同じであることを確かめる。
 """
 
 from __future__ import annotations
 
+import contextlib
 import copy
+import dataclasses
 import glob
+import inspect
 import io
 import json
 import os
@@ -35,26 +56,30 @@ import re
 import shutil
 import sys
 import tempfile
+import textwrap
 import unittest
 from datetime import date, datetime
 from typing import List, NamedTuple, Tuple
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from tests.support import REPO_ROOT, load_manifest
+from tests.support import REPO_ROOT, load_manifest, logs_enabled
 
-from chime import __version__, buildinfo, check, cli, configcheck, phrases, status, timesignal, weather
+from chime import __version__, audio, buildinfo, check, cli, configcheck, phrases, status, timesignal, weather
 from chime import config as chime_config
-from chime.app import MISSING_PREVIEW, RETRY_SECONDS, ChimeApp
+from chime.app import MISSING_PREVIEW, NO_EVENTS_RECHECK_SECONDS, RETRY_SECONDS, ChimeApp
 from chime.audio import Segment
 from chime.check import INFO_LIMIT, LIST_LIMIT, Result, prerecorded_coverage, render_section, summarize
 from chime.config import BASE_DIR, DEFAULT_CONFIG, Config
-from chime.history import KEEP_LINES, MAX_LINES, History, make_entry
+from chime.history import KEEP_LINES, MAX_LINES, RESULTS, History, make_entry
+from chime.pause import MAX_PAUSE_BYTES, MAX_PAUSE_DAYS, PauseStore
 from chime.phrases import announcement_phrases, collect_phrases
 from chime.quotes import load_quotes
-from chime.scheduler import Scheduler
+from chime.scheduler import MAX_LOOKAHEAD_DAYS, Scheduler
 from chime.sequence import PlaybackPlan
 from chime.state import MAX_RECENT_QUOTES
+
+import tests.test_app as app_tests
 
 CHANGELOG_PATH = os.path.join(REPO_ROOT, "CHANGELOG.md")
 
@@ -404,7 +429,7 @@ def documented_claims(counts: DocumentedCounts) -> List[Claim]:
               r"廃止した (\d+) 項目 `weather\.provider`", (counts.removed_weather,)),
         Claim("docs/KNOWLEDGE_BASE.md", "廃止したキーの数", r"廃止した (\d+) キーのうち",
               (counts.removed,)),
-    ] + tool_claims()
+    ] + tool_claims() + closure_and_pause_claims()
 
 
 def tool_claims() -> List[Claim]:
@@ -468,6 +493,66 @@ def tool_claims() -> List[Claim]:
         Claim(spec, "予定を求められないときのやり直し", r"(\d+) 秒後にやり直す", (RETRY_SECONDS,)),
         Claim(spec, "起動時の警告に挙げる文言の数", r"件数と先頭 (\d+) 件の文言", (MISSING_PREVIEW,)),
     ]
+
+
+def service_value(name: str) -> int:
+    """``campus_chime.service`` の ``name=数値`` の行の数値。"""
+    text = read_text(os.path.join(REPO_ROOT, "campus_chime.service"))
+    match = re.search(r"^{0}=(\d+)$".format(name), text, re.MULTILINE)
+    assert match is not None, "campus_chime.service に {0} がありません".format(name)
+    return int(match.group(1))
+
+
+def closure_and_pause_claims() -> List[Claim]:
+    """休館日・休止・音量・再生の停止について文書に書かれた数値と、実装の定数・既定の設定。"""
+    docs = ("README.md", "docs/SETUP.md", "docs/KNOWLEDGE_BASE.md", "docs/SPECIFICATION.md",
+            "docs/REQUIREMENTS.md")
+    setup, kb, spec = "docs/SETUP.md", "docs/KNOWLEDGE_BASE.md", "docs/SPECIFICATION.md"
+    claims = [Claim(path, "休止の最長の日数", r"最長 (\d+) 日", (MAX_PAUSE_DAYS,)) for path in docs]
+    claims += [Claim(path, "近い休館日を挙げる日数", r"休館日（今後 (\d+) 日）", (status.CLOSURE_DAYS,))
+               for path in (setup, kb, spec)]
+    claims += [
+        Claim(spec, "予定を探す日数", r"最大 (\d+) 日先まで", (MAX_LOOKAHEAD_DAYS,)),
+        Claim(spec, "予定が無いときの再確認", r"(\d+) 分ごとに再確認",
+              (NO_EVENTS_RECHECK_SECONDS // 60,)),
+        Claim(spec, "停止要求のフェードアウト", r"(\d+) ミリ秒（`STOP_FADEOUT_MS`）",
+              (audio.STOP_FADEOUT_MS,)),
+        Claim(spec, "WAV の打ち切りの余裕", r"長さに (\d+) 秒（`WAV_TIMEOUT_MARGIN_SECONDS`）",
+              (int(audio.WAV_TIMEOUT_MARGIN_SECONDS),)),
+        Claim(spec, "休止の記録の大きさの上限", r"(\d+) MiB（`MAX_PAUSE_BYTES`）", (MAX_PAUSE_BYTES // (1024 * 1024),)),
+        Claim(spec, "停止のフェードアウトを待つ余裕", r"(\d+) ミリ秒〔`STOP_FADEOUT_MARGIN_MS`〕",
+              (audio.STOP_FADEOUT_MARGIN_MS,)),
+        Claim(spec, "再生の確認の間隔", r"([\d.]+) 秒（`POLL_SECONDS`）", (audio.POLL_SECONDS,)),
+        Claim(spec, "外部コマンドを止める猶予", r"(\d+) 秒（`TERMINATE_GRACE_SECONDS`）",
+              (int(audio.TERMINATE_GRACE_SECONDS),)),
+        Claim(spec, "音声デバイスの初期化の試行",
+              r"(\d+) 回（`MIXER_INIT_ATTEMPTS`）まで試し、(\d+) 秒（`MIXER_INIT_RETRY_SECONDS`）おき",
+              (audio.MIXER_INIT_ATTEMPTS, int(audio.MIXER_INIT_RETRY_SECONDS))),
+        Claim(spec, "ユニットの停止の待ち時間", r"TimeoutStopSec=(\d+)", (service_value("TimeoutStopSec"),)),
+    ]
+    # 設定表の既定値（仕様書 3.2 章）。キーの書き方は、表の見出しの節の中の短い形
+    schedule, audio_defaults = DEFAULT_CONFIG["schedule"], DEFAULT_CONFIG["audio"]
+    # 休止の説明が言う秒数: 実行中のサービスが書き換えに気づくまで（待機の 1 回分）と、準備に入る時刻（再生開始の前）
+    claims += [Claim(path, "休止に気づくまでの秒数", r"最大 (\d+) 秒ほど", (int(schedule["max_sleep_seconds"]),))
+               for path in ("README.md", setup, kb)]
+    claims += [Claim(path, "待機の長さの既定", r"max_sleep_seconds`。既定 (\d+) 秒", (int(schedule["max_sleep_seconds"]),))
+               for path in (setup, kb)]
+    claims += [Claim(path, "追いかけ再生の猶予の既定", r"catchup_grace_seconds`。既定 (\d+) 秒",
+                     (int(schedule["catchup_grace_seconds"]),)) for path in (setup, kb)]
+    claims += [Claim(path, "準備に入る秒数", r"再生開始の (\d+) 秒前から", (int(schedule["prepare_lead_seconds"]),))
+               for path in ("README.md", setup, kb, spec, "docs/REQUIREMENTS.md")]
+    rows = [("closures.dates", schedule["closures"]["dates"]),
+            ("closures.ranges", schedule["closures"]["ranges"]),
+            ("volume.time_signal", audio_defaults["volume"]["time_signal"]),
+            ("volume.voice", audio_defaults["volume"]["voice"]),
+            ("volume.music", audio_defaults["volume"]["music"]),
+            ("max_segment_seconds", audio_defaults["max_segment_seconds"]),
+            ("state.pause_file", DEFAULT_CONFIG["state"]["pause_file"])]
+    for key, value in rows:
+        shown = value if isinstance(value, str) else json.dumps(value)
+        claims.append(Claim(spec, "設定表の既定値 {0}".format(key),
+                            r"\| `{0}` \| `([^`]*)` \|".format(re.escape(key)), (shown,)))
+    return claims
 
 
 class ClaimCheckTest(unittest.TestCase):
@@ -636,6 +721,8 @@ SETUP_MD = "docs/SETUP.md"
 KNOWLEDGE_BASE_MD = "docs/KNOWLEDGE_BASE.md"
 SPECIFICATION_MD = "docs/SPECIFICATION.md"
 REQUIREMENTS_MD = "docs/REQUIREMENTS.md"
+SECURITY_MD = "docs/SECURITY.md"
+SECURITY_REVIEW_MD = "docs/SECURITY_REVIEW.md"
 
 
 def doc(name: str) -> str:
@@ -743,6 +830,10 @@ class OptionExtractionTest(unittest.TestCase):
         self.assertIn("--help", cli_options())
         self.assertEqual(shell_options("setup.sh"), {"--help", "--no-apt", "--no-service"})
         self.assertEqual(shell_options("update.sh"), {"--help"})
+        self.assertEqual(shell_options("security_check.sh"), {"--help", "--user"})
+        self.assertEqual(shell_options("harden.sh"),
+                         {"--help", "--confirm", "--rollback", "--rollback-pending", "--dry-run", "--force",
+                          "--test-sound", "--user", "--revert-after", "--ssh-from", "--ntp-server"})
 
 
 class CliOptionsInDocsTest(unittest.TestCase):
@@ -772,13 +863,16 @@ class CliOptionsInDocsTest(unittest.TestCase):
         table = section(doc(REQUIREMENTS_MD), "### FR-09", "### FR-10")
         listed = set(re.findall(r"^\| `(--[a-z-]+)", table, re.MULTILINE))
         self.assertEqual(sorted(listed - cli_options()), [])
-        for option in ("--check", "--status", "--wait-idle", "--version"):
+        for option in ("--check", "--status", "--wait-idle", "--version", "--pause-today",
+                       "--pause-until", "--pause-off", "--reason"):
             self.assertIn(option, listed, "REQUIREMENTS.md の FR-09 の表に載っていません")
 
     def test_the_options_written_after_the_commands_exist(self):
         programs = {"campus_chime.py": cli_options(),
                     "scripts/setup.sh": shell_options("setup.sh"),
-                    "scripts/update.sh": shell_options("update.sh")}
+                    "scripts/update.sh": shell_options("update.sh"),
+                    "scripts/security_check.sh": shell_options("security_check.sh"),
+                    "scripts/harden.sh": shell_options("harden.sh")}
         unknown = []
         for path in current_doc_paths():
             text = read_text(path)
@@ -824,7 +918,7 @@ class FileListsInDocsTest(unittest.TestCase):
         self.assertEqual(missing, [], "SPECIFICATION.md に `chime/<名前>` の記載がありません")
 
     def test_the_specification_names_every_script_in_its_script_section(self):
-        scripts = section(self.spec, "### 4.19", "\n---\n")
+        scripts = section(self.spec, "### 4.19", "### 4.20")
         self.assertTrue(scripts, "SPECIFICATION.md に 4.19 章がありません")
         missing = [name for name in listed_files("scripts", (".sh", ".py"))
                    if "| `{0}` |".format(name) not in scripts]
@@ -930,6 +1024,9 @@ class SectionReferencesInDocsTest(unittest.TestCase):
     def test_every_referenced_section_exists(self):
         headings = {name: heading_numbers(doc(name)) for name in
                     (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD)}
+        for path in current_doc_paths():
+            # 上の 5 つ以外の文書（SECURITY.md など）の「N 章」も、その文書自身の見出しと照らす
+            headings.setdefault(os.path.relpath(path, REPO_ROOT), heading_numbers(read_text(path)))
         problems = []
         for path in current_doc_paths():
             name = os.path.relpath(path, REPO_ROOT)
@@ -970,7 +1067,8 @@ def _app_in(directory: str, **overrides) -> ChimeApp:
     data = copy.deepcopy(DEFAULT_CONFIG)
     _merge(data, overrides)
     data["state"] = {"file": os.path.join(directory, "state.json"),
-                     "history_file": os.path.join(directory, "history.jsonl")}
+                     "history_file": os.path.join(directory, "history.jsonl"),
+                     "pause_file": os.path.join(directory, "pause.json")}
     data["audio"]["mock_max_seconds"] = 0
     data["tts"]["engines"] = ["prerecorded"]
     return ChimeApp(Config(data, base_dir=BASE_DIR), backend="mock")
@@ -1043,6 +1141,29 @@ def real_history_lines(directory: str) -> List[str]:
     app = _app_in(directory)
     event = _event(app, date(2026, 10, 9), "closing")
     _broadcast(app, event, app.builder.build_closing())
+
+    # 10/12 10:00 時報: 「今日だけ止める」で止めていたので、鳴らさなかった
+    app = _app_in(directory)
+    app.pause = PauseStore(app.pause.path, today=lambda: date(2026, 10, 12))
+    app.pause.set(date(2026, 10, 12), "設備点検", now=datetime(2026, 10, 12, 9, 0, tzinfo=ZONE))
+    event = _event(app, date(2026, 10, 12), "hourly:10")
+    with mock.patch("chime.app.logger"):
+        app._skip_if_paused(event)
+    os.remove(app.pause.path)
+
+    # 10/12 16:57 閉館放送: 閉館アナウンスのあと、蛍の光の前に停止の要求を受けて止まった
+    app = _app_in(directory)
+    event = _event(app, date(2026, 10, 12), "closing")
+    plan = app.builder.build_closing()
+    play_one = app.player.play_one
+
+    def play_one_then_stop(segment):
+        play_one(segment)
+        app.stop_event.set()
+
+    with mock.patch.object(app.player, "play_one", play_one_then_stop), \
+            mock.patch("chime.app.logger"):
+        _broadcast(app, event, plan)
 
     entries = History(os.path.join(directory, "history.jsonl")).recent(status.HISTORY_LIMIT)
     return [status.describe_entry(entry, ZONE).replace(home, EXAMPLE_HOME) for entry in entries]
@@ -1123,7 +1244,7 @@ class OutputExamplesTest(unittest.TestCase):
                 break
             labels.append(re.split(r"\s{2,}", line, maxsplit=1)[0])
         self.assertEqual(labels, ["現在時刻", "時刻の同期", "サービス", "自動起動", "再生方法",
-                                  "作り置きの音声"])
+                                  "作り置きの音声", "放送の休止"])
         for label in labels:
             self.assertIn("「{0}」".format(label), self.knowledge_base)
 
@@ -1186,16 +1307,16 @@ class OutputExamplesTest(unittest.TestCase):
         # 実装に放送させて、履歴に記録された行を読み出し、--status が表示する行と比べる
         with tempfile.TemporaryDirectory() as directory:
             lines = real_history_lines(directory)
-        self.assertEqual(len(lines), 6)
+        self.assertEqual(len(lines), status.HISTORY_LIMIT)
         self.assertIn("\n".join(lines), self.knowledge_base)
 
     def test_the_result_words_of_a_history_line_are_explained(self):
         words = []
-        for result in ("ok", "partial", "failed", "error"):
+        for result in RESULTS:
             line = status.describe_entry(
                 {"kind": "hourly", "result": result, "at": "2026-10-08T12:00:00+09:00"}, ZONE)
             words.append(line.split()[3])
-        self.assertEqual(words, ["成功", "一部のみ", "失敗", "エラー"])
+        self.assertEqual(words, ["成功", "一部のみ", "失敗", "エラー", "止めていた", "中断"])
         for word in words:
             self.assertIn("| {0} |".format(word), self.knowledge_base)
 
@@ -1212,8 +1333,10 @@ class OutputExamplesTest(unittest.TestCase):
         degraded = dict(history=[{"result": "ok", "degraded": True}])
         # tts.engines に prerecorded が無いと、声がそろっていても Pi は無音になる
         silent = dict(prerecorded_enabled=False)
+        # 停止要求で途中で止まった放送。結果は「中断」で、失敗とは別の理由として挙げる
+        interrupted = dict(history=[{"result": "interrupted", "played": 1, "total": 2}])
         cases = (dict(ntp=False), dict(active="inactive"), dict(backend="mock"),
-                 dict(history=[{"result": "failed"}]), dropped, degraded, silent,
+                 dict(history=[{"result": "failed"}]), dropped, degraded, interrupted, silent,
                  dict(coverage=missing))
         for overrides in cases:
             reason = reasons(**overrides)
@@ -1628,7 +1751,7 @@ class HistoryEntryInDocsTest(DocTestCase):
 
     def test_every_field_of_an_entry_is_a_row_of_the_specification_table(self):
         entry = make_entry(at=datetime(2026, 10, 8, 12, 0, tzinfo=ZONE), key="hourly:12",
-                           kind="hourly", played=1, total=1, error="x")
+                           kind="hourly", played=1, total=1, error="x", reason="休止: 点検")
         table = section(doc(SPECIFICATION_MD), "### 4.16", "### 4.17")
         for field in entry:
             with self.subTest(field=field):
@@ -2593,6 +2716,691 @@ class Mp3AndStickyChecksInDocsTest(DocTestCase):
                 self.assertInDoc("sticky ビット", section(doc(name), start, end), name)
 
 
+# -- 休館日・休止・音量・停止の文書 ---------------------------------------------------
+
+#: 休館日と休止の出力例の「いま」（金曜 12:30）。SETUP.md 6-3・7 章と KNOWLEDGE_BASE.md の例は、この時刻の出力。
+EXAMPLE_NOW = datetime(2026, 10, 30, 12, 30, tzinfo=ZONE)
+
+#: SETUP.md 7 章の、休館日と音量の例の見出し（太字）。
+CLOSURES_HEADING = "休館日を決める（学園祭・年末年始など）"
+VOLUME_HEADING = "音量を絞る"
+
+
+@contextlib.contextmanager
+def example_clock(now: datetime = EXAMPLE_NOW):
+    """``ChimeApp.now()`` を ``now`` に固定する（この間に作ったアプリの予定の計算も追従する）。"""
+    with mock.patch.object(ChimeApp, "now", lambda app: now):
+        yield
+
+
+def printing(function, *args):
+    """``function(*args)`` の ``(戻り値, 標準出力, 標準エラー出力)``。"""
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        result = function(*args)
+    return result, out.getvalue(), err.getvalue()
+
+
+def setup_example(heading: str) -> dict:
+    """SETUP.md 7 章の、太字の見出し ``heading`` の下にある JSON の例（設定の上書き）。"""
+    chapter = section(doc(SETUP_MD), "## 7. 設定を変える", "\n## 8.")
+    body = section(chapter, "**{0}**".format(heading), "\n**")
+    blocks = [block for block in fenced_blocks(body) if block.lstrip().startswith("{")]
+    assert blocks, "SETUP.md 7 章に「{0}」の JSON の例がありません".format(heading)
+    return json.loads(blocks[0])
+
+
+def unit_directives(text: str) -> List[str]:
+    """systemd ユニットの、コメントと空行を除いた行。"""
+    return [line.strip() for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")]
+
+
+class ClosureAndPauseExamplesInDocsTest(DocTestCase):
+    """休館日・休止の設定の例と出力の例が、実装の動きと同じであること。"""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.directory = tmp.name
+        clock = example_clock()
+        clock.__enter__()
+        self.addCleanup(clock.__exit__, None, None, None)
+        self.setup = doc(SETUP_MD)
+        self.knowledge_base = doc(KNOWLEDGE_BASE_MD)
+
+    def app(self) -> ChimeApp:
+        """SETUP.md 7 章の休館日の例を設定にした、一時フォルダの中だけに書くアプリ。"""
+        return _app_in(self.directory, **setup_example(CLOSURES_HEADING))
+
+    def pause(self, app: ChimeApp, *argv: str) -> str:
+        """休止のコマンドを実行して、標準出力を返す（成功するはず）。"""
+        args = cli.build_parser().parse_args(list(argv))
+        code, out, err = printing(cli.run_pause, app, args)
+        self.assertEqual((code, err), (0, ""), argv)
+        return out
+
+    def assertBlockInDoc(self, expected: str, text: str, name: str) -> None:
+        blocks = [block.rstrip("\n") for block in fenced_blocks(text)]
+        if expected.rstrip("\n") not in blocks:
+            self.fail("{0} に、実装の出力と同じコードブロックがありません:\n{1}".format(
+                name, expected.rstrip("\n")))
+
+    # -- 設定の例 ----------------------------------------------------------------
+    def test_the_closure_example_in_setup_is_read_without_a_problem_and_closes_the_days(self):
+        example = setup_example(CLOSURES_HEADING)
+        app = _app_in(self.directory, **example)
+        self.assertEqual(app.scheduler.closures.problems, [])
+        self.assertEqual(configcheck.validate(app.config), [])
+        closures = example["schedule"]["closures"]
+        self.assertTrue(closures["dates"] and closures["ranges"], "1 日ずつと期間の両方の例が要る")
+        named = []
+        for entry in closures["dates"]:
+            day, name = (entry, "") if isinstance(entry, str) else (entry["date"], entry.get("name", ""))
+            named.append((date.fromisoformat(day), name))
+        for entry in closures["ranges"]:
+            named.append((date.fromisoformat(entry["from"]), entry.get("name", "")))
+            named.append((date.fromisoformat(entry["to"]), entry.get("name", "")))
+        for day, name in named:
+            with self.subTest(day=day.isoformat()):
+                self.assertEqual(app.scheduler.events_for_date(day), [])
+                self.assertEqual(app.scheduler.closures.closed_reason(day),
+                                 "休館: " + name if name else "休館")
+
+    def test_the_volume_example_in_setup_sets_every_kind_and_is_read_as_written(self):
+        example = setup_example(VOLUME_HEADING)
+        app = _app_in(self.directory, **example)
+        self.assertEqual(configcheck.validate(app.config), [])
+        volumes = example["audio"]["volume"]
+        self.assertEqual(sorted(volumes), sorted(audio.SEGMENT_KINDS))
+        for kind, value in volumes.items():
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    audio.volume_for(Segment("x.wav", kind=kind), app.config.section("audio")), value)
+
+    # -- 出力の例 ----------------------------------------------------------------
+    def test_the_pause_until_and_pause_off_outputs_in_setup_are_what_the_commands_print(self):
+        app = self.app()
+        until = self.pause(app, "--pause-until", "2026-11-05", "--reason", "設備点検")
+        self.assertBlockInDoc(until, self.setup, SETUP_MD)
+        code, lifted, err = printing(cli.pause_off, app)
+        self.assertEqual((code, err), (0, ""))
+        self.assertBlockInDoc(lifted, self.setup, SETUP_MD)
+
+    def test_the_pause_off_output_with_a_catch_up_in_setup_is_what_the_command_prints(self):
+        # 12 時の時報（再生開始 11:59:57）の 23 秒後に戻すと、その回をサービスが追いかけて鳴らす。
+        self.pause(self.app(), "--pause-until", "2026-11-05", "--reason", "設備点検")
+        with example_clock(datetime(2026, 10, 30, 12, 0, 20, tzinfo=ZONE)):
+            code, lifted, err = printing(cli.pause_off, self.app())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("追いかけて鳴らします", lifted)
+        self.assertBlockInDoc(lifted, self.setup, SETUP_MD)
+
+    def test_the_pause_off_output_with_a_maybe_catch_up_in_setup_is_what_the_command_prints(self):
+        # 12 時の時報（再生開始 11:59:57）の 108 秒後に戻す。サービスが解除に気づくまで最大 30 秒かかり、猶予（120 秒）を
+        # 過ぎるかもしれないので、鳴ると約束せず「間に合えば」と言う。
+        self.pause(self.app(), "--pause-until", "2026-11-05", "--reason", "設備点検")
+        with example_clock(datetime(2026, 10, 30, 12, 1, 45, tzinfo=ZONE)):
+            code, lifted, err = printing(cli.pause_off, self.app())
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("間に合えば追いかけて鳴ります", lifted)
+        self.assertNotIn("サービスが追いかけて鳴らします", lifted)
+        self.assertBlockInDoc(lifted, self.setup, SETUP_MD)
+
+    def test_the_settings_examples_say_nothing_to_the_check_not_even_that_a_value_is_the_default(self):
+        # 写して使う例で、既定値と同じ値を書かせない（--check が「書かなくても同じ動作です」と情報を出すため）
+        examples = [("SETUP.md 休館日", setup_example(CLOSURES_HEADING)),
+                    ("SETUP.md 音量", setup_example(VOLUME_HEADING))]
+        advice = section(self.knowledge_base, "### 3-5.", "### 3-6.")
+        blocks = [block for block in fenced_blocks(advice) if block.lstrip().startswith("{")]
+        self.assertTrue(blocks, "KNOWLEDGE_BASE.md 3-5 に音量の JSON の例がありません")
+        examples.append(("KNOWLEDGE_BASE.md 音量", json.loads(blocks[0])))
+        for label, example in examples:
+            with self.subTest(example=label), tempfile.TemporaryDirectory() as directory:
+                config = pi_like_install(directory, example)
+                self.assertEqual([(f.level, f.key, f.message) for f in configcheck.check_config(config)], [])
+        self.assertEqual(examples[1][1], examples[2][1], "音量の例は、SETUP.md と KNOWLEDGE_BASE.md で同じ")
+
+    def test_a_record_that_cannot_be_written_or_cleared_points_to_check_or_to_the_folder(self):
+        # 文書: 書けない・消せないときは終了コード 1。場所がフォルダなら手で移す・消す案内、それ以外は --check の案内
+        app = self.app()
+        args = cli.build_parser().parse_args(["--pause-today"])
+        with mock.patch.object(PauseStore, "set", side_effect=PermissionError(13, "Permission denied")):
+            code, out, err = printing(cli.run_pause, app, args)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("休止の記録を書けませんでした", err)
+        self.assertIn("--check", err)
+        os.mkdir(app.pause.path)
+        code, out, err = printing(cli.pause_off, app)
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("休止の記録を消せませんでした", err)
+        self.assertIn("フォルダ", err)
+        self.assertIn("--pause-off でも消せません", err)
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                text = doc(name)
+                self.assertInDoc("終了コード 1", text, name)
+                self.assertInDoc("`python3 campus_chime.py --check`", text, name)
+                self.assertInDoc("手で移すか消す", text, name)
+        self.assertInDoc("`--check` の「書き込み」で直し方を確かめる", doc(README_MD), README_MD)
+
+    def test_the_closure_rows_of_schedule_start_with_closed_and_no_document_calls_them_paused(self):
+        # 休館日の行の頭は「休館」。「休止」は --pause-* で止めたほうの言い方で、行の頭には付けない
+        code, out, err = printing(cli.show_schedule, self.app(), 8)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual([line for line in out.splitlines() if "学園祭" in line], ["  休館 2026-11-02（月） 学園祭"])
+        self.assertFalse([line for line in out.splitlines() if line.lstrip().startswith("休止")], out)
+        for path in current_doc_paths():
+            text = read_text(path)
+            with self.subTest(doc=os.path.relpath(path, REPO_ROOT)):
+                self.assertIsNone(re.search(r"^ +休止 \d{4}-\d\d-\d\d|「休止 (…|日付)", text, re.MULTILINE))
+
+    def test_the_pause_today_output_in_the_knowledge_base_is_what_the_command_prints(self):
+        today = self.pause(self.app(), "--pause-today", "--reason", "点検")
+        self.assertBlockInDoc(today, self.knowledge_base, KNOWLEDGE_BASE_MD)
+
+    def test_the_schedule_with_a_pause_and_a_closure_in_setup_is_what_schedule_prints(self):
+        app = self.app()
+        self.pause(app, "--pause-today", "--reason", "点検")
+        code, out, err = printing(cli.show_schedule, app, 5)
+        self.assertEqual((code, err), (0, ""))
+        self.assertBlockInDoc(out, self.setup, SETUP_MD)
+
+    def test_the_status_while_paused_in_the_knowledge_base_is_what_status_prints(self):
+        app = self.app()
+        self.pause(app, "--pause-today", "--reason", "点検")
+
+        def no_command(*args, **kwargs):
+            raise FileNotFoundError("timedatectl / systemctl は使わない")
+
+        collected = status.collect_status(app, run=no_command, production=True)
+        paused = dataclasses.replace(
+            collected, version="campus-chime 6.1.0 (a1b2c3d)", ntp=True, active="active",
+            enabled="enabled", backend="pygame")
+        self.assertEqual(status.attention(paused), [])
+        self.assertBlockInDoc("\n".join(status.render_status(paused, [])), self.knowledge_base,
+                              KNOWLEDGE_BASE_MD)
+
+    def test_the_pause_line_of_check_is_what_check_prints(self):
+        # KNOWLEDGE_BASE.md 3-6 の表が引く、止めているときの情報の行（書き込みの節）
+        with tempfile.TemporaryDirectory() as directory:
+            config = pi_like_install(directory)
+            app = ChimeApp(config, backend="mock")
+            # 点検は「今日」を自分で数える（アプリの時計を使わない）ので、そちらも例の日付に固定する
+            # （固定しないと、例の日付を過ぎた日にテストが落ちる）
+            with example_clock(), mock.patch.object(check, "_today", lambda config: EXAMPLE_NOW.date()):
+                app.pause.set(date(2026, 10, 30), "点検", now=EXAMPLE_NOW)
+                printed = check_output(config)
+        line = next(line for line in printed if "cache/pause.json" in line)
+        self.assertTrue(line.startswith("  情報  cache/pause.json"), line)
+        self.assertIn("止めています: 10/30（点検）", line)
+        self.assertIn("python3 campus_chime.py --pause-off", line)
+        self.assertInDoc("cache/pause.json", self.knowledge_base, KNOWLEDGE_BASE_MD)
+
+
+class ClosureAndPauseRulesInDocsTest(DocTestCase):
+    """休館日・休止・音量・停止について、文書が実装の決まりと同じことを言っていること。"""
+
+    #: 実装の動きと食い違うので、どの文書にも残してはいけない書き方（v6.1.0 までの記述）。
+    STALE = ("再生中は止まらず", "再生中は止まらない", "約 90 秒後", "今後の版で改善予定",
+             "祝日判定は未対応", "祝日・休講日の判定")
+
+    def test_no_document_still_says_that_a_playing_broadcast_cannot_be_stopped(self):
+        for path in current_doc_paths():
+            text = read_text(path)
+            for phrase in self.STALE:
+                with self.subTest(doc=os.path.relpath(path, REPO_ROOT), phrase=phrase):
+                    self.assertNotInDoc(phrase, text, os.path.relpath(path, REPO_ROOT))
+
+    def test_the_docs_say_that_a_stop_request_stops_the_playback(self):
+        # 実装: 0.05 秒ごとに確かめ、300 ミリ秒でフェードアウトして止める（1 秒に収まる）
+        self.assertLess(audio.POLL_SECONDS + audio.STOP_FADEOUT_MS / 1000.0, 1.0)
+        for name in (README_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("1 秒ほどで止ま", doc(name), name)
+        spec = doc(SPECIFICATION_MD)
+        self.assertInDoc("PlaybackInterrupted", section(spec, "### 4.3", "### 4.4"), SPECIFICATION_MD)
+        self.assertInDoc("`interrupted`", section(spec, "### 4.16", "### 4.17"), SPECIFICATION_MD)
+
+    def test_every_document_says_that_public_holidays_are_not_closed_automatically(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("祝日は自動では休", doc(name), name)
+
+    #: 実装より言い過ぎな書き方（止めた回は、どれも履歴に「止めていた」と残る、という約束）。実際に残るのは、
+    #: 準備に入っていた回を止めたときだけで、先に止めた日の回は予定の選び直しで外すだけ。
+    OVERCLAIMS = (
+        "（`cache/history.jsonl` には「止めていた」と残ります）",
+        "止めているあいだの放送は、`--status` の「直近の放送」に「止めていた」と残ります",
+        "再生済みの記録も付けない。履歴には「止めていた」と残る。",
+        "止めた回は再生済みにしない（履歴は「止めていた」）",
+        "**再生済みの記録を付けず**、履歴に「止めていた」と残すこと（",
+        "次の正時は鳴らず、`--status` の「直近の放送」に「止めていた」と残る",
+        "「今日だけ止める」で止めた日。意図した動き。履歴には",
+        "`--pause-*` で止めていた日。意図した動き",
+    )
+
+    def test_no_document_says_that_every_paused_broadcast_leaves_a_history_row(self):
+        for path in current_doc_paths():
+            text = read_text(path)
+            for phrase in self.OVERCLAIMS:
+                with self.subTest(doc=os.path.relpath(path, REPO_ROOT), phrase=phrase):
+                    self.assertNotInDoc(phrase, text, os.path.relpath(path, REPO_ROOT))
+
+    #: 「履歴に『止めていた』と残る」という書き方（残るのは、準備に入っていた回を止めたときだけ）。
+    HISTORY_ROW_CLAIM = re.compile("「止めていた」(と残|の行が付)")
+    PREPARING = re.compile("準備に入っていた回|再生開始の 45 秒前")
+
+    def test_every_claim_of_a_paused_row_in_the_history_names_the_chime_being_prepared(self):
+        # 言い回しを変えても、「止めていた」と残る回を、準備に入っていた回に限って書かせる
+        # （先に止めた日の回は、履歴にも回ごとのログにも残らない）。限定は、同じ行の前か、同じ文の中に要る。
+        seen = 0
+        for name in FACT_DOCS:
+            for line in doc(name).splitlines():
+                for match in self.HISTORY_ROW_CLAIM.finditer(line):
+                    seen += 1
+                    start = line.rfind("。", 0, match.start()) + 1
+                    end = line.find("。", match.end())
+                    sentence = line[start:end if end >= 0 else len(line)]
+                    with self.subTest(doc=name, line=line[:60]):
+                        self.assertTrue(self.PREPARING.search(line[:match.start()]) or self.PREPARING.search(sentence),
+                                        "{0}: 準備に入っていた回に限る書き方になっていません: {1}".format(name, sentence))
+        self.assertGreaterEqual(seen, 6, "「止めていた」と残る、という記述が文書から消えています（言い換えたなら正規表現を直す）")
+
+    def test_the_acceptance_check_of_pausing_expects_a_row_only_when_the_pause_came_late(self):
+        row = next(line for line in doc(SPECIFICATION_MD).splitlines() if line.startswith("| T-18 "))
+        for needle in ("先に止めたので", "「放送の休止」", "行は付かない", "再生開始の 45 秒前から"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, row)
+
+    def test_every_document_says_that_only_the_broadcast_being_prepared_leaves_a_row(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("準備に入っていた回", doc(name), name)
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("先に止めた日の回は", doc(name), name)
+
+    def test_the_docs_say_that_a_folder_in_place_of_the_record_cannot_be_cleared_by_pause_off(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("フォルダになっているときだけは", doc(name), name)
+                self.assertInDoc("`--pause-off` でも消せない", doc(name), name)
+
+    def test_the_docs_quote_the_note_that_status_adds_to_a_record_it_cannot_use(self):
+        shown = "止めていません" + status.PAUSE_UNUSABLE_NOTE
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc(shown, doc(name), name)
+
+    def test_no_document_names_the_kind_of_site(self):
+        # 設置場所の種類（図書館など）は、依頼にも設定にも書かれていない。祝日の理由は、どの施設でも通る言い方にする。
+        for path in current_doc_paths():
+            with self.subTest(doc=os.path.relpath(path, REPO_ROOT)):
+                self.assertNotInDoc("図書館", read_text(path), os.path.relpath(path, REPO_ROOT))
+
+    def test_the_reason_for_ringing_on_holidays_is_the_operators_decision_not_a_claim_about_the_facility(self):
+        # 運用者の判断は「祝日も開館する（鳴らす）」。「祝日も開く施設があるため」のような一般論にしない
+        for path in current_doc_paths():
+            with self.subTest(doc=os.path.relpath(path, REPO_ROOT)):
+                self.assertNotInDoc("開く施設", read_text(path), os.path.relpath(path, REPO_ROOT))
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("祝日も開館", doc(name), name)
+        self.assertInDoc("運用者（オーナー）の判断", section(doc(REQUIREMENTS_MD), "### FR-05", "### FR-06")
+                         + section(doc(REQUIREMENTS_MD), "## 2.7", "\n## 3"), REQUIREMENTS_MD)
+
+    def test_the_docs_say_whether_check_warns_about_a_wait_as_long_as_the_grace_as_it_does(self):
+        # schedule.max_sleep_seconds がスケジュールの猶予（catchup_grace_seconds）以上だと、再生開始の直前に
+        # 解除した回を取りこぼす。文書は、そうなる前に --check が警告するかどうかを、実装と同じに書く
+        # （警告が増えたのに「警告しない」と書いてある、警告が無いのに「警告する」と書いてある、のどちらでも落ちる）
+        grace = DEFAULT_CONFIG["schedule"]["catchup_grace_seconds"]
+        data = copy.deepcopy(DEFAULT_CONFIG)
+        data["schedule"]["max_sleep_seconds"] = grace
+        warned = [finding for finding in configcheck.validate(Config(data, base_dir=BASE_DIR))
+                  if finding.key == "schedule.max_sleep_seconds" and finding.level == "warning"]
+        says_warns, says_silent = "`--check` が警告", "`--check` は警告し"
+        for name, marker in ((SETUP_MD, "取りこぼすことがあります"), (KNOWLEDGE_BASE_MD, "取りこぼすことがある")):
+            [bullet] = [line for line in doc(name).splitlines() if marker in line and "max_sleep_seconds" in line]
+            with self.subTest(doc=name):
+                self.assertIn(says_warns if warned else says_silent, bullet,
+                              "実装が警告する・しないことを、文書が書いていません: " + bullet)
+                self.assertNotIn(says_silent if warned else says_warns, bullet,
+                                 "実装が警告する・しないと、文書の書き方が違います: " + bullet)
+
+    def test_every_description_of_status_lists_the_pause_row_and_the_closures(self):
+        # 「いまの状態（版・時刻の同期・サービス・…）」と並べる文書の説明は、ヘルプと同じ項目を挙げる。
+        for name in (README_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD):
+            described = re.findall(r"（版・時刻の同期[^）。]*", doc(name))
+            with self.subTest(doc=name):
+                self.assertTrue(described, "--status の項目の説明がありません")
+                for text in described:
+                    self.assertIn("放送の休止", text)
+                    self.assertIn("休館日", text)
+
+    def test_the_advice_for_silencing_a_day_is_pausing_not_stopping_the_service(self):
+        advice = section(doc(KNOWLEDGE_BASE_MD), "### 3-4.", "### 3-5.")
+        self.assertTrue(advice)
+        for needle in ("--pause-today", "--pause-until", "--pause-off", "schedule.closures"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, advice, KNOWLEDGE_BASE_MD)
+        self.assertInDoc("--pause-today", doc(SPECIFICATION_MD), SPECIFICATION_MD)
+        operations = section(doc(SPECIFICATION_MD), "## 11. 運用・保守", "\n---\n")
+        row = next((line for line in operations.splitlines() if line.startswith("| 放送を止める")), "")
+        self.assertIn("--pause-today", row)
+        self.assertIn("--pause-off", row)
+
+    def test_the_volume_advice_is_to_fix_alsa_high_and_lower_it_in_the_app(self):
+        for name, start, end in ((SETUP_MD, "### 4-2.", "### 4-3."),
+                                 (KNOWLEDGE_BASE_MD, "### 3-5.", "### 3-6.")):
+            advice = section(doc(name), start, end)
+            with self.subTest(doc=name):
+                self.assertTrue(advice)
+                self.assertInDoc("高め", advice, name)
+                self.assertInDoc("audio.volume", advice, name)
+        self.assertInDoc("高めに固定", doc(README_MD), README_MD)
+
+    def test_the_docs_say_that_a_command_runs_in_its_own_group_and_the_code_starts_it_so(self):
+        # 仕様書: ラッパー（sh -c "aplay …"）が起こした孫の再生も止まるよう、子のグループごと止める
+        self.assertIn("start_new_session=True", inspect.getsource(audio.CommandPlayer))
+        self.assertIn("killpg", inspect.getsource(audio.CommandPlayer))
+        row = next(line for line in doc(SPECIFICATION_MD).splitlines() if line.startswith("| `CommandPlayer`"))
+        for needle in ("start_new_session=True", "グループごと", "孫の再生", "SIGKILL"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, row)
+
+    def test_the_docs_say_that_the_command_backend_cannot_change_the_volume(self):
+        for name in (README_MD, SETUP_MD, SPECIFICATION_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("音量を変えられません", doc(name), name)
+
+    #: 文書（仕様書か運用ナレッジ）が引用する、v6.2.0 のログの文面。実装に無い文面を載せない。
+    LOG_MESSAGES = (
+        "休止中のため鳴らしません",
+        "休止の記録があります",
+        "休止の記録が変わりました",
+        "休止の記録を使えません（放送は通常どおり行います）",
+        "休止の記録を確かめられませんでした（放送は通常どおり行います）",
+        "休館日の設定に使えない項目があります",
+        "予定されたイベントがありません。",
+        "分ごとに再確認します",
+        "停止要求のため再生を中断しました",
+        "音を出す前に停止要求を受けたため、再生済みにしません",
+        "停止要求で中断",
+        "再生が終わらないため打ち切りました（上限",
+        "音声デバイスの初期化に失敗しました",
+        "音声デバイスを初期化できませんでした",
+        "command 方式では音量を変えられません",
+    )
+
+    def test_the_log_messages_the_docs_quote_exist_in_the_code(self):
+        source = message_source()
+        quoted = doc(SPECIFICATION_MD) + doc(KNOWLEDGE_BASE_MD)
+        for message in self.LOG_MESSAGES:
+            with self.subTest(message=message):
+                self.assertIn(message, source, "実装にありません")
+                self.assertIn(message, quoted, "仕様書にも運用ナレッジにも載っていません")
+
+    def test_the_unit_in_the_specification_is_the_unit_file(self):
+        unit = block_starting_with(section(doc(SPECIFICATION_MD), "## 6. systemd", "### 6.1"), "[Unit]")
+        self.assertTrue(unit)
+        service = read_text(os.path.join(REPO_ROOT, "campus_chime.service"))
+        self.assertEqual(unit_directives(unit), unit_directives(service))
+
+    def test_every_result_of_a_history_line_is_in_the_specification_table(self):
+        table = section(doc(SPECIFICATION_MD), "### 4.16", "### 4.17")
+        for result in RESULTS:
+            with self.subTest(result=result):
+                self.assertInDoc("`{0}`".format(result), table, SPECIFICATION_MD)
+
+    def test_the_new_options_are_rows_of_the_specification_and_the_requirements_tables(self):
+        options = ("--pause-today", "--pause-until", "--pause-off", "--reason")
+        table = section(doc(SPECIFICATION_MD), "### 4.11", "### 4.12")
+        requirements = section(doc(REQUIREMENTS_MD), "### FR-09", "### FR-10")
+        for option in options:
+            with self.subTest(option=option):
+                self.assertInDoc("| `{0}".format(option), table, SPECIFICATION_MD)
+                self.assertInDoc("| `{0}".format(option), requirements, REQUIREMENTS_MD)
+
+    def test_the_closure_and_pause_backlog_items_are_marked_done(self):
+        backlog = section(doc(REQUIREMENTS_MD), "## 10. 将来課題", "\n---\n")
+        rows = {split_cells(line)[1]: line for line in backlog.splitlines()
+                if line.startswith("| ") and line[2:3].isdigit()}
+        for item in ("祝日・休講日判定", "音量の設定ファイル化"):
+            with self.subTest(item=item):
+                self.assertIn(item, rows)
+                self.assertIn("6.2.0", rows[item])
+                self.assertIn("対応済み", rows[item])
+
+    def test_the_settings_added_in_6_2_0_are_listed_as_warnings_not_as_replaced_values(self):
+        added = {"schedule.closures", "schedule.closures.dates", "schedule.closures.ranges",
+                 "audio.volume", "audio.volume.time_signal", "audio.volume.voice",
+                 "audio.volume.music", "audio.max_segment_seconds", "state.pause_file"}
+        rows = rule_table(doc(SPECIFICATION_MD))
+        warned = set()
+        for row in rows:
+            warned |= keys_in(row[2])
+        errors, warnings = probed_levels()
+        self.assertEqual(sorted(added - warned), [], "仕様書 3.5 章の表の warning の欄に載っていません")
+        self.assertEqual(sorted(added & errors), [], "error にならないはずの設定です")
+        self.assertEqual(sorted(added - warnings), [], "warning になりうる設定のはずです")
+
+
+class PausedBroadcastRecordInDocsTest(app_tests.PauseTestCase):
+    """文書が言う「履歴に『止めていた』と残るのは、準備に入っていた回だけ」が、実装の動きであること。
+
+    文書は、先に止めた日の回は履歴にも回ごとのログにも残らず、準備に入っていた回を止めたときだけ
+    ``skipped`` の行とログが残る、と言う。実装がそう動くかを、本物の ``ChimeApp`` の常駐ループで確かめる。
+    待機は偽物に差し替え、呼び出しを数えて、止まらないループは打ち切る。
+    """
+
+    def test_a_pause_written_before_the_chime_is_prepared_leaves_no_row_and_no_log(self):
+        self.set_pause(date(2026, 10, 14), "試験")   # 止めた日は 2026-10-14（その日の 10 時の時報も外れる）
+
+        def pass_the_chime_time_then_stop(target, interrupt):
+            self.app.stop_event.set()
+            return False
+
+        self.install_sleeper(pass_the_chime_time_then_stop)
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_forever()
+        self.assertEqual(self.entries(), [])
+        self.assertEqual([record.getMessage() for record in captured.records
+                          if "休止中のため鳴らしません" in record.getMessage()], [])
+
+    def test_the_chime_being_prepared_when_the_pause_is_written_leaves_a_skipped_row_and_a_log(self):
+        event = self.scheduled()
+        self.install_sleeper()
+        self.set_pause(date(2026, 10, 14), "試験")
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app.run_event(event)
+        entry = self.skipped_entry()
+        self.assertEqual((entry["key"], entry["reason"]), (event.key, "休止: 試験"))
+        self.assertTrue([record for record in captured.records
+                         if "休止中のため鳴らしません" in record.getMessage()])
+
+    def test_the_startup_list_of_upcoming_chimes_leaves_out_the_paused_days_as_the_specification_says(self):
+        self.set_pause(date(2026, 10, 14), "試験")
+        with logs_enabled(), self.assertLogs("chime.app", level="INFO") as captured:
+            self.app._log_upcoming()
+        text = "\n".join(record.getMessage() for record in captured.records)
+        heading = "次回以降の予定（休止のあいだは省いています）:"
+        self.assertIn(heading, text)
+        self.assertNotIn("2026-10-14 10:00:00", text)
+        self.assertIn(heading, doc(SPECIFICATION_MD))
+
+    def midnight_scheduler(self, **closures) -> Scheduler:
+        """0 時の時報だけを毎日鳴らす予定（0 時の時報は、前の日の 23:59:57 に鳴り始める）。"""
+        settings = copy.deepcopy(DEFAULT_CONFIG["schedule"])
+        settings["hourly"].update(start_hour=0, end_hour=0, weekdays=[0, 1, 2, 3, 4, 5, 6])
+        settings["closing"]["enabled"] = False
+        settings["closures"] = closures
+        return Scheduler(settings, self.app.tzinfo, 3.0, clock=self.app.now)
+
+    def test_a_midnight_chime_belongs_to_the_day_it_sounds_for_when_pausing(self):
+        event = self.midnight_scheduler().events_for_date(date(2026, 10, 15))[0]
+        self.assertEqual((event.at.date(), event.play_at.date()), (date(2026, 10, 15), date(2026, 10, 14)))
+        self.set_pause(date(2026, 10, 14))     # 前の日だけを止めても、翌日の 0 時の時報は止まらない
+        self.assertIsNone(self.app._pause_covering(event))
+        self.set_pause(date(2026, 10, 15))     # 翌日を止めれば止まる
+        self.assertIsNotNone(self.app._pause_covering(event))
+
+    def test_a_midnight_chime_belongs_to_the_day_it_sounds_for_when_closing(self):
+        day = date(2026, 10, 15)
+        self.assertEqual(len(self.midnight_scheduler(dates=["2026-10-14"]).events_for_date(day)), 1)
+        self.assertEqual(self.midnight_scheduler(dates=["2026-10-15"]).events_for_date(day), [])
+        self.assertEqual(self.midnight_scheduler(dates=["2026-10-15"]).events_for_date(date(2026, 10, 14))[0].at.date(),
+                         date(2026, 10, 14))
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD):
+            with self.subTest(doc=name):
+                text = doc(name)
+                for needle in ("23:59:57", "翌日の放送として扱"):
+                    self.assertIn(needle, text, "{0} に次の記述がありません: {1}".format(name, needle))
+                self.assertRegex(text, "前(の日|日)だけ", name)
+
+    def test_the_prepare_time_the_docs_state_is_the_default_of_the_scheduler(self):
+        event = self.scheduled()
+        self.assertEqual((event.play_at - event.prepare_at).total_seconds(),
+                         DEFAULT_CONFIG["schedule"]["prepare_lead_seconds"])
+
+
+#: 文書の数を拾うときに数えない文書（変更履歴・開発履歴）。
+FACT_DOCS = (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD)
+
+
+def stated_numbers(pattern: str, *names: str) -> dict:
+    """文書 ``names`` から ``pattern`` の最初の捕獲群を全部集める（``{文書: [数の文字列, …]}``。無い文書は入れない）。"""
+    found = {}
+    for name in names:
+        values = re.findall(pattern, doc(name))
+        if values:
+            found[name] = values
+    return found
+
+
+def mp3_seconds(path: str) -> float:
+    """MPEG-1 Layer III のフレームをたどった長さ（秒）。ID3 タグは読み飛ばす。"""
+    with open(path, "rb") as handle:
+        data = handle.read()
+    index = 0
+    if data[:3] == b"ID3":
+        index = 10 + ((data[6] & 0x7F) << 21 | (data[7] & 0x7F) << 14 | (data[8] & 0x7F) << 7 | (data[9] & 0x7F))
+    bitrates = {1: 32, 2: 40, 3: 48, 4: 56, 5: 64, 6: 80, 7: 96, 8: 112, 9: 128, 10: 160, 11: 192,
+                12: 224, 13: 256, 14: 320}
+    rates = [44100, 48000, 32000]
+    total = 0.0
+    while index + 4 <= len(data):
+        header = int.from_bytes(data[index:index + 4], "big")
+        if (header >> 21) & 0x7FF != 0x7FF:
+            index += 1
+            continue
+        version, layer, bitrate, rate = (header >> 19) & 3, (header >> 17) & 3, (header >> 12) & 15, (header >> 10) & 3
+        if version != 3 or layer != 1 or bitrate in (0, 15) or rate == 3:
+            index += 1
+            continue
+        length = 144 * bitrates[bitrate] * 1000 // rates[rate] + ((header >> 9) & 1)
+        total += 1152 / rates[rate]
+        index += length
+    return total
+
+
+class DocumentedFactsInDocsTest(DocTestCase):
+    """文書の文中に書いた数（分・回・秒）が、実装の定数・既定の設定・同梱の音源と同じであること。
+
+    ``Claim`` は文書ごとに 1 か所の書き方を決めて数えるが、ここは書き方が文書ごとに違う数を、
+    見つかった文書すべてについて確かめる（1 つの文書にも無ければ、記述が消えたとして落とす）。
+    """
+
+    def assertAllStated(self, found: dict, expected, what: str) -> None:
+        self.assertTrue(found, "文書に {0} の記述が見つかりません（言い換えたなら正規表現を直す）".format(what))
+        for name, values in found.items():
+            for value in values:
+                self.assertEqual(float(value), float(expected), "{0} の {1}".format(name, what))
+
+    def test_the_minutes_between_rechecks_when_nothing_is_scheduled(self):
+        self.assertAllStated(stated_numbers(r"(\d+) 分ごとに再確認", *FACT_DOCS),
+                             NO_EVENTS_RECHECK_SECONDS // 60, "予定が無いときの再確認の間隔（分）")
+
+    def test_the_attempts_to_open_the_audio_device_and_their_interval(self):
+        self.assertAllStated(stated_numbers(r"(\d+) 回まで試す", KNOWLEDGE_BASE_MD),
+                             audio.MIXER_INIT_ATTEMPTS, "音声デバイスの初期化を試す回数")
+        self.assertAllStated(stated_numbers(r"(\d+) 回試しました", *FACT_DOCS),
+                             audio.MIXER_INIT_ATTEMPTS, "音声デバイスの初期化を試した回数")
+        self.assertAllStated(stated_numbers(r"(\d+) 秒おきに \d+ 回まで試す", KNOWLEDGE_BASE_MD),
+                             audio.MIXER_INIT_RETRY_SECONDS, "初期化をやり直す間隔（秒）")
+
+    def test_the_days_the_scheduler_looks_ahead(self):
+        self.assertAllStated(stated_numbers(r"(\d+) 日先まで", *FACT_DOCS),
+                             MAX_LOOKAHEAD_DAYS, "予定を探す日数")
+
+    def test_the_seconds_after_the_start_a_late_chime_is_still_played(self):
+        grace = DEFAULT_CONFIG["schedule"]["catchup_grace_seconds"]
+        self.assertAllStated(stated_numbers(r"開始から (\d+) 秒以内", *FACT_DOCS), grace, "追いかけ再生の猶予（秒）")
+
+    def test_the_seconds_after_the_start_a_chime_is_sure_to_be_caught_up_after_pause_off(self):
+        # 休止を解いたとき、確実に鳴るのは、開始からの経過が「猶予 − 解除に気づくまでの長さ」に満たない回だけ。
+        # それ以降の回は、サービスが気づくのが猶予に間に合えば鳴る（間に合わなければ鳴らない）
+        schedule = DEFAULT_CONFIG["schedule"]
+        grace, noticing = schedule["catchup_grace_seconds"], schedule["max_sleep_seconds"]
+        docs = (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD)
+        self.assertAllStated(stated_numbers(r"開始から (\d+) 秒未満", *docs), grace - noticing, "確実に鳴る回の経過（秒）")
+        self.assertAllStated(stated_numbers(r"開始から (\d+) 秒以上たった", *docs), grace - noticing,
+                             "間に合えば鳴る回の経過（秒）")
+        self.assertAllStated(stated_numbers(r"最大 (\d+) 秒かか", *docs), noticing, "解除に気づくまでの長さ（秒）")
+        self.assertAllStated(stated_numbers(r"(\d+) 秒を過ぎ", *docs), grace, "追いかけ再生の猶予（秒）")
+
+    def test_the_margin_added_to_a_wav_before_it_is_cut_off(self):
+        margin = audio.WAV_TIMEOUT_MARGIN_SECONDS
+        self.assertAllStated(stated_numbers(r"音の長さ ＋ (\d+) 秒", *FACT_DOCS), margin, "WAV の打ち切りに足す秒数")
+        self.assertAllStated(stated_numbers(r"音の長さに (\d+) 秒を足した", *FACT_DOCS), margin, "WAV の打ち切りに足す秒数")
+
+    def test_a_stop_request_stops_the_playback_in_about_one_second(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            self.assertInDoc("1 秒ほど", doc(name), name)
+        self.assertAllStated(stated_numbers(r"(\d+) 秒ほどで止ま", *FACT_DOCS), 1, "停止にかかる秒数")
+        self.assertLessEqual(audio.STOP_FADEOUT_MS / 1000.0 + audio.POLL_SECONDS, 1.0)
+
+    def test_the_wait_for_the_service_to_stop_is_the_one_of_the_unit_file(self):
+        unit = service_value("TimeoutStopSec")
+        self.assertAllStated(stated_numbers(r"停止の待ち時間は (\d+) 秒", *FACT_DOCS), unit, "停止の待ち時間")
+        self.assertAllStated(stated_numbers(r"TimeoutStopSec=(\d+)", *FACT_DOCS), unit, "TimeoutStopSec")
+
+    def test_the_length_of_hotaru_is_the_length_of_the_file(self):
+        seconds = mp3_seconds(os.path.join(REPO_ROOT, "assets", "hotaru.mp3"))
+        stated = stated_numbers(r"約 (\d+) 秒", SETUP_MD, KNOWLEDGE_BASE_MD)
+        long_ones = [(name, value) for name, values in stated.items() for value in values if int(value) > 100]
+        self.assertTrue(long_ones, "蛍の光が鳴り終わる長さ（約 N 秒）の記述がありません")
+        for name, value in long_ones:   # 「約 139 秒」のような、蛍の光の長さだけを対象にする
+            self.assertAlmostEqual(float(value), seconds, delta=1.0, msg=name)
+
+    def test_the_default_of_max_segment_seconds(self):
+        default = DEFAULT_CONFIG["audio"]["max_segment_seconds"]
+        self.assertAllStated(stated_numbers(r"max_segment_seconds`（既定 (\d+) 秒）", SETUP_MD), default,
+                             "max_segment_seconds の既定")
+        self.assertAllStated(stated_numbers(r"既定の (\d+) 秒として扱う", KNOWLEDGE_BASE_MD), default,
+                             "max_segment_seconds の既定")
+
+    def test_the_default_of_the_time_signal_volume(self):
+        default = DEFAULT_CONFIG["time_signal"]["volume"]
+        self.assertAllStated(stated_numbers(r"time_signal\.volume`?（既定 ([\d.]+)）", *FACT_DOCS), default,
+                             "time_signal.volume の既定")
+
+    def test_the_pause_commands_are_never_documented_with_sudo(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD):
+            text = doc(name)
+            self.assertInDoc("`sudo` を付けずに", text, name)
+            self.assertNotRegex(text, r"(?<!ずに)`sudo` を付けて(?!ずに)[^。\n]*(--pause|休止)", name)
+            self.assertNotRegex(text, r"sudo python3 campus_chime\.py --pause", name)
+
+    def test_the_mp3_length_reader_counts_frames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "tone.mp3")
+            frame = bytes([0xFF, 0xFB, 0x90, 0x00]) + bytes(417 - 4)   # MPEG-1 Layer III、128 kbps、44.1 kHz
+            with open(path, "wb") as handle:
+                handle.write(frame * 10)
+            self.assertAlmostEqual(mp3_seconds(path), 10 * 1152 / 44100.0, places=6)
+
+
 # -- 文書ではなく、ソースの書き方 ---------------------------------------------------------
 
 def python_sources() -> List[str]:
@@ -2692,6 +3500,1041 @@ class KnowledgeBaseQuotesTest(DocTestCase):
         invented = ["「{0}」の「{1}」".format(quote, chunk) for quote, chunk in quoted_chunks(guide)
                     if chunk not in source]
         self.assertEqual(invented, [], "実装に無い文面が引用されています（表示される文面に直す）")
+
+
+# -- セキュリティの点検と強化（scripts/security_check.sh・scripts/harden.sh）の文書 -------------------
+
+HARDEN_SH = os.path.join(REPO_ROOT, "scripts", "harden.sh")
+
+#: harden.sh が引数を読む ``case`` の、手順の名前を並べた行。
+_HARDEN_STEP_CASE = re.compile(r'^\s+(ssh(?: \| [a-z]+)+)\) STEPS\+=\("\$\{arg\}"\)', re.MULTILINE)
+
+#: 文書に ``harden.sh ssh`` のように書かれた手順の名前（小文字で始まる語だけ。``STEP`` のような記号や、
+#: ``harden.sh --rollback`` のようなオプションは拾わない）。
+_HARDEN_WORD = re.compile(r"harden\.sh[ \t]+([a-z][a-z-]*)")
+
+
+def harden_steps() -> List[str]:
+    """harden.sh が受け付ける手順の名前（``recommended`` を除く）。"""
+    match = _HARDEN_STEP_CASE.search(read_text(HARDEN_SH))
+    assert match, "harden.sh の、手順の名前を読む case の行が見つかりません"
+    return match.group(1).split(" | ")
+
+
+def script_constant(script: str, name: str) -> str:
+    """シェルスクリプトの ``NAME=値`` の行の値（クォートの無い 1 語のもの）。"""
+    text = read_text(os.path.join(REPO_ROOT, "scripts", script))
+    match = re.search(r"^{0}=(\S+)$".format(name), text, re.MULTILINE)
+    assert match, "{0} に {1}= の行がありません".format(script, name)
+    return match.group(1)
+
+
+def subsections(text: str, prefix: str) -> dict:
+    """見出し ``### <prefix>N `名前` …`` ごとの本文（名前 → 次の見出しの手前まで）。"""
+    found = {}
+    pattern = re.compile(r"^### {0}\d+ `(\w+)`[^\n]*\n(.*?)(?=^#{{2,3}} |\Z)".format(re.escape(prefix)),
+                         re.MULTILINE | re.DOTALL)
+    for match in pattern.finditer(text):
+        found[match.group(1)] = match.group(2)
+    return found
+
+
+class HardenWordExtractionTest(unittest.TestCase):
+    """検査そのものが、``harden.sh`` に続く手順の名前だけを拾うこと。"""
+
+    def test_only_a_lowercase_word_right_after_the_script_name_is_read(self):
+        text = ("sudo bash scripts/harden.sh ssh\n`harden.sh firewall` と harden.sh --rollback ssh と\n"
+                "harden.sh STEP と harden.sh の説明、harden.sh\n")
+        self.assertEqual(_HARDEN_WORD.findall(text), ["ssh", "firewall"])
+
+    def test_the_steps_are_read_from_the_case_line_of_the_script(self):
+        self.assertEqual(sorted(harden_steps()),
+                         sorted(["ssh", "firewall", "sudo", "services", "journal", "updates", "service", "ntp"]))
+
+    def test_the_steps_are_the_ones_the_script_lists_and_recommended_is_accepted(self):
+        script = read_text(HARDEN_SH)
+        listed = re.search(r"^ALL_STEPS=\(([^)]*)\)", script, re.MULTILINE)
+        self.assertEqual(sorted(listed.group(1).split()), sorted(harden_steps()))
+        self.assertIsNotNone(re.search(r"^\s+recommended\) STEPS\+=", script, re.MULTILINE))
+
+    def test_subsections_are_split_at_their_headings(self):
+        text = "## 5. 手順\n\n### 5.1 `ssh` — 鍵\n本文 1\n\n### 5.2 `firewall` — 防火壁\n本文 2\n\n## 6. 次\n"
+        self.assertEqual(subsections(text, "5."), {"ssh": "本文 1\n\n", "firewall": "本文 2\n\n"})
+
+
+class HardenStepsInDocsTest(DocTestCase):
+    """文書に書いた ``harden.sh`` の手順とオプションが、スクリプトにあること。"""
+
+    def test_every_word_written_after_harden_sh_is_a_step(self):
+        valid = set(harden_steps()) | {"recommended"}
+        unknown = []
+        for path in current_doc_paths():
+            for number, line in enumerate(read_text(path).splitlines(), start=1):
+                unknown.extend("{0}:{1}: harden.sh {2}".format(os.path.relpath(path, REPO_ROOT), number, word)
+                               for word in _HARDEN_WORD.findall(line) if word not in valid)
+        self.assertEqual(unknown, [], "存在しない手順が書かれています（綴りの違い、または廃止）")
+
+    def test_the_security_guide_names_every_step_with_its_command_and_a_heading(self):
+        text = doc(SECURITY_MD)
+        for step in harden_steps():
+            with self.subTest(step=step):
+                self.assertIsNotNone(re.search(r"scripts/harden\.sh[ \t]+{0}\b".format(step), text),
+                                     "SECURITY.md に scripts/harden.sh {0} がありません".format(step))
+                self.assertIsNotNone(re.search(r"^### \d+\.\d+ `{0}` ".format(step), text, re.MULTILINE),
+                                     "SECURITY.md に手順 {0} の見出しがありません".format(step))
+        self.assertIsNotNone(re.search(r"scripts/harden\.sh[ \t]+recommended\b", text))
+
+    def test_every_step_is_explained_by_what_it_changes_its_effect_how_to_check_and_how_to_undo(self):
+        steps = subsections(doc(SECURITY_MD), "5.")
+        self.assertEqual(sorted(steps), sorted(harden_steps()))
+        for step, body in sorted(steps.items()):
+            for label in ("変えること", "放送への影響", "確かめ方", "元に戻す"):
+                with self.subTest(step=step, label=label):
+                    self.assertInDoc("**{0}".format(label), body, "{0} の手順 {1}".format(SECURITY_MD, step))
+            with self.subTest(step=step, what="rollback"):
+                self.assertInDoc("--rollback {0}".format(step), body, "{0} の手順 {1}".format(SECURITY_MD, step))
+
+    def test_the_security_guide_names_every_option_of_the_two_scripts(self):
+        text = doc(SECURITY_MD)
+        for script in ("security_check.sh", "harden.sh"):
+            for option in sorted(shell_options(script) - {"--help"}):
+                with self.subTest(script=script, option=option):
+                    self.assertInDoc(option, text, SECURITY_MD)
+
+    def test_the_specification_rows_of_the_scripts_name_every_option(self):
+        scripts = section(doc(SPECIFICATION_MD), "### 4.19", "### 4.20")
+        for script in ("security_check.sh", "harden.sh"):
+            row = next((line for line in scripts.splitlines() if line.startswith("| `{0}` |".format(script))), "")
+            self.assertTrue(row, "SPECIFICATION.md 4.19 章に {0} の行がありません".format(script))
+            for option in sorted(shell_options(script)):
+                with self.subTest(script=script, option=option):
+                    self.assertIn(option, row)
+            self.assertIn("docs/SECURITY.md", row)
+
+    def test_the_files_the_script_writes_are_named_in_the_security_guide(self):
+        text = doc(SECURITY_MD)
+        for name in ("STATE_REAL", "SSHD_DROPIN", "FW_NFT_FILE", "FW_UNIT", "REVERT_SERVICE", "REVERT_TIMER",
+                     "JOURNAL_DROPIN", "APT_UPGRADES_CONF", "SERVICE_DROPIN", "CHRONY_SOURCES"):
+            with self.subTest(name=name):
+                self.assertInDoc(script_constant("harden.sh", name), text, SECURITY_MD)
+
+    def test_the_revert_window_of_the_guide_is_the_default_and_the_limit_of_the_script(self):
+        script = read_text(HARDEN_SH)
+        default = script_constant("harden.sh", "REVERT_AFTER")
+        text = doc(SECURITY_MD)
+        self.assertInDoc("既定は {0}".format(default), text, SECURITY_MD)
+        self.assertInDoc("{0} 分".format(default), text, SECURITY_MD)
+        self.assertInDoc("{0} 分".format(default), section(doc(KNOWLEDGE_BASE_MD), "### 4-10.", "### 4-11."),
+                         KNOWLEDGE_BASE_MD)
+        self.assertIn('-gt 60', script)
+        self.assertInDoc("1〜60", text, SECURITY_MD)
+
+
+#: ``[SECURITY_REVIEW.md](SECURITY_REVIEW.md) 7.1 節``・``SETUP.md の 1 節`` のように、文書の名前に続けて書いた節の番号。
+_FOREIGN_SECTION = re.compile(
+    r"[A-Z_]+\.md(?:\]\([^)]*\)|[`\])])*[ \t]*(?:の[ \t]*)?\d+(?:\.\d+)?[ \t]*節")
+
+
+def strip_foreign_section_references(text: str) -> str:
+    return _FOREIGN_SECTION.sub(" ", text)
+
+
+class ForeignSectionReferenceTest(unittest.TestCase):
+    """検査そのものが、別の文書の節を、この文書の節と取り違えないこと。"""
+
+    def test_a_section_after_another_documents_name_is_removed(self):
+        for text in ("[SECURITY_REVIEW.md](SECURITY_REVIEW.md) 7.1 節", "SECURITY_REVIEW.md の 7.1 節",
+                     "`SECURITY.md` 3.2 節"):
+            with self.subTest(text=text):
+                self.assertEqual(re.findall(r"\d+(?:\.\d+)?[ \t]*節", strip_foreign_section_references(text)), [])
+
+    def test_a_section_of_this_document_is_kept(self):
+        self.assertEqual(re.findall(r"(\d+(?:\.\d+)?)[ \t]*節",
+                                    strip_foreign_section_references("3.2 節と SETUP.md 1 節と 7 節")), ["3.2", "7"])
+
+
+class SecurityGuideContentTest(DocTestCase):
+    """docs/SECURITY.md が、決めた内容（報告の窓口・前提・進め方・確定の仕組み・復旧・毎月の点検・GitHub・事故）を持つこと。"""
+
+    def setUp(self):
+        self.text = doc(SECURITY_MD)
+
+    def test_the_vulnerability_reporting_comes_first_and_says_privately_and_the_scope(self):
+        reporting = section(self.text, "## 1. ", "\n## 2. ")
+        self.assertTrue(reporting)
+        for needle in ("公開の Issue", "非公開", "Report a vulnerability", "Private vulnerability reporting",
+                       "Settings > Security", "対象にするもの", "対象にしないもの"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, reporting, SECURITY_MD)
+
+    def test_the_premise_and_the_way_to_test_from_outside_the_campus_are_written(self):
+        premise = section(self.text, "## 2. ", "\n## 3. ")
+        for needle in ("グローバルアドレス", "クラス B", "security_check.sh", "テザリング", "nc -vz"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, premise, SECURITY_MD)
+
+    def test_the_recommended_order_is_check_then_ssh_then_firewall_then_sudo_then_services(self):
+        order = section(self.text, "## 3. ", "\n## 4. ")
+        marks = ("scripts/security_check.sh", "scripts/harden.sh ssh", "scripts/harden.sh firewall --ssh-from",
+                 "scripts/harden.sh sudo", "scripts/harden.sh services journal", "`ntp`", "`service`")
+        positions = [order.find(mark) for mark in marks]
+        self.assertNotIn(-1, positions, dict(zip(marks, positions)))
+        self.assertEqual(positions, sorted(positions))
+        for needle in ("--dry-run", "ssh-keygen -t ed25519", "ssh-copy-id"):
+            self.assertInDoc(needle, order, SECURITY_MD)
+
+    def test_the_confirm_flow_says_why_the_terminal_must_be_new(self):
+        flow = section(self.text, "## 4. ", "\n## 5. ")
+        for needle in ("新しい端末", "--confirm", "--rollback-pending", "--force", "tmux",
+                       "Permission denied (publickey)", "閉じないでください", "再起動"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, flow, SECURITY_MD)
+
+    def test_the_lockout_recovery_waits_then_uses_the_console(self):
+        lockout = section(self.text, "## 7. ", "\n## 8. ")
+        for needle in ("まず待つ", "HDMI", "USB キーボード", "sudo bash scripts/harden.sh --rollback ssh"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, lockout, SECURITY_MD)
+        self.assertLess(lockout.find("まず待つ"), lockout.find("HDMI"))
+
+    def test_the_monthly_routine_updates_and_reboots_outside_the_broadcast_hours(self):
+        monthly = section(self.text, "## 6. ", "\n## 7. ")
+        for needle in ("bash scripts/security_check.sh", "sudo apt update && sudo apt full-upgrade", "sudo reboot",
+                       "9:55〜17:05", "python3 campus_chime.py --status"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, monthly, SECURITY_MD)
+
+    def test_the_github_protection_is_written(self):
+        github = section(self.text, "## 8. ", "\n## 9. ")
+        for needle in ("二要素認証", "パスキー", "ハードウェアセキュリティキー", "リカバリーコード", "オフライン", "Rulesets",
+                       "Require a pull request before merging", "Block force pushes", "Restrict deletions",
+                       "マージの前", "main"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, github, SECURITY_MD)
+
+    def test_the_pc_side_voicevox_listens_on_loopback(self):
+        pc = section(self.text, "## 9. ", "\n## 10. ")
+        self.assertInDoc("-p 127.0.0.1:50021:50021", pc, SECURITY_MD)
+        self.assertInDoc("SETUP.md", pc, SECURITY_MD)
+
+    def test_the_incident_runbook_has_its_steps(self):
+        incident = section(self.text, "## 10. ", "\n## 11. ")
+        for needle in ("電源を抜く", "SETUP.md", "Wi-Fi のパスフレーズ", "パスワード", "Security log", "取り消"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, incident, SECURITY_MD)
+
+    def test_the_section_numbers_written_in_the_guide_exist(self):
+        headings = heading_numbers(self.text)
+        self.assertTrue({"1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"} <= headings)
+        # ほかの文書の節（``SECURITY_REVIEW.md 7.1 節``）は、この文書の見出しとは照らさない（別のテストが照らす）
+        cited = re.findall(r"(\d+(?:\.\d+)?)[ \t]*節", strip_foreign_section_references(self.text))
+        self.assertTrue(cited)
+        self.assertEqual(sorted(set(cited) - headings), [])
+
+    def test_the_guide_describes_the_defence_and_not_how_to_attack(self):
+        # 公開リポジトリの運用者向けの手引き。攻撃のやり方（偽装の手順・エクスプロイト）は書かない
+        for word in ("なりすま", "偽装", "spoof", "Spoof", "exploit", "Exploit", "PoC", "CVE-"):
+            with self.subTest(word=word):
+                self.assertNotInDoc(word, self.text, SECURITY_MD)
+
+
+class SecurityGuideLinksTest(DocTestCase):
+    """README・仕様書・要件定義書が、新しい文書とスクリプトを載せていること。"""
+
+    def test_the_readme_points_at_the_guide_from_the_features_the_setup_and_the_document_list(self):
+        readme = doc(README_MD)
+        for start, end in (("## 3. できること", "## 4."), ("## 6. セットアップ", "## 7."),
+                           ("## 11. ドキュメント", "## 12.")):
+            with self.subTest(start=start):
+                self.assertInDoc("docs/SECURITY.md", section(readme, start, end), README_MD)
+
+    def test_the_readme_document_list_has_every_file_of_docs(self):
+        table = section(doc(README_MD), "## 11. ドキュメント", "## 12.")
+        self.assertEqual(sorted(re.findall(r"\[docs/(\w+\.md)\]\(docs/\1\)", table)),
+                         listed_files("docs", (".md",)))
+
+    def test_the_readme_tree_lists_every_file_of_docs(self):
+        tree = section(doc(README_MD), "└── docs/", "```")
+        self.assertEqual(sorted(re.findall(r"[├└]── (\w+\.md)", tree)), listed_files("docs", (".md",)))
+
+    def test_the_setup_and_the_knowledge_base_point_at_the_guide(self):
+        for name in (SETUP_MD, KNOWLEDGE_BASE_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("SECURITY.md", doc(name), name)
+        self.assertInDoc("SECURITY.md", section(doc(SETUP_MD), "## 13. ", "\n## 14."), SETUP_MD)
+
+    def test_the_specification_change_table_records_the_new_files(self):
+        table = section(doc(SPECIFICATION_MD), "### 2.1", "\n---\n")
+        for name in ("scripts/security_check.sh", "scripts/harden.sh", "docs/SECURITY.md", "docs/SECURITY_REVIEW.md",
+                     "tests/test_security_check.py", "tests/test_harden_script.py"):
+            with self.subTest(name=name):
+                self.assertInDoc("`{0}`".format(name), table, SPECIFICATION_MD)
+                row = next(line for line in table.splitlines() if "`{0}`".format(name) in line)
+                self.assertIn("v6.2.0", row)
+
+    def test_the_620_rows_mention_the_security_tools(self):
+        readme_row = re.search(r"^\|\s*(?:\*\*)?v6\.2\.0(?:\*\*)?\s*\|.*$", doc(README_MD), re.MULTILINE)
+        requirements_row = re.search(r"^\|\s*v6\.2\.0\s*\|.*$", doc(REQUIREMENTS_MD), re.MULTILINE)
+        for name, row in ((README_MD, readme_row), (REQUIREMENTS_MD, requirements_row)):
+            self.assertIsNotNone(row, "{0} に v6.2.0 の行がありません".format(name))
+            for needle in ("security_check.sh", "harden.sh", "docs/SECURITY.md"):
+                with self.subTest(doc=name, needle=needle):
+                    self.assertInDoc(needle, row.group(0), name)
+        for name in (SPECIFICATION_MD, REQUIREMENTS_MD):
+            header = doc(name).split("---", 1)[0]
+            with self.subTest(doc=name):
+                self.assertInDoc("安全面の点検と強化", header, name)
+
+    def test_the_requirements_have_the_security_requirement_and_an_acceptance_condition(self):
+        requirements = doc(REQUIREMENTS_MD)
+        nfr = section(requirements, "### NFR-08", "\n---\n")
+        for needle in ("scripts/security_check.sh", "scripts/harden.sh", "docs/SECURITY.md", "--rollback"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, nfr, REQUIREMENTS_MD)
+        row = next((line for line in requirements.splitlines() if line.startswith("| A-20 |")), "")
+        self.assertIn("security_check.sh", row)
+        self.assertIn("--confirm", row)
+
+    def test_the_requirements_revision_date_is_not_before_the_release_date_in_the_changelog(self):
+        revised = re.search(r"\*\*改訂日:\*\*\s*(\d{4})/(\d\d)/(\d\d)", doc(REQUIREMENTS_MD))
+        released = re.search(r"^## \[{0}\] - (\d{{4}})-(\d\d)-(\d\d)".format(re.escape(__version__)),
+                             read_text(CHANGELOG_PATH), re.MULTILINE)
+        self.assertIsNotNone(revised, "REQUIREMENTS.md のヘッダに改訂日がありません")
+        self.assertIsNotNone(released, "CHANGELOG.md に現行版の見出しがありません")
+        self.assertGreaterEqual(date(*map(int, revised.groups())), date(*map(int, released.groups())))
+
+
+class ServiceDropInInDocsTest(DocTestCase):
+    """放送サービスの保護は追加設定（drop-in）で足し、ユニット本体の文面は変えないこと。"""
+
+    def setUp(self):
+        self.spec = doc(SPECIFICATION_MD)
+        self.chapter = section(self.spec, "### 6.3", "\n---\n")
+
+    def test_the_specification_has_the_chapter_and_says_the_unit_itself_is_not_changed(self):
+        self.assertTrue(self.chapter, "SPECIFICATION.md に 6.3 章がありません")
+        self.assertInDoc(script_constant("harden.sh", "SERVICE_DROPIN"), self.chapter, SPECIFICATION_MD)
+        self.assertInDoc("ユニット本体", self.chapter, SPECIFICATION_MD)
+        self.assertInDoc("変えない", self.chapter, SPECIFICATION_MD)
+
+    def test_the_unit_file_of_the_repository_has_no_sandbox_of_its_own(self):
+        unit = read_text(os.path.join(REPO_ROOT, "campus_chime.service"))
+        for key in ("ProtectSystem", "ReadWritePaths", "SystemCallFilter", "CapabilityBoundingSet"):
+            with self.subTest(key=key):
+                self.assertNotIn(key, unit)
+
+    def test_the_options_of_the_chapter_are_the_ones_the_script_writes(self):
+        script = read_text(HARDEN_SH)
+        block = section(script, "  SANDBOX_PROPS=(\n", "\n  )\n")
+        keys = re.findall(r'^\s+"?([A-Za-z]+)=', block, re.MULTILINE)
+        self.assertGreater(len(keys), 15)
+        missing = [key for key in keys if key not in self.chapter]
+        self.assertEqual(missing, [], "SPECIFICATION.md 6.3 章に載っていない保護の項目があります")
+        for key in ("PrivateDevices", "DeviceAllow", "DevicePolicy", "ProtectClock", "MemoryDenyWriteExecute",
+                    "ProcSubset", "RemoveIPC", "PrivateUsers"):
+            with self.subTest(unused=key):
+                self.assertNotIn(key, keys)
+                self.assertInDoc(key, self.chapter, SPECIFICATION_MD)
+
+
+class SecurityInSetupAndKnowledgeBaseTest(DocTestCase):
+    """SETUP.md と KNOWLEDGE_BASE.md の、安全面に関わる手順と対処。"""
+
+    def test_the_imager_step_recommends_a_public_key_and_a_random_password(self):
+        step = section(doc(SETUP_MD), "### 1-4.", "\n## 2.")
+        self.assertTrue(step)
+        for needle in ("公開鍵認証のみ許可する", "ssh-keygen -t ed25519", "id_ed25519.pub", "秘密鍵",
+                       "sudo bash scripts/harden.sh ssh", "パスワード管理ソフト", "ランダム"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, step, SETUP_MD)
+        self.assertNotInDoc("忘れないもの", step, SETUP_MD)
+
+    def test_the_last_step_runs_the_check_and_points_at_the_guide(self):
+        checklist = section(doc(SETUP_MD), "## 12. ", "\n## 13.")
+        self.assertInDoc("bash scripts/security_check.sh", checklist, SETUP_MD)
+        self.assertInDoc("SECURITY.md", checklist, SETUP_MD)
+
+    def test_voicevox_listens_on_loopback_except_in_the_documented_wsl2_workaround(self):
+        runs = []
+        for path in current_doc_paths():
+            runs.extend((os.path.relpath(path, REPO_ROOT), line) for line in read_text(path).splitlines()
+                        if "docker run" in line and "50021:50021" in line)
+        self.assertTrue(runs)
+        self.assertIn("-p 127.0.0.1:50021:50021", runs[0][1])
+        for name, line in runs:
+            if "-p 127.0.0.1:50021:50021" not in line:
+                # 全部のインターフェースで待ち受ける書き方は、注意と一緒にだけ
+                self.assertIn("学内のほかの人にも届く", line, name)
+        setup = doc(SETUP_MD)
+        self.assertInDoc("--base-url http://<ホストのIP>:50021", setup, SETUP_MD)
+        self.assertInDoc("docker stop voicevox", section(setup, "WSL2 側から", "生成した音声を WSL2"), SETUP_MD)
+
+    def test_the_update_procedure_tells_that_sudo_may_ask_for_the_password(self):
+        procedure = section(doc(SETUP_MD), "### A. Pi 側で反映する", "### B.")
+        self.assertInDoc("harden.sh sudo", procedure, SETUP_MD)
+        self.assertInDoc("パスワードを聞かれる", procedure, SETUP_MD)
+
+    def test_the_chrony_restart_is_written_next_to_the_timesyncd_restart(self):
+        blocks = [block for block in fenced_blocks(doc(KNOWLEDGE_BASE_MD))
+                  if "systemctl restart systemd-timesyncd" in block]
+        self.assertEqual(len(blocks), 1)
+        self.assertIn("systemctl restart chrony", blocks[0])
+        self.assertInDoc("chronyc tracking", section(doc(KNOWLEDGE_BASE_MD), "### 4-5.", "### 4-6."),
+                         KNOWLEDGE_BASE_MD)
+
+    def test_the_monthly_routine_is_a_full_upgrade_and_a_reboot_outside_the_broadcast_hours(self):
+        table = section(doc(KNOWLEDGE_BASE_MD), "## 5. 定期点検の目安", "\n---\n")
+        row = next((line for line in table.splitlines() if "full-upgrade" in line), "")
+        self.assertTrue(row.startswith("| 毎月"), "毎月の行に apt full-upgrade がありません")
+        for needle in ("security_check.sh", "9:55〜17:05", "再起動", "--status", "SECURITY.md"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, row)
+        self.assertNotInDoc("学期ごと", table, KNOWLEDGE_BASE_MD)
+
+    def test_no_document_tells_the_reader_to_run_a_plain_apt_upgrade(self):
+        for name in (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SPECIFICATION_MD, REQUIREMENTS_MD, SECURITY_MD):
+            with self.subTest(doc=name):
+                self.assertIsNone(re.search(r"\bapt(?:-get)? upgrade\b", doc(name)),
+                                  "apt upgrade ではなく apt full-upgrade を書く")
+
+    def test_the_troubleshooting_has_an_entry_for_each_consequence_of_a_step(self):
+        chapter = section(doc(KNOWLEDGE_BASE_MD), "## 4. トラブル対処", "\n## 5.")
+
+        def entry(fragment: str) -> str:
+            match = re.search(r"^### 4-\d+\. [^\n]*{0}[^\n]*\n(.*?)(?=^### |\Z)".format(re.escape(fragment)),
+                              chapter, re.MULTILINE | re.DOTALL)
+            self.assertIsNotNone(match, "KNOWLEDGE_BASE.md 4 章に「{0}」の項目がありません".format(fragment))
+            return match.group(1)
+
+        ssh = entry("SSH で入れない")
+        for needle in ("--rollback ssh", "--rollback firewall", "HDMI", "--rollback-pending"):
+            with self.subTest(entry="ssh", needle=needle):
+                self.assertIn(needle, ssh)
+        password = entry("パスワードを聞くようになった")
+        for needle in ("update.sh", "setup.sh", "--rollback sudo", "harden.sh sudo"):
+            with self.subTest(entry="sudo", needle=needle):
+                self.assertIn(needle, password)
+        sound = entry("harden.sh service")
+        for needle in ("--rollback service", "--test-sound"):
+            with self.subTest(entry="service", needle=needle):
+                self.assertIn(needle, sound)
+
+
+
+# -- 修正ラウンドで直した、セキュリティの文書の言い過ぎ・言い落とし -----------------------------------
+
+SECURITY_CHECK_SH = os.path.join(REPO_ROOT, "scripts", "security_check.sh")
+DEVELOPMENT_LOG_MD = "docs/DEVELOPMENT_LOG.md"
+
+#: 運用者向けの文書（点検の画面に出る名前で書く文書）。開発の記録と仕様書は含めない。
+OPERATOR_DOCS = (README_MD, SETUP_MD, KNOWLEDGE_BASE_MD, SECURITY_MD, SECURITY_REVIEW_MD)
+
+#: 実機で試しておらず、強制終了などでは戻らないのに、言い切ってはいけない書き方。
+OVERPROMISES = ("締め出されない", "どれも元に戻せ", "どの手順も元に戻せ", "いつでも戻せる", "必ず戻せ", "確実に戻")
+
+#: その言い切りを否定する文（「…という保証ではありません」）は書いてよい。
+DENIAL_MARKS = ("保証", "わけではありません")
+
+
+def overpromising_lines(text: str) -> List[Tuple[int, str]]:
+    return [(number, line.strip()[:60]) for number, line in enumerate(text.splitlines(), start=1)
+            if any(promise in line for promise in OVERPROMISES) and not any(mark in line for mark in DENIAL_MARKS)]
+
+
+def script_item_ids() -> List[str]:
+    """security_check.sh のコメントにある項目の ID（``# NET-ADDR4``・``# SSH-PASSWORD / SSH-ROOT``）。"""
+    ids = []
+    for match in re.finditer(r"^[ \t]*# ((?:[A-Z]+-[A-Z0-9]+)(?: / [A-Z]+-[A-Z0-9]+)*)[ \t]*$",
+                             read_text(SECURITY_CHECK_SH), re.MULTILINE):
+        ids.extend(match.group(1).split(" / "))
+    return ids
+
+
+def script_categories() -> List[str]:
+    """security_check.sh が画面に出す分類の名前（``category="…"`` と ``emit ラベル "…"``）。"""
+    text = read_text(SECURITY_CHECK_SH)
+    names = re.findall(r'\b[a-z_]*category="([^"$]+)"', text)
+    names += re.findall(r'\bemit (?:OK|情報|注意|要対応|不明) "([^"$]+)"', text)
+    return sorted(set(names))
+
+
+def row_naming(text: str, needle: str) -> str:
+    return next((line for line in text.splitlines() if needle in line), "")
+
+
+class OverpromiseDetectionTest(unittest.TestCase):
+    """検査そのものが、言い切りだけを拾い、それを否定する文は拾わないこと。"""
+
+    def test_a_flat_promise_is_found(self):
+        self.assertEqual(len(overpromising_lines("確定しなければ自動で元に戻るので、締め出されない。\n")), 1)
+        self.assertEqual(len(overpromising_lines("どれも元に戻せる。\n")), 1)
+
+    def test_a_denial_is_not_found(self):
+        self.assertEqual(overpromising_lines("「締め出されない」という保証ではありません。\n"), [])
+        self.assertEqual(overpromising_lines("必ず戻せるわけではありません。\n"), [])
+
+    def test_the_item_ids_are_read_from_the_comments(self):
+        ids = script_item_ids()
+        for item in ("NET-ADDR4", "SSH-PASSWORD", "SSH-ROOT", "OS-KERNEL", "SVC-RPICONNECT", "HARDEN-PENDING"):
+            self.assertIn(item, ids)
+
+    def test_the_categories_are_read_from_the_script(self):
+        names = script_categories()
+        for name in ("IPv4 アドレス", "SSH パスワードログイン", "カーネルの新しさ", "Bluetooth", "pip の pygame"):
+            self.assertIn(name, names)
+
+
+class BeforeYouStartInDocsTest(DocTestCase):
+    """運用の手引きは、適用の前に読むべき注意を、手順より前に置くこと（実機では未試験、コンソール、放送のない時間）。"""
+
+    def setUp(self):
+        self.text = doc(SECURITY_MD)
+        self.order = section(self.text, "## 3. ", "\n## 4. ")
+        match = re.search(r"(?:^>.*\n?)+", self.order, re.MULTILINE)
+        self.box = match.group(0) if match else ""
+
+    def test_the_order_opens_with_a_box_before_the_table(self):
+        self.assertTrue(self.box, "SECURITY.md 3 節に「始める前に」の箱（引用）がありません")
+        self.assertLess(self.order.find(self.box), self.order.find("| 順 |"))
+        for needle in ("始める前に", "一度も動かしていません", "--dry-run", "1 手順ずつ", "HDMI", "USB キーボード", "パスワード",
+                       "9:55〜17:05", "SECURITY_REVIEW.md"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, self.box, SECURITY_MD)
+
+    def test_the_box_names_the_steps_that_touch_the_broadcast(self):
+        for needle in ("service", "updates", "ntp", "--test-sound"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, self.box, SECURITY_MD)
+
+    def test_the_top_of_the_guide_points_at_the_box_and_says_where_a_new_terminal_starts(self):
+        top = self.text.split("\n---\n", 1)[0]
+        self.assertInDoc("3 節の「始める前に」", top, SECURITY_MD)
+        self.assertInDoc("ホームのフォルダから始まります", top, SECURITY_MD)
+        self.assertInDoc("sudo bash /home/pi/campus-chime/scripts/harden.sh", top, SECURITY_MD)
+
+    def test_the_documents_that_cite_the_advice_point_at_the_box(self):
+        for name in (DEVELOPMENT_LOG_MD, SECURITY_REVIEW_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("SECURITY.md 3 節の「始める前に」", doc(name), name)
+                self.assertNotInDoc("1 手順ずつ、HDMI とキーボードをつないだ状態で行う（SECURITY.md 7 節）", doc(name), name)
+
+    def test_the_order_starts_with_the_check_then_the_os_update_and_then_the_keys(self):
+        rows = [line for line in self.order.splitlines() if re.match(r"\| \d+ \|", line)]
+        self.assertGreaterEqual(len(rows), 10)
+        self.assertIn("security_check.sh", rows[0])
+        self.assertIn("full-upgrade", rows[1])
+        self.assertIn("3.1 節", rows[2])
+        self.assertIn("harden.sh ssh", rows[3])
+
+    def test_the_guide_says_which_os_it_works_on_and_that_apt_is_refreshed(self):
+        script = read_text(HARDEN_SH)
+        self.assertIn("bookworm | trixie)", script)
+        self.assertIn("sys apt-get update", script)
+        for needle in ("bookworm", "trixie", "apt-get update", "--force"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, self.order, SECURITY_MD)
+
+
+class LimitsOfTheSafetyNetsInDocsTest(DocTestCase):
+    """元に戻す仕組みが何を守り、何を守れないかを書き、言い切らないこと。"""
+
+    def test_no_document_promises_that_nobody_is_locked_out_or_that_everything_can_be_undone(self):
+        problems = []
+        for path in current_doc_paths() + [CHANGELOG_PATH]:
+            problems.extend("{0}:{1}: {2}".format(os.path.relpath(path, REPO_ROOT), number, line)
+                            for number, line in overpromising_lines(read_text(path)))
+        self.assertEqual(problems, [], "言い切りが残っています。守るものと、守れないものを書く")
+
+    def test_the_guide_lists_what_each_safety_net_does(self):
+        chapter = section(doc(SECURITY_MD), "### 3.2 ", "\n## 4. ")
+        self.assertTrue(chapter, "SECURITY.md に 3.2 節がありません")
+        for needle in ("Ctrl-C", "SIGHUP", "SIGTERM", "130・129・143", "最後に確定した設定", "5 分", "10 分"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, chapter, SECURITY_MD)
+
+    def test_the_guide_lists_what_the_safety_nets_cannot_do(self):
+        chapter = section(doc(SECURITY_MD), "### 3.2 ", "\n## 4. ")
+        for needle in ("限界", "kill -9", "電源断", "OS が起動しない", "元に戻せませんでした", "実機", "未確認"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, chapter, SECURITY_MD)
+
+    def test_the_exit_codes_of_the_signals_are_the_ones_of_the_script(self):
+        script = read_text(HARDEN_SH)
+        for name, code in (("INT", 130), ("TERM", 143), ("HUP", 129)):
+            with self.subTest(signal=name):
+                self.assertIn("'on_signal {0} {1}'".format(name, code), script)
+
+    def test_the_sudo_step_is_described_with_its_window_and_its_limit(self):
+        window = script_constant("harden.sh", "SUDO_WINDOW")
+        body = subsections(doc(SECURITY_MD), "5.")["sudo"]
+        for needle in ("{0} 分の安全網".format(window), "Ctrl-C", "強制終了", "--confirm", "パスワードが分からない",
+                       "適用の前に"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, body, SECURITY_MD)
+        self.assertIn('arm_for sudo "${SUDO_WINDOW}"', read_text(HARDEN_SH))
+        self.assertEqual(sorted(set(re.findall(r"(\d+) 分の安全網", doc(SECURITY_MD)))), [window])
+        self.assertEqual(sorted(set(re.findall(r"SUDO_WINDOW`?（(\d+) 分）", doc(SPECIFICATION_MD)))), [window])
+        self.assertInDoc("{0} 分".format(window), section(doc(KNOWLEDGE_BASE_MD), "### 4-10.", "### 4-11."),
+                         KNOWLEDGE_BASE_MD)
+
+    def test_a_late_confirm_is_described_as_the_script_reports_it(self):
+        script = read_text(HARDEN_SH)
+        text = doc(SECURITY_MD)
+        for message in ("確定する変更はありません。ただし、これは確定できたからではありません。", "自動で元に戻された変更があります"):
+            with self.subTest(message=message):
+                self.assertIn(message, script)
+                self.assertInDoc(message, text, SECURITY_MD)
+        self.assertInDoc("終了コード 1", section(text, "### 4.3 ", "### 4.4 "), SECURITY_MD)
+        self.assertIn("確定する変更はありません。ただし、これは確定できたからではありません。",
+                      section(doc(KNOWLEDGE_BASE_MD), "### 4-10.", "### 4-11."))
+
+    def test_the_messages_the_guide_quotes_from_the_scripts_exist(self):
+        scripts = read_text(HARDEN_SH) + read_text(SECURITY_CHECK_SH)
+        text = doc(SECURITY_MD)
+        for message in ("この画面は、変更の前に開いたものです", "元に戻せませんでした", "点検は完全ではありません",
+                        "すでに適用済みです", "更新したカーネルがまだ使われていません"):
+            with self.subTest(message=message):
+                self.assertIn(message, scripts)
+                self.assertInDoc(message, text, SECURITY_MD)
+
+    def test_the_reapplication_goes_back_to_the_last_confirmed_setting(self):
+        for name in (SECURITY_MD, SPECIFICATION_MD, REQUIREMENTS_MD):
+            with self.subTest(doc=name):
+                self.assertInDoc("最後に確定した設定", doc(name), name)
+        self.assertIn("confirmed/", read_text(HARDEN_SH))
+
+
+class CheckWithSudoInDocsTest(DocTestCase):
+    """確認の手順は、sudo を付けた点検で行う（付けないと root が要る項目が [不明] になり、「要対応 0 件」が合格にならない）。"""
+
+    def test_no_document_writes_the_check_without_sudo(self):
+        bare = []
+        for path in current_doc_paths() + [CHANGELOG_PATH]:
+            for number, line in enumerate(read_text(path).splitlines(), start=1):
+                if re.search(r"(?<!sudo )bash scripts/security_check\.sh", line):
+                    bare.append("{0}:{1}".format(os.path.relpath(path, REPO_ROOT), number))
+        self.assertEqual(bare, [], "sudo を付けない点検のコマンドが残っています")
+
+    def test_every_acceptance_check_says_that_unknown_items_must_be_gone_too(self):
+        for name, where in ((SECURITY_MD, section(doc(SECURITY_MD), "## 3. ", "\n## 4. ")),
+                            (SECURITY_MD, section(doc(SECURITY_MD), "## 6. ", "\n## 7. ")),
+                            (SETUP_MD, section(doc(SETUP_MD), "## 12. ", "\n## 13.")),
+                            (KNOWLEDGE_BASE_MD, row_naming(doc(KNOWLEDGE_BASE_MD), "| 毎月（放送のない時間に）")),
+                            (SECURITY_REVIEW_MD, row_naming(doc(SECURITY_REVIEW_MD), "| 10 | 最後の確認"))):
+            with self.subTest(doc=name, where=where[:20]):
+                self.assertTrue(where)
+                self.assertInDoc("[不明]", where, name)
+
+    def test_the_guide_explains_what_unknown_means(self):
+        text = doc(SECURITY_MD)
+        for needle in ("調べられなかった", "点検は完全ではありません", "安全と確かめられたことにはなりません"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, text, SECURITY_MD)
+
+    def test_the_script_says_so_when_unknown_items_remain(self):
+        script = read_text(SECURITY_CHECK_SH)
+        self.assertIn("点検は完全ではありません", script)
+        self.assertIn("この結果は、確認の合格には使えません", script)
+        self.assertIn("sudo bash scripts/security_check.sh", script)
+
+    def test_the_documents_say_the_check_does_not_rebuild_the_apt_index(self):
+        script = read_text(SECURITY_CHECK_SH)
+        self.assertIn("-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache=", script)
+        self.assertIn("pkgcache.bin", script)
+        self.assertIn("pkgcache.bin", doc(SPECIFICATION_MD))
+
+
+class CategoryNamesInDocsTest(DocTestCase):
+    """運用の手順は、点検の画面に出る分類の名前で書く（項目の ID は、スクリプトのコメントにしかない）。"""
+
+    @staticmethod
+    def without_developer_reference(name: str) -> str:
+        text = doc(name)
+        if name == SECURITY_REVIEW_MD:
+            text = text.split("### 8.4 ", 1)[0]
+        return text
+
+    def test_the_item_ids_are_not_written_in_the_operators_documents(self):
+        ids = script_item_ids()
+        self.assertGreaterEqual(len(ids), 30)
+        found = []
+        for name in OPERATOR_DOCS:
+            text = self.without_developer_reference(name)
+            found.extend("{0}: {1}".format(name, item) for item in ids
+                         if re.search(r"(?<![A-Z-]){0}(?![A-Z0-9-])".format(item), text))
+        self.assertEqual(found, [], "画面に出ない項目の ID が書かれています（画面に出る分類の名前に直す）")
+
+    def test_every_category_of_the_script_is_in_the_reference_table(self):
+        reference = doc(SECURITY_REVIEW_MD).split("### 8.4 ", 1)[1]
+        missing = [name for name in script_categories() if "「{0}」".format(name) not in reference]
+        self.assertEqual(missing, [], "SECURITY_REVIEW.md 8.4 節の対応表に無い分類があります")
+
+    def test_every_item_id_of_the_script_is_in_the_reference_table(self):
+        reference = doc(SECURITY_REVIEW_MD).split("### 8.4 ", 1)[1]
+        missing = [item for item in script_item_ids() if "`{0}`".format(item) not in reference]
+        self.assertEqual(missing, [], "SECURITY_REVIEW.md 8.4 節の対応表に無い項目の ID があります")
+
+    def test_the_names_the_documents_give_for_a_line_are_the_names_the_script_prints(self):
+        script = read_text(SECURITY_CHECK_SH)
+        wrong = []
+        # 点検の行の名前を書くのは、手引きとレビューの記録だけ（ほかの文書の「…の行」は、別の道具の出力）
+        for name in (SECURITY_MD, SECURITY_REVIEW_MD):
+            text = self.without_developer_reference(name)
+            for run in re.findall(r"((?:「[^」\n]+」[・、]?)+)の行", text):
+                wrong.extend("{0}: {1}".format(name, quoted) for quoted in re.findall(r"「([^」]+)」", run)
+                             if quoted not in script)
+        self.assertEqual(wrong, [], "点検の画面に出ない名前を、点検の行の名前として書いています")
+
+    def test_the_review_names_the_lines_of_the_check_it_relies_on(self):
+        review = self.without_developer_reference(SECURITY_REVIEW_MD)
+        for needle in ("「カーネルの新しさ」", "「再起動の要否」", "「IPv4 アドレス」", "「リポジトリの取得元」", "「pip の pygame」"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, review, SECURITY_REVIEW_MD)
+
+
+class CommandPathsInDocsTest(DocTestCase):
+    """新しい SSH の画面はホームのフォルダから始まる。そこで打つ確定のコマンドは、場所を全部書く。"""
+
+    ABSOLUTE = "/home/pi/campus-chime/scripts/harden.sh"
+
+    def test_every_confirm_command_in_the_docs_names_the_whole_path(self):
+        bare = []
+        for path in current_doc_paths() + [CHANGELOG_PATH]:
+            for number, line in enumerate(read_text(path).splitlines(), start=1):
+                for match in re.finditer(r"harden\.sh --confirm", line):
+                    if not line[:match.end()].endswith(self.ABSOLUTE + " --confirm"):
+                        bare.append("{0}:{1}".format(os.path.relpath(path, REPO_ROOT), number))
+        self.assertEqual(bare, [], "場所を書かない確定のコマンドが残っています（新しい端末ではホームから始まる）")
+
+    def test_the_confirm_steps_of_the_guide_are_in_blocks_that_can_be_copied(self):
+        flow = section(doc(SECURITY_MD), "### 4.1 ", "### 4.2 ")
+        blocks = [textwrap.dedent(block).strip() for block in
+                  re.findall(r"^[ \t]*```[^\n]*\n(.*?)^[ \t]*```", flow, re.MULTILINE | re.DOTALL)]
+        self.assertIn("sudo bash {0} --confirm".format(self.ABSOLUTE), blocks)
+        self.assertIn("cd /home/pi/campus-chime\npython3 campus_chime.py --status", blocks)
+        self.assertInDoc("sudo bash {0} --rollback-pending".format(self.ABSOLUTE), flow, SECURITY_MD)
+
+    def test_the_review_table_writes_the_confirm_of_the_new_terminal_in_full(self):
+        rows = section(doc(SECURITY_REVIEW_MD), "## 4. ", "\n## 5. ")
+        for number in ("5", "6"):
+            with self.subTest(row=number):
+                row = row_naming(rows, "| {0} |".format(number))
+                self.assertInDoc("sudo bash {0} --confirm".format(self.ABSOLUTE), row, SECURITY_REVIEW_MD)
+        self.assertInDoc("cd /home/pi/campus-chime", rows, SECURITY_REVIEW_MD)
+
+    def test_the_script_writes_the_commands_it_prints_with_its_own_absolute_path(self):
+        script = read_text(HARDEN_SH)
+        self.assertIn("harden_cmd() { printf 'sudo bash %q' \"${SCRIPT_PATH}\"; }", script)
+
+
+class KnowledgeBaseSoundTestInDocsTest(DocTestCase):
+    """4-12 は、保護を戻した直後に、保護が無いと断られる ``--test-sound`` を勧めない。"""
+
+    def test_the_retry_after_the_rollback_names_the_step_together_with_the_test(self):
+        entry = section(doc(KNOWLEDGE_BASE_MD), "### 4-12.", "\n---\n")
+        self.assertInDoc("sudo bash scripts/harden.sh service --test-sound", entry, KNOWLEDGE_BASE_MD)
+        self.assertIsNone(re.search(r"scripts/harden\.sh --test-sound", entry),
+                          "戻したあとは保護の設定が無く、--test-sound だけは断られる")
+
+    def test_the_script_refuses_a_bare_test_sound_without_the_dropin(self):
+        script = read_text(HARDEN_SH)
+        self.assertIn("先に $(harden_cmd) service を実行するか、service と一緒に --test-sound を付けてください", script)
+
+
+class PinnedFactsOfTheSecurityGuideTest(DocTestCase):
+    """手引きに書いた時刻・秒数・上限・分数が、スクリプトの値と同じであること（書き換えると落ちる）。"""
+
+    def setUp(self):
+        self.script = read_text(HARDEN_SH)
+        self.guide = doc(SECURITY_MD)
+        self.steps = subsections(self.guide, "5.")
+
+    def test_the_apt_timers_are_the_ones_the_script_installs(self):
+        found = {}
+        for drop_in, clock, spread in re.findall(
+                r'put_file updates "\$\{(APT_DAILY_DROPIN|APT_UPGRADE_DROPIN)\}" 644 '
+                r'"\$\(updates_timer_content (\d\d:\d\d) (\d+)min\)"', self.script):
+            found[drop_in] = (clock, spread)
+        self.assertEqual(sorted(found), ["APT_DAILY_DROPIN", "APT_UPGRADE_DROPIN"])
+        for unit, drop_in in (("apt-daily.timer", "APT_DAILY_DROPIN"), ("apt-daily-upgrade.timer", "APT_UPGRADE_DROPIN")):
+            with self.subTest(unit=unit):
+                self.assertInDoc("`{0}` は {1}（ばらつき最大 {2} 分）".format(unit, *found[drop_in]),
+                                 self.steps["updates"], SECURITY_MD)
+
+    def test_the_hours_the_updates_come_are_the_ones_the_script_reports(self):
+        reported = re.search(r"毎朝 (\d+:\d\d〜\d+:\d\d) ごろ", self.script)
+        self.assertIsNotNone(reported)
+        self.assertInDoc("毎朝 {0} ごろ".format(reported.group(1)), self.steps["updates"], SECURITY_MD)
+        for path in current_doc_paths():
+            for number, line in enumerate(read_text(path).splitlines(), start=1):
+                for hours in re.findall(r"毎朝 (\d+:\d\d〜\d+:\d\d) ごろ", line):
+                    self.assertEqual(hours, reported.group(1), "{0}:{1}".format(os.path.relpath(path, REPO_ROOT), number))
+
+    def test_the_hours_around_the_timers_are_the_ones_the_script_checks(self):
+        self.assertIn("low, high = 4 * 60 + 30, 6 * 60 + 30", self.script)
+        self.assertInDoc("4:30〜6:30", self.steps["updates"], SECURITY_MD)
+        self.assertInDoc("4:30〜6:30", doc(SECURITY_REVIEW_MD), SECURITY_REVIEW_MD)
+
+    def test_the_wait_for_the_time_sync_is_the_one_of_the_script(self):
+        match = re.search(r"for \(\(i = 0; i < (\d+); i\+\+\)\); do\s+if \[ \"\$\(timedatectl show -p NTPSynchronized"
+                          r".*?sleep (\d+)", self.script, re.DOTALL)
+        self.assertIsNotNone(match)
+        seconds = int(match.group(1)) * int(match.group(2))
+        self.assertIn("{0} 秒待っても".format(seconds), self.script)
+        self.assertInDoc("最大 {0} 秒".format(seconds), self.steps["ntp"], SECURITY_MD)
+
+    def test_the_journal_limit_is_the_one_of_the_script(self):
+        limit = re.search(r"'SystemMaxUse=(\w+)'", self.script).group(1)
+        self.assertInDoc("上限 {0}".format(limit), self.steps["journal"], SECURITY_MD)
+        self.assertInDoc("上限 {0}".format(limit), doc(SPECIFICATION_MD), SPECIFICATION_MD)
+
+    def test_the_look_ahead_is_the_one_of_the_script(self):
+        minutes = script_constant("harden.sh", "LOOKAHEAD_MINUTES")
+        for step in ("firewall", "updates", "ntp"):
+            with self.subTest(step=step):
+                self.assertInDoc("{0} 分以上".format(minutes), self.steps[step], SECURITY_MD)
+        self.assertInDoc("{0} 分以上".format(minutes), doc(SPECIFICATION_MD), SPECIFICATION_MD)
+
+    def test_the_waits_of_the_automatic_revert_are_the_ones_of_the_script(self):
+        self.assertIn("acquire_lock 1800", self.script)
+        self.assertIn("RestartSec=60", self.script)
+        chapter = section(self.guide, "### 4.4 ", "\n---\n")
+        self.assertInDoc("最大 30 分", chapter, SECURITY_MD)
+        self.assertInDoc("60 秒後", chapter, SECURITY_MD)
+
+    def test_the_documented_rollbacks_name_a_step(self):
+        steps = set(harden_steps())
+        wrong = []
+        for path in current_doc_paths() + [CHANGELOG_PATH]:
+            for number, line in enumerate(read_text(path).splitlines(), start=1):
+                wrong.extend("{0}:{1}: --rollback {2}".format(os.path.relpath(path, REPO_ROOT), number, word)
+                             for word in re.findall(r"--rollback[ \t]+([a-z][a-z-]*)", line) if word not in steps)
+        self.assertEqual(wrong, [], "--rollback に続く手順の名前が違います")
+
+    def test_every_long_option_of_the_guide_is_an_option_of_a_script_or_a_known_command(self):
+        known = shell_options("harden.sh") | shell_options("security_check.sh") | cli_options()
+        known |= {"--name", "--base-url", "--list-boots", "--no-pager"}
+        unknown = sorted(set(_OPTION.findall(self.guide)) - known)
+        self.assertEqual(unknown, [], "手引きに、スクリプトにも既知のコマンドにも無いオプションがあります（綴りの違い）")
+
+    def test_the_public_review_does_not_name_the_flag_and_the_file_of_an_unfixed_deletion_problem(self):
+        text = doc(SECURITY_REVIEW_MD)
+        self.assertNotInDoc("--prune", text, SECURITY_REVIEW_MD)
+        self.assertNotInDoc("manifest.json", text, SECURITY_REVIEW_MD)
+
+    def test_the_chrony_sources_file_is_also_written_when_the_servers_are_carried_over(self):
+        row = row_naming(self.guide, "/etc/chrony/sources.d/campus-chime-harden.sources")
+        for needle in ("--ntp-server", "引き継"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, row, SECURITY_MD)
+        self.assertIn('NTP_SERVERS_EFFECTIVE+=("${host}")', self.script)
+        self.assertIn("timesyncd に設定されていた NTP サーバーを引き継ぎます", self.script)
+
+    def test_the_review_does_not_say_the_old_procedure_had_no_reboot(self):
+        review = doc(SECURITY_REVIEW_MD)
+        self.assertNotInDoc("再起動の決まりもなかった", review, SECURITY_REVIEW_MD)
+        row = row_naming(review, "| 4 | 条件つきで中")
+        self.assertInDoc("毎月", row, SECURITY_REVIEW_MD)
+        self.assertInDoc("学期ごとの更新と再起動", row, SECURITY_REVIEW_MD)
+
+    def test_the_guide_describes_the_port_detection_and_the_force_limit(self):
+        step = self.steps["firewall"]
+        for needle in ("sshd -T", "ssh.socket", "22 とは限りません", "`--force` を付けても止まります", "22 だけを開けます"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, step, SECURITY_MD)
+        self.assertIn("tcp dport", self.script)
+        self.assertIn("--force でも止めます", self.script)
+
+    def test_the_timing_checks_of_the_updates_step_are_the_ones_of_the_script(self):
+        step = self.steps["updates"]
+        for needle in ("timedatectl set-timezone", "UTC", "--force"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, step, SECURITY_MD)
+        self.assertIn("timedatectl set-timezone", self.script)
+
+    def test_the_service_step_describes_the_checks_before_the_change(self):
+        step = self.steps["service"]
+        for needle in ("WorkingDirectory", "ExecStart", "`~`", "sudo mkdir -p", "sudo chown", "`$`"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, step, SECURITY_MD)
+        self.assertIn("runuser", self.script)
+        self.assertIn("sudo mkdir -p", self.script)
+
+
+def shell_function(text: str, name: str) -> str:
+    """シェルスクリプトの関数 ``name() { … }`` の本体（閉じ括弧だけの行の手前まで）。"""
+    match = re.search(r"^{0}\(\) \{{\n(.*?)^\}}$".format(re.escape(name)), text, re.MULTILINE | re.DOTALL)
+    assert match, "関数 {0} が見つかりません".format(name)
+    return match.group(1)
+
+
+class ServiceDirsInDocsTest(DocTestCase):
+    """``setup.sh`` が再起動の前に作るフォルダ（保護の下のサービスが書き込む場所）の記述が、スクリプトと同じであること。"""
+
+    def script_dirs(self) -> List[str]:
+        match = re.search(r"^SERVICE_WRITE_DIRS=\(([^)\n]*)\)", read_text(SETUP_SH), re.MULTILINE)
+        self.assertIsNotNone(match, "setup.sh に SERVICE_WRITE_DIRS の行がありません")
+        return match.group(1).split()
+
+    def documents(self) -> List[Tuple[str, str]]:
+        changelog = section(read_text(CHANGELOG_PATH), "## [6.2.0]", "\n## [6.1.0]")
+        return [(SPECIFICATION_MD, row_naming(section(doc(SPECIFICATION_MD), "### 4.19", "\n---\n"), "| `setup.sh` |")),
+                (SETUP_MD, section(doc(SETUP_MD), "## 5. 本体を導入する", "## 6.")),
+                (SECURITY_MD, subsections(doc(SECURITY_MD), "5.")["service"]),
+                (CHANGELOG_PATH, changelog)]
+
+    def test_the_script_makes_the_two_fixed_folders(self):
+        self.assertEqual(self.script_dirs(), ["cache", "assets/generated"])
+
+    def test_the_folders_are_made_just_before_the_restart_and_only_there(self):
+        script = read_text(SETUP_SH)
+        calls = [match.start() for match in re.finditer(r"^[ \t]+prepare_service_dirs$", script, re.MULTILINE)]
+        self.assertEqual(len(calls), 1, "prepare_service_dirs は、再起動する分岐の 1 か所でだけ呼ぶ")
+        restart = script.index('sudo systemctl restart "${SERVICE_NAME}"')
+        self.assertEqual(script[calls[0]:restart].split(), ["prepare_service_dirs"])
+        self.assertLess(script.index("restart_withheld=1"), calls[0])
+
+    def test_making_them_does_not_use_sudo(self):
+        body = shell_function(read_text(SETUP_SH), "prepare_service_dirs")
+        code = [line for line in body.splitlines() if not line.lstrip().startswith("#")]
+        self.assertFalse([line for line in code if "sudo" in line], "フォルダは実行している利用者で作る（sudo を使わない）")
+        self.assertIn('mkdir -p "${REPO_DIR}/${rel}"', body)
+
+    def test_the_header_that_help_shows_names_both_folders(self):
+        header = []
+        for line in read_text(SETUP_SH).splitlines()[1:]:
+            if not line.startswith("#"):
+                break
+            header.append(line)
+        text = "\n".join(header)
+        for rel in self.script_dirs():
+            with self.subTest(folder=rel):
+                self.assertIn("{0}/".format(rel), text)
+
+    def test_the_documents_name_the_folders_the_script_makes(self):
+        for name, text in self.documents():
+            for rel in self.script_dirs():
+                with self.subTest(doc=name, folder=rel):
+                    self.assertTrue(text, "{0} に該当する節がありません".format(name))
+                    self.assertInDoc("`{0}/`".format(rel), text, name)
+
+    def test_the_specification_row_says_what_the_script_does_not_do(self):
+        row = row_naming(section(doc(SPECIFICATION_MD), "### 4.19", "\n---\n"), "| `setup.sh` |")
+        for needle in ("prepare_service_dirs", "`config.json` からは読まない", "root で実行したときは何も作らず", "`sudo` は使わない",
+                       "`--no-service`", "警告だけで導入は止めず"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, row, SPECIFICATION_MD)
+
+    def test_a_folder_moved_by_the_config_is_left_to_the_service_step_in_the_guide_and_the_specification(self):
+        self.assertInDoc("`config.json` で場所を変えているときは、この手順が求めた場所を作ります",
+                         subsections(doc(SECURITY_MD), "5.")["service"], SECURITY_MD)
+        self.assertInDoc("`setup.sh` も、サービスを再起動する前に", section(doc(SPECIFICATION_MD), "### 6.3", "\n---\n"), SPECIFICATION_MD)
+
+    def test_the_guide_does_not_tell_to_make_them_as_root(self):
+        step = subsections(doc(SECURITY_MD), "5.")["service"]
+        self.assertInDoc("root で実行したときは作らず", step, SECURITY_MD)
+        self.assertIn("root で実行しているため", read_text(SETUP_SH))
+
+
+class HardenPendingItemInDocsTest(DocTestCase):
+    """点検の「harden.sh の保留」の項目（``check_harden_pending``）の記述が、スクリプトと同じであること。"""
+
+    def setUp(self):
+        self.script = read_text(SECURITY_CHECK_SH)
+        self.body = shell_function(self.script, "check_harden_pending")
+        self.spec_row = row_naming(section(doc(SPECIFICATION_MD), "### 4.19", "\n---\n"), "| `security_check.sh` |")
+
+    def sudo_only_branch(self) -> str:
+        return self.body.rsplit("\n  else\n", 1)[1]
+
+    def test_the_record_lines_are_the_ones_harden_sh_writes(self):
+        harden = read_text(HARDEN_SH)
+        self.assertIn('meta_set "${PENDING_FILE}" window', harden)
+        self.assertIn('meta_set "${PENDING_FILE}" "$1" "${NOW}"', harden)
+        for key in ("ssh", "firewall", "sudo", "window"):
+            with self.subTest(key=key):
+                self.assertIn("{0}=*)".format(key), self.body)
+                self.assertInDoc("`{0}=".format(key), self.spec_row, SPECIFICATION_MD)
+
+    def test_the_window_that_is_assumed_when_it_cannot_be_read_is_the_one_of_harden_sh(self):
+        match = re.search(r"\*\) window=(\d+) ;; esac", self.body)
+        self.assertIsNotNone(match)
+        self.assertEqual(match.group(1), script_constant("harden.sh", "REVERT_AFTER"))
+        self.assertInDoc("既定（`REVERT_AFTER`）と同じ {0} 分".format(match.group(1)), self.spec_row, SPECIFICATION_MD)
+
+    def test_a_stuck_sudo_step_alone_is_not_told_to_be_confirmed(self):
+        branch = self.sudo_only_branch()
+        self.assertIn("sudo の手順が途中で止まりました。数分で自動で元に戻ります", branch)
+        self.assertIn("確定の操作は要りません", branch)
+        self.assertNotIn("--confirm", branch)
+        self.assertIn("--confirm", self.body.split("\n  else\n")[0])
+        self.assertInDoc("この項目に `--confirm` は書かない", self.spec_row, SPECIFICATION_MD)
+
+    def test_the_guide_says_the_same_for_a_stuck_sudo_step(self):
+        steps = subsections(doc(SECURITY_MD), "5.")
+        sudo = steps["sudo"]
+        self.assertInDoc("sudo の手順が途中で止まりました", sudo, SECURITY_MD)
+        confirms = [line for line in sudo.splitlines() if "--confirm" in line]
+        self.assertTrue(confirms)
+        self.assertEqual([line for line in confirms if "要りません" not in line], [],
+                         "sudo の手順の節は、--confirm が要らないとだけ書く")
+        confirming = section(doc(SECURITY_MD), "## 4. ", "### 4.1 ")
+        self.assertInDoc("「harden.sh の保留」の行", confirming, SECURITY_MD)
+        self.assertInDoc("確定の操作は要らない（できない）", confirming, SECURITY_MD)
+
+    def test_the_messages_the_documents_quote_are_the_ones_the_script_prints(self):
+        for needle in ("確定していません（手順: ", "確定しないと ${window} 分で自動で元に戻ります", "数分で自動で元に戻ります（パスワードなしの sudo が戻る）"):
+            with self.subTest(needle=needle):
+                self.assertIn(needle, self.body)
+        for needle in ("数分で自動で元に戻ります", "確定しないと N 分で自動で元に戻ります"):
+            with self.subTest(needle=needle):
+                self.assertInDoc(needle, self.spec_row, SPECIFICATION_MD)
+
+    def test_the_fix_line_names_the_repository_by_its_absolute_quoted_path(self):
+        self.assertIn("printf '%q' \"${REPO_DIR}/scripts/harden.sh\"", self.body)
+        self.assertInDoc("`printf %q` で引用する", self.spec_row, SPECIFICATION_MD)
+        self.assertInDoc("sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm", self.spec_row, SPECIFICATION_MD)
+
+    def test_what_counts_as_nothing_pending_is_the_same_in_the_script_and_the_specification(self):
+        self.assertIn('[ "${has_ssh}${has_firewall}${has_sudo}" = 000 ]', self.body)
+        self.assertIn("[ -f \"${pending_file}\" ]", self.body)
+        self.assertInDoc("手順の行が 1 つも無い記録（`window` だけ・空・手順でない行）と、普通のファイルでない記録は、確定待ちなしの `[OK]`",
+                         self.spec_row, SPECIFICATION_MD)
+
+    def test_a_run_with_unknown_items_says_so_as_root_too(self):
+        self.assertIn("理由は上の各行にあります", self.script)
+        self.assertInDoc("すでに `sudo` を付けているのに出るときは、道具が無い・ファイルを読めない、などが理由です（各行に書いてあります）",
+                         doc(SECURITY_MD), SECURITY_MD)
+
+    def test_the_documents_say_the_check_writes_nothing_even_as_root(self):
+        self.assertIn("apt_read() {", self.script)
+        self.assertInDoc("root で実行しても、apt の索引の写しは作り直しません", doc(SECURITY_MD), SECURITY_MD)
+        self.assertInDoc("root で実行しても、apt の索引の写し（`/var/cache/apt`）を作り直さない",
+                         section(read_text(CHANGELOG_PATH), "## [6.2.0]", "\n## [6.1.0]"), "CHANGELOG.md")
+        self.assertInDoc("root で実行しても `/var/cache/apt` に何も書かない", self.spec_row, SPECIFICATION_MD)
+
+
+class SecuritySectionReferencesInDocsTest(unittest.TestCase):
+    """``SECURITY.md 3.2 節``・``SECURITY_REVIEW.md 7.1 節`` のように、ほかの文書が指す節が実在すること。"""
+
+    REFERENCE = re.compile(r"(SECURITY|SECURITY_REVIEW)\.md(?:\]\([^)]*\)|[`\])])*[ \t]*(?:の[ \t]*)?(\d+(?:\.\d+)?)[ \t]*[節章]")
+
+    def test_the_reference_pattern_reads_the_written_styles(self):
+        for text, target, number in (("SECURITY.md 3.2 節", "SECURITY", "3.2"),
+                                     ("[SECURITY_REVIEW.md](SECURITY_REVIEW.md) 7.1 節", "SECURITY_REVIEW", "7.1"),
+                                     ("`SECURITY.md` の 8 節", "SECURITY", "8")):
+            with self.subTest(text=text):
+                self.assertEqual(self.REFERENCE.findall(text), [(target, number)])
+
+    def test_every_referenced_section_exists(self):
+        headings = {"SECURITY": heading_numbers(doc(SECURITY_MD)),
+                    "SECURITY_REVIEW": heading_numbers(doc(SECURITY_REVIEW_MD))}
+        problems = []
+        for path in doc_paths() + [CHANGELOG_PATH]:
+            for target, number in self.REFERENCE.findall(read_text(path)):
+                if number not in headings[target]:
+                    problems.append("{0}: {1}.md の {2}".format(os.path.relpath(path, REPO_ROOT), target, number))
+        self.assertEqual(problems, [], "実在しない節を指しています（見出しを変えたら参照も直す）")
 
 
 if __name__ == "__main__":

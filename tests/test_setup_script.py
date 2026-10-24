@@ -19,6 +19,12 @@ setup.sh は Pi の上で人が手で実行するもので、CI でも他のテ�
 * サービスの再起動に成功したら、そのときのコミットを ``cache/deployed_commit`` に書く
   （``update.sh`` が「サービスは最新か」を判断する記録）。書くのは実行している利用者で、
   root のときや、再起動しなかった・失敗したときは書かない。
+* サービスの再起動の前に、サービスが書き込むフォルダ（``cache/`` と ``assets/generated/``）を、
+  実行している利用者（``sudo`` なし）で作る。``harden.sh`` の service 手順の保護
+  （``ProtectSystem=strict``、``ReadWritePaths=-<リポジトリ>/cache`` など。``-`` は無ければ無視）の下では、
+  無いフォルダには書き込めない。新規の checkout では ``cache/`` は再起動のあとに初めて作られるので、
+  先に作らないと、保護の下のサービスは状態を保存できない。root のときは作らず、警告だけ出す
+  （root 所有のフォルダは、サービス（pi）が書けない）。作れなくても導入は止めない。
 * 新規に作る ``config.json`` の雛形は、既定値を 1 つも写さない「空の上書き」でなければ
   ならない。旧版は ``config.example.json``（既定値の完全なコピー）を複製しており、その時点の
   既定値が凍結されて、読み上げ文言が作り置き音声と食い違った
@@ -196,6 +202,18 @@ case "$*" in
     if [ -e cache/deployed_commit ]; then echo "record-at-restart: present" >> "$CALLS_LOG"
     else echo "record-at-restart: absent" >> "$CALLS_LOG"; fi
     exit "${RESTART_EXIT:-0}" ;;
+esac
+"""
+
+#: 再起動の瞬間に、サービスが書き込むフォルダがもう在るかを記録する偽物の ``sudo``。
+SUDO_DIRS_STUB = """#!/bin/sh
+echo "sudo $*" >> "$CALLS_LOG"
+case "$*" in
+  *restart*)
+    for dir in cache assets/generated; do
+      if [ -d "$dir" ]; then echo "dir-at-restart: $dir present" >> "$CALLS_LOG"
+      else echo "dir-at-restart: $dir absent" >> "$CALLS_LOG"; fi
+    done ;;
 esac
 """
 
@@ -547,6 +565,94 @@ class DeployedCommitTest(SetupFlowCase):
         os.chmod(self.record, 0o444)
         self.run_setup("--no-apt")
         self.assertEqual(self.recorded(), self.git("rev-parse", "HEAD") + "\n")
+
+
+class ServiceDirsTest(SetupFlowCase):
+    """再起動の前に、サービスが書き込むフォルダを用意する（保護の下のサービスは、無いフォルダに書けない）。"""
+
+    RESTART = "sudo systemctl restart campus_chime.service"
+    DIRS = ("cache", "assets/generated")
+
+    def setUp(self):
+        super().setUp()
+        bin_dir = self.env["PATH"].split(os.pathsep)[0]
+        with open(os.path.join(bin_dir, "sudo"), "w", encoding="utf-8") as handle:
+            handle.write(SUDO_DIRS_STUB)
+        os.chmod(os.path.join(bin_dir, "sudo"), 0o755)
+
+    def path(self, rel):
+        return os.path.join(self.repo, *rel.split("/"))
+
+    def test_the_folders_exist_when_the_service_is_restarted(self):
+        result = self.run_setup("--no-apt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.calls()
+        # 再起動の記録のすぐあとに、その瞬間の有無が並ぶ。
+        index = calls.index(self.RESTART)
+        for offset, rel in enumerate(self.DIRS, start=1):
+            self.assertEqual(calls[index + offset], "dir-at-restart: {0} present".format(rel))
+        self.assertNotIn("absent", " ".join(calls))
+        for rel in self.DIRS:
+            self.assertTrue(os.path.isdir(self.path(rel)), rel)
+        self.assertNotIn("サービスが書き込むフォルダ", result.stderr)
+
+    def test_it_is_made_by_the_invoking_user_without_sudo(self):
+        self.run_setup("--no-apt")
+        for rel in self.DIRS:
+            self.assertEqual(os.stat(self.path(rel)).st_uid, os.getuid(), rel)
+        self.assertFalse([call for call in self.calls() if call.startswith("sudo") and "mkdir" in call])
+
+    def test_existing_folders_and_their_contents_are_left_alone(self):
+        os.makedirs(self.path("cache"))
+        with open(self.path("cache/state.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}\n")
+        result = self.run_setup("--no-apt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(os.listdir(self.path("cache")), ["state.json"])
+
+    def test_the_folders_are_not_made_when_the_service_is_not_touched(self):
+        for args in (("--no-apt", "--no-service"), ("--no-apt",)):
+            with self.subTest(args=args):
+                shutil.rmtree(self.path("cache"), ignore_errors=True)
+                result = self.run_setup(*args, CHECK_EXIT="2")
+                self.assertNotIn(self.RESTART, self.calls())
+                self.assertFalse(os.path.exists(self.path("cache")), result.stderr)
+                self.assertFalse(os.path.exists(self.path("assets")), result.stderr)
+
+    def test_a_folder_that_cannot_be_made_only_warns_and_the_service_is_still_restarted(self):
+        with open(self.path("cache"), "w", encoding="utf-8") as handle:
+            handle.write("ファイル\n")
+        result = self.run_setup("--no-apt")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("完了", result.stdout)
+        self.assertIn("サービスが書き込むフォルダ（cache/）を作れませんでした", result.stderr)
+        self.assertIn(self.RESTART, self.calls())
+        # 作れたほうは作る（1 つの失敗で、残りを諦めない）。
+        self.assertTrue(os.path.isdir(self.path("assets/generated")))
+
+    def test_as_root_the_folders_are_not_made_and_a_warning_is_printed(self):
+        """root が作ると root 所有になり、サービス（pi）が書けなくなる。"""
+        result = self.run_setup("--no-apt", FAKE_UID="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("完了", result.stdout)
+        self.assertIn("root で実行しているため、サービスが書き込むフォルダ（cache/ assets/generated/）は作りません", result.stderr)
+        self.assertIn(self.RESTART, self.calls())
+        self.assertIn("dir-at-restart: cache absent", self.calls())
+        self.assertIn("dir-at-restart: assets/generated absent", self.calls())
+        self.assertFalse(os.path.exists(self.path("cache")))
+        self.assertFalse(os.path.exists(self.path("assets")))
+
+    def test_as_root_no_warning_is_printed_for_folders_that_already_exist(self):
+        for rel in self.DIRS:
+            os.makedirs(self.path(rel))
+        result = self.run_setup("--no-apt", FAKE_UID="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("サービスが書き込むフォルダ", result.stderr)
+
+    def test_the_header_mentions_the_folders(self):
+        header = header_block()
+        self.assertIn("cache/ と assets/generated/", header)
+        self.assertIn("root で実行しているときは作らない", header)
 
 
 class ConfigTemplateTest(unittest.TestCase):

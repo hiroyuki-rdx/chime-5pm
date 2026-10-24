@@ -8,12 +8,13 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import random
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 from unittest import mock
 from zoneinfo import ZoneInfo
@@ -23,6 +24,7 @@ from tests.support import SHIPPED_QUOTES, VOICE_DIR, block_network, logs_enabled
 from chime import status, timesignal
 from chime.config import DEFAULT_CONFIG, Config, deep_merge
 from chime.history import History, make_entry
+from chime.pause import PauseStore
 from chime.scheduler import Scheduler
 from chime.status import (attention, broadcast_window, busy_event, collect_status, describe_entry,
                           ntp_synchronized, query_command, run_status, service_state, wait_idle)
@@ -71,7 +73,7 @@ def random_entries(count, seed=20261009):
     containers = [[], [None], [1, "a", None], texts[:5], [texts], {}, {"a": [1]}]
     values = scalars + containers
     keys = ["at", "day", "key", "kind", "result", "played", "total", "silent", "missing",
-            "warnings", "degraded", "error", "v", "extra"]
+            "warnings", "degraded", "error", "reason", "v", "extra"]
     return [{key: rng.choice(values) for key in keys if rng.random() < 0.7}
             for _ in range(count)]
 
@@ -94,11 +96,17 @@ def make_scheduler(now, settings=None):
     return scheduler
 
 
-def make_app(config, backend="pygame", now=FRIDAY):
-    """``ChimeApp`` の代わり（表示が使う分だけ）。時刻は固定、スケジューラも同じ時計で動く。"""
+def make_app(config, backend="pygame", now=FRIDAY, pause=None):
+    """``ChimeApp`` の代わり（表示が使う分だけ）。時刻は固定、スケジューラも同じ時計で動く。
+
+    ``pause`` は休止の記録（``PauseStore``）。省くと、休止の機能を持たない app になる。
+    """
     scheduler = make_scheduler(now, config.section("schedule"))
-    return SimpleNamespace(config=config, tzinfo=TZ, now=scheduler.now, scheduler=scheduler,
-                           player=SimpleNamespace(name=backend))
+    app = SimpleNamespace(config=config, tzinfo=TZ, now=scheduler.now, scheduler=scheduler,
+                          player=SimpleNamespace(name=backend))
+    if pause is not None:
+        app.pause = pause
+    return app
 
 
 class StatusCase(unittest.TestCase):
@@ -116,10 +124,11 @@ class StatusCase(unittest.TestCase):
         values.update(overrides)
         History(self.history_path).append(make_entry(**values))
 
-    def show(self, answers=None, backend="pygame", production=True, config=None, now=FRIDAY):
+    def show(self, answers=None, backend="pygame", production=True, config=None, now=FRIDAY,
+             pause=None):
         """(終了コード, 出力)。"""
         out = io.StringIO()
-        app = make_app(config or self.config, backend, now)
+        app = make_app(config or self.config, backend, now, pause)
         code = run_status(app, out=out, run=FakeRun(answers), production=production,
                           version="campus-chime 6.1.0 (abc1234)")
         return code, out.getvalue()
@@ -914,6 +923,429 @@ class CollectStatusTest(StatusCase):
         collected = collect_status(make_app(self.config), FakeRun(), True, "v")
         self.assertEqual(len(collected.history), 1)
         self.assertEqual(collected.history[0]["key"], "hourly:11")
+
+
+class PauseAndClosureCase(StatusCase):
+    """休止の記録と休館日の設定を、``--status`` の画面で確かめる土台。"""
+
+    def setUp(self):
+        super().setUp()
+        self.pause_path = os.path.join(self.tmp, "pause.json")
+        self.store = PauseStore(self.pause_path, today=lambda: FRIDAY.date())
+
+    def pause_until(self, last_day, reason=""):
+        self.store.set(last_day, reason, now=FRIDAY)
+
+    def row(self, output, label):
+        [row] = [line for line in output.splitlines() if line.startswith(label)]
+        return row
+
+    def closure_config(self, **closures):
+        return make_config(self.tmp, {"state": {"history_file": self.history_path},
+                                      "schedule": {"closures": closures}})
+
+
+class PauseRowTest(PauseAndClosureCase):
+    def test_without_a_pause_the_row_says_not_paused(self):
+        code, output = self.show(pause=self.store)
+        self.assertEqual(code, 0, output)
+        self.assertIn("止めていません", self.row(output, "放送の休止"))
+        self.assertNotIn("要確認", self.row(output, "放送の休止"))
+
+    def test_an_app_without_the_feature_is_shown_as_not_paused(self):
+        code, output = self.show()
+        self.assertEqual(code, 0, output)
+        self.assertIn("止めていません", self.row(output, "放送の休止"))
+
+    def test_a_pause_shows_the_span_and_the_reason(self):
+        self.pause_until(date(2026, 10, 10), "点検")
+        code, output = self.show(pause=self.store)
+        self.assertIn("止めています: 10/09〜10/10（点検）", self.row(output, "放送の休止"))
+        self.assertEqual(code, 0, output)   # 利用者が止めているのは、問題ではない
+        self.assertNotIn("要確認", output)
+        self.assertIn("気になる点は見つかりませんでした。", output)
+
+    def test_a_one_day_pause_without_a_reason_is_just_the_day(self):
+        self.pause_until(date(2026, 10, 9))
+        _, output = self.show(pause=self.store)
+        self.assertTrue(self.row(output, "放送の休止").endswith("止めています: 10/09"),
+                        self.row(output, "放送の休止"))
+
+    def test_a_reason_with_a_line_break_stays_on_one_line(self):
+        self.pause_until(date(2026, 10, 9), "1 行目\n2 行目\x1b[31m")
+        _, output = self.show(pause=self.store)
+        self.assertIn("止めています: 10/09（1 行目 2 行目 [31m）", self.row(output, "放送の休止"))
+        self.assertNotIn("\x1b", output)
+
+    def test_an_expired_or_broken_record_is_not_a_pause(self):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            json.dump({"v": 1, "first_day": "2026-10-01", "last_day": "2026-10-08",
+                       "set_at": "2026-10-01T09:00:00+09:00", "reason": ""}, handle)
+        self.assertIn("止めていません", self.row(self.show(pause=self.store)[1], "放送の休止"))
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write("{ broken")
+        code, output = self.show(pause=self.store)
+        self.assertEqual(code, 0, output)
+        self.assertIn("止めていません", self.row(output, "放送の休止"))
+
+    #: 使えない記録のときに「止めていません」に添える案内（放送は通常どおり鳴るので、要確認ではない）。
+    UNUSABLE = "止めていません（休止の記録を使えません。--check で確かめてください）"
+
+    def write_record(self, text):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_a_record_that_cannot_be_used_points_to_the_check(self):
+        # 止めたつもりで書いた記録が壊れていると、「止めていません」だけでは、コマンドが失敗したと思われる。
+        valid = {"v": 1, "first_day": "2026-10-09", "last_day": "2026-10-10",
+                 "set_at": "2026-10-09T09:00:00+09:00", "reason": ""}
+        records = {
+            "壊れた JSON": "{ broken",
+            "オブジェクトでない": "[]",
+            "知らない版": json.dumps(dict(valid, v=2)),
+            "日付が読めない": json.dumps(dict(valid, last_day="2026-02-30")),
+            "長すぎる期間": json.dumps(dict(valid, last_day="2026-12-31")),
+        }
+        for label, text in records.items():
+            with self.subTest(label):
+                self.write_record(text)
+                code, output = self.show(pause=self.store)
+                self.assertTrue(self.row(output, "放送の休止").endswith(self.UNUSABLE), output)
+                self.assertEqual(code, 0, output)   # 放送は通常どおり鳴る。要確認にはしない
+                self.assertNotIn("要確認", output)
+                self.assertIn("気になる点は見つかりませんでした。", output)
+
+    def test_a_folder_in_place_of_the_record_points_to_the_check_too(self):
+        os.mkdir(self.pause_path)
+        code, output = self.show(pause=self.store)
+        self.assertTrue(self.row(output, "放送の休止").endswith(self.UNUSABLE), output)
+        self.assertEqual(code, 0, output)
+
+    def test_a_record_that_is_missing_or_expired_has_no_note(self):
+        _, output = self.show(pause=self.store)
+        self.assertTrue(self.row(output, "放送の休止").endswith("止めていません"), output)
+        self.write_record(json.dumps({"v": 1, "first_day": "2026-10-01", "last_day": "2026-10-08",
+                                      "set_at": "2026-10-01T09:00:00+09:00", "reason": ""}))
+        _, output = self.show(pause=self.store)
+        self.assertTrue(self.row(output, "放送の休止").endswith("止めていません"), output)
+
+    def test_a_pause_in_force_has_no_note(self):
+        self.pause_until(date(2026, 10, 10), "点検")
+        _, output = self.show(pause=self.store)
+        self.assertNotIn("使えません", self.row(output, "放送の休止"))
+
+    def test_the_judgement_gets_the_place_and_the_day_of_the_app(self):
+        # 期限が切れたかどうかは、休止の記録を読むアプリと同じ場所・同じ日（アプリの時計）で判断する。
+        with mock.patch("chime.status.pause_record_unusable", return_value=False) as judged:
+            self.show(pause=self.store, now=FRIDAY + timedelta(days=2))
+        judged.assert_called_once_with(self.config, self.pause_path, (FRIDAY + timedelta(days=2)).date())
+
+    def test_a_pause_in_force_is_not_judged(self):
+        self.pause_until(date(2026, 10, 10))
+        with mock.patch("chime.status.pause_record_unusable") as judged:
+            self.show(pause=self.store)
+        judged.assert_not_called()
+
+    def test_collect_status_says_whether_the_record_is_unusable(self):
+        self.write_record("{ broken")
+        self.assertTrue(collect_status(make_app(self.config, pause=self.store), FakeRun(), True, "v").pause_unusable)
+        self.pause_until(date(2026, 10, 10))
+        self.assertFalse(collect_status(make_app(self.config, pause=self.store), FakeRun(), True, "v").pause_unusable)
+        self.assertFalse(collect_status(make_app(self.config), FakeRun(), True, "v").pause_unusable)
+
+    def test_a_judgement_that_fails_does_not_stop_the_status(self):
+        self.write_record("{ broken")
+        with mock.patch("chime.status.pause_record_unusable", side_effect=RuntimeError("壊れた")):
+            code, output = self.show(pause=self.store)
+        self.assertEqual(code, 0, output)
+        self.assertTrue(self.row(output, "放送の休止").endswith("止めていません"), output)
+
+    def test_a_failing_record_does_not_stop_the_status(self):
+        broken = SimpleNamespace(current=mock.Mock(side_effect=RuntimeError("壊れた")))
+        code, output = self.show(pause=broken)
+        self.assertEqual(code, 0, output)
+        self.assertIn("止めていません", output)
+
+    def test_the_rows_stay_aligned(self):
+        self.pause_until(date(2026, 10, 10), "点検")
+        _, output = self.show(pause=self.store)
+        labels = ("現在時刻", "時刻の同期", "サービス", "自動起動", "再生方法", "作り置きの音声",
+                  "放送の休止")
+        rows = [line for line in output.splitlines() if line.startswith(labels)]
+        self.assertEqual(len(rows), 7)
+        width = max(status.display_width(label) for label in labels)
+        for row in rows:
+            label = next(label for label in labels if row.startswith(label))
+            value = row[len(label):].lstrip(" ")
+            padding = len(row) - len(label) - len(value)
+            self.assertEqual(status.display_width(label) + padding, width + 2, row)
+
+    def test_the_upcoming_list_starts_after_the_pause(self):
+        self.pause_until(date(2026, 10, 10))   # 金曜と土曜。次に鳴るのは月曜の 10 時
+        _, output = self.show(pause=self.store)
+        self.assertIn("次の予定（休止のあいだは省いています）", output)
+        events = output.split("次の予定（休止のあいだは省いています）")[1].split("気になる点")[0]
+        listed = [line for line in events.splitlines() if line.startswith("  - ")]
+        self.assertEqual(len(listed), 3)
+        self.assertIn("時報 2026-10-12 10:00:00", listed[0])
+
+    def test_a_pause_ending_today_does_not_list_the_rest_of_today(self):
+        # 今日（金曜）だけ止める。13:00 以降の今日の放送は鳴らないので、次の予定は翌日以降から数える
+        # （最終日そのものから数えると、止めた日の放送が並んでしまう）。
+        self.pause_until(FRIDAY.date())
+        _, output = self.show(pause=self.store)
+        block = output.split("次の予定（休止のあいだは省いています）")[1].split("気になる点")[0]
+        listed = [line for line in block.splitlines() if line.startswith("  - ")]
+        self.assertEqual(len(listed), 3)
+        self.assertIn("時報 2026-10-12 10:00:00", listed[0])      # 次は月曜の 10 時
+        self.assertNotIn("2026-10-09", block)
+
+    def test_without_a_pause_the_upcoming_list_starts_now(self):
+        _, output = self.show(pause=self.store)
+        self.assertIn("\n次の予定\n", output)
+        self.assertNotIn("休止のあいだは省いています", output)
+        self.assertIn("時報 2026-10-09 13:00:00", output)
+
+    def test_collect_status_carries_the_pause(self):
+        self.pause_until(date(2026, 10, 10), "点検")
+        collected = collect_status(make_app(self.config, pause=self.store), FakeRun(), True, "v")
+        self.assertEqual((collected.pause.first_day, collected.pause.last_day, collected.pause.reason),
+                         (date(2026, 10, 9), date(2026, 10, 10), "点検"))
+        self.assertIsNone(collect_status(make_app(self.config), FakeRun(), True, "v").pause)
+
+    def test_status_never_writes_the_pause_record(self):
+        self.pause_until(date(2026, 10, 10))
+        before = (os.stat(self.pause_path).st_mtime_ns, sorted(os.listdir(self.tmp)))
+        self.show(pause=self.store)
+        self.assertEqual((os.stat(self.pause_path).st_mtime_ns, sorted(os.listdir(self.tmp))), before)
+
+    def test_a_real_app_shows_its_own_pause(self):
+        from chime.app import ChimeApp
+        app = ChimeApp(self.config, backend="mock", dry_run=True)
+        app.now = lambda: FRIDAY
+        app.pause.set(date(2026, 10, 10), "点検", now=FRIDAY)
+        collected = collect_status(app, FakeRun(), True, "v")
+        self.assertEqual(collected.pause.reason, "点検")
+
+
+class ClosureSectionTest(PauseAndClosureCase):
+    def test_no_closures_no_section(self):
+        _, output = self.show()
+        self.assertNotIn("休館日", output)
+
+    def test_the_closures_within_14_days_are_listed_with_their_weekday_and_name(self):
+        config = self.closure_config(
+            dates=[{"date": "2026-10-12", "name": "学園祭"}, "2026-10-23"],
+            ranges=[{"from": "2026-10-20", "to": "2026-10-21", "name": "入試"}])
+        _, output = self.show(config=config)
+        section = output.split("休館日（今後 14 日）\n")[1].split("\n\n")[0]
+        self.assertEqual(section.splitlines(), [
+            "  10/12（月） 休館: 学園祭",
+            "  10/20（火） 休館: 入試",
+            "  10/21（水） 休館: 入試",
+        ])   # 10/23 は 15 日目。範囲の外
+
+    def test_today_counts_as_the_first_day(self):
+        config = self.closure_config(dates=["2026-10-09", "2026-10-22"])
+        _, output = self.show(config=config)
+        section = output.split("休館日（今後 14 日）\n")[1].split("\n\n")[0]
+        self.assertEqual(section.splitlines(), ["  10/09（金） 休館", "  10/22（木） 休館"])
+
+    def test_a_closure_on_a_day_that_does_not_chime_anyway_is_not_listed(self):
+        config = self.closure_config(dates=["2026-10-10", "2026-10-11"])   # 土曜・日曜
+        _, output = self.show(config=config)
+        self.assertNotIn("休館日", output)
+
+    def test_the_section_comes_after_the_upcoming_events_and_before_the_verdict(self):
+        config = self.closure_config(dates=["2026-10-12"])
+        _, output = self.show(config=config)
+        self.assertLess(output.index("次の予定"), output.index("休館日（今後 14 日）"))
+        self.assertLess(output.index("休館日（今後 14 日）"), output.index("気になる点"))
+
+    def test_a_closure_is_not_a_reason_to_worry(self):
+        config = self.closure_config(dates=["2026-10-12"])
+        code, output = self.show(config=config)
+        self.assertEqual(code, 0, output)
+        self.assertNotIn("要確認", output)
+
+    def test_unusable_closure_entries_are_left_out_and_the_status_is_still_shown(self):
+        config = self.closure_config(dates=["tomorrow", "2026-10-12"], ranges=[{"from": "x"}])
+        with logs_enabled(), self.assertLogs("chime.closures", level="ERROR"):
+            code, output = self.show(config=config)
+        self.assertEqual(code, 0, output)
+        self.assertIn("  10/12（月） 休館", output)
+
+    def test_a_scheduler_that_cannot_answer_does_not_stop_the_status(self):
+        app = make_app(self.config)
+        app.scheduler.skip_reason = mock.Mock(side_effect=RuntimeError("壊れた"))
+        out = io.StringIO()
+        code = run_status(app, out=out, run=FakeRun(), production=True, version="v")
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertNotIn("休館日", out.getvalue())
+
+    def test_collect_status_carries_the_closures(self):
+        config = self.closure_config(dates=[{"date": "2026-10-12", "name": "学園祭"}])
+        collected = collect_status(make_app(config), FakeRun(), True, "v")
+        self.assertEqual(collected.closures, [(date(2026, 10, 12), "休館: 学園祭")])
+        self.assertEqual(collect_status(make_app(self.config), FakeRun(), True, "v").closures, [])
+
+
+class SkippedAndInterruptedEntryTest(unittest.TestCase):
+    def entry(self, **overrides):
+        values = dict(at=datetime(2026, 10, 9, 10, 0, tzinfo=TZ), key="hourly:10", kind="hourly",
+                      played=0, total=0)
+        values.update(overrides)
+        return make_entry(**values)
+
+    def test_a_skipped_broadcast_is_shown_as_stopped_with_its_reason(self):
+        line = describe_entry(self.entry(result="skipped", reason="休止: 点検"), TZ)
+        self.assertEqual(line, "10/09 10:00  時報      止めていた  休止: 点検")
+
+    def test_a_skipped_broadcast_without_a_reason(self):
+        line = describe_entry(self.entry(result="skipped"), TZ)
+        self.assertEqual(line, "10/09 10:00  時報      止めていた")
+
+    def test_an_interrupted_broadcast_says_how_far_it_got(self):
+        line = describe_entry(self.entry(kind="closing", key="closing", played=2, total=5,
+                                         result="interrupted"), TZ)
+        self.assertEqual(line, "10/09 10:00  閉館放送  中断  2/5 件を鳴らして停止")
+
+    def test_how_far_it_got_is_shown_only_for_an_interrupted_broadcast(self):
+        self.assertNotIn("鳴らして停止", describe_entry(self.entry(played=2, total=5), TZ))
+
+    def test_counts_that_are_not_counts_are_not_shown(self):
+        for played, total in (("2", 5), (True, 5), (-1, 5), (2, None), (2.5, 5)):
+            entry = {"at": "2026-10-09T10:00:00+09:00", "kind": "hourly", "result": "interrupted",
+                     "played": played, "total": total}
+            with self.subTest(played=played, total=total):
+                self.assertNotIn("鳴らして停止", describe_entry(entry, TZ))
+
+    def test_a_reason_that_is_not_text_is_ignored_and_text_is_one_line(self):
+        for reason in (None, 5, ["休止"], {"a": 1}, True, ""):
+            entry = {"at": "2026-10-09T10:00:00+09:00", "kind": "hourly", "result": "skipped",
+                     "reason": reason}
+            with self.subTest(reason=reason):
+                self.assertEqual(describe_entry(entry, TZ), "10/09 10:00  時報      止めていた")
+        line = describe_entry(self.entry(result="skipped", reason="休止: 1 行目\n2 行目\x1b"), TZ)
+        self.assertNotIn("\n", line)
+        self.assertNotIn("\x1b", line)
+
+    def test_the_labels_of_the_new_results(self):
+        self.assertIn("止めていた", describe_entry(self.entry(result="skipped"), TZ))
+        self.assertIn("中断", describe_entry(self.entry(result="interrupted"), TZ))
+        self.assertNotIn("skipped", describe_entry(self.entry(result="skipped"), TZ))
+        self.assertNotIn("interrupted", describe_entry(self.entry(result="interrupted"), TZ))
+
+
+class SkippedAndInterruptedAttentionTest(unittest.TestCase):
+    def status(self, history):
+        return status.Status(
+            version="v", now=FRIDAY, ntp=True, active="active", enabled="enabled",
+            backend="pygame", production=True, history=history, upcoming=[],
+            coverage=SimpleNamespace(ok=True, missing=[], total=1), zone=TZ)
+
+    def test_an_interrupted_latest_broadcast_is_one_reason(self):
+        found = self.status([{"result": "interrupted", "played": 2, "total": 5}])
+        self.assertTrue(found.last_interrupted)
+        [reason] = attention(found)
+        self.assertIn("停止要求で途中で止まりました", reason)
+
+    def test_an_interrupted_broadcast_that_is_not_the_latest_is_not_a_reason(self):
+        found = self.status([{"result": "ok"}, {"result": "interrupted"}])
+        self.assertFalse(found.last_interrupted)
+        self.assertEqual(attention(found), [])
+
+    def test_a_skipped_latest_entry_is_never_a_reason(self):
+        found = self.status([{"result": "skipped", "reason": "休止"}])
+        self.assertEqual(attention(found), [])
+        self.assertIsNone(found.last_broadcast)
+        self.assertFalse(found.last_failed)
+
+    def test_skipped_entries_do_not_hide_a_failure_before_them(self):
+        found = self.status([{"result": "skipped"}, {"result": "skipped"}, {"result": "failed"},
+                             {"result": "ok"}])
+        self.assertEqual(found.last_broadcast, {"result": "failed"})
+        [reason] = attention(found)
+        self.assertIn("直近の放送が失敗しています", reason)
+
+    def test_skipped_entries_do_not_hide_an_interruption_a_missing_part_or_a_degraded_one(self):
+        for entry, reason in (({"result": "interrupted"}, "停止要求で途中で止まりました"),
+                              ({"result": "partial", "missing": ["蛍の光"]}, "音源ファイルが無くて"),
+                              ({"result": "ok", "degraded": True}, "簡易の内容で鳴りました")):
+            with self.subTest(entry=entry):
+                [found] = attention(self.status([{"result": "skipped"}, entry]))
+                self.assertIn(reason, found)
+
+    def test_skipped_entries_in_front_of_a_good_broadcast_are_nothing_to_worry_about(self):
+        self.assertEqual(attention(self.status([{"result": "skipped"}, {"result": "ok"}])), [])
+
+    def test_an_interrupted_failure_gives_one_reason(self):
+        # 結果は 1 つなので、interrupted と failed が同時にはならない。欠けた部品は別の理由。
+        found = self.status([{"result": "interrupted", "missing": ["蛍の光"]}])
+        self.assertEqual(len(attention(found)), 1)
+
+    def test_whatever_is_in_the_history_the_properties_never_raise(self):
+        for entry in random_entries(500, seed=11):
+            found = self.status([entry, {"result": "skipped"}, entry])
+            self.assertIsInstance(found.last_interrupted, bool)
+            found.last_broadcast
+            "\n".join(status.render_status(found, attention(found))).encode("utf-8")
+
+
+class SkippedAndInterruptedStatusTest(StatusCase):
+    def test_a_skipped_entry_is_listed_and_is_fine(self):
+        self.add_history(at=FRIDAY - timedelta(hours=2), played=3, total=3)
+        self.add_history(at=FRIDAY - timedelta(hours=1), played=0, total=0, result="skipped",
+                         reason="休止: 点検")
+        code, output = self.show()
+        self.assertEqual(code, 0, output)
+        self.assertIn("止めていた  休止: 点検", output)
+
+    def test_a_skipped_entry_does_not_clear_an_earlier_failure(self):
+        self.add_history(at=FRIDAY - timedelta(hours=2), played=0, total=3)
+        self.add_history(at=FRIDAY - timedelta(hours=1), played=0, total=0, result="skipped",
+                         reason="休止")
+        code, output = self.show()
+        self.assertEqual(code, 1, output)
+        self.assertIn("直近の放送が失敗しています", output.split("要確認:")[1])
+
+    def test_an_interrupted_latest_entry_needs_attention_and_shows_how_far_it_got(self):
+        self.add_history(played=2, total=5, result="interrupted")
+        code, output = self.show()
+        self.assertEqual(code, 1, output)
+        self.assertIn("中断  2/5 件を鳴らして停止", output)
+        self.assertIn("停止要求で途中で止まりました", output.split("要確認:")[1])
+
+    def test_the_next_good_broadcast_clears_the_interruption(self):
+        self.add_history(at=FRIDAY - timedelta(hours=2), played=2, total=5, result="interrupted")
+        self.add_history(at=FRIDAY - timedelta(hours=1), played=3, total=3)
+        code, output = self.show()
+        self.assertEqual(code, 0, output)
+        self.assertIn("中断", output)   # 表示はする
+
+    def test_a_real_skipped_broadcast_is_seen_in_the_status(self):
+        """休止のために鳴らさなかった放送が、履歴を通して ``--status`` に出る。"""
+        from chime.app import ChimeApp
+        app = ChimeApp(self.config, backend="mock")
+        app.now = lambda: FRIDAY
+        app.scheduler = make_scheduler(FRIDAY, self.config.section("schedule"))
+        app.pause.set(date(2026, 10, 9), "点検", now=FRIDAY)
+        [event] = [event for event in app.scheduler.events_for_date(FRIDAY.date())
+                   if event.key == "hourly:13"]
+
+        def must_not_wait(*args, **kwargs):
+            # 時計は止まっている。休止が効かずに再生の時刻を待つと、永久に戻らない。待たずに失敗にする。
+            raise AssertionError("休止の日の放送が、止まらずに再生の時刻を待っている")
+
+        app.scheduler.sleep_until = must_not_wait
+        app.run_event(event)
+        self.assertFalse(app.state.is_fired(event.key, event.day))
+        out = io.StringIO()
+        code = run_status(make_app(self.config, pause=app.pause), out=out, run=FakeRun(),
+                          production=True, version="v")
+        self.assertEqual(code, 0, out.getvalue())
+        self.assertIn("10/09 13:00  時報      止めていた  休止: 点検", out.getvalue())
+        self.assertIn("止めています: 10/09（点検）", out.getvalue())
 
 
 class BroadcastWindowTest(unittest.TestCase):

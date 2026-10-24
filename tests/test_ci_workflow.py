@@ -1,7 +1,7 @@
 """CI の定義（``.github/workflows/ci.yml``）のテスト。
 
 CI は押してみるまで結果が分からず、定義を間違えても「緑のまま何も調べていない」ことが
-ある。次の 3 点を、ファイルを読んで固定する（通信も、GitHub の実行も使わない）。
+ある。次の 4 点を、ファイルを読んで固定する（通信も、GitHub の実行も使わない）。
 
 * ``test`` ジョブの Python の版に下限の 3.9（と、実機の 3.11）が入っている。
 * ``prerecorded-only`` ジョブに ``--check`` の段がある（合成エンジンの無い環境で、
@@ -9,6 +9,9 @@ CI は押してみるまで結果が分からず、定義を間違えても「�
 * ``scripts/*.sh`` の **どれも** ``bash -n`` で 1 本ずつ構文を調べ、``shellcheck`` にかける。
   以前は ``bash -n scripts/setup.sh scripts/update.sh`` と書いていて、``bash -n`` は
   2 つ目以降を「引数」として扱うため、update.sh の構文は調べられていなかった。
+* どのワークフロー（``ci.yml`` と ``tag.yml`` を含む ``.github/workflows/`` の全部）も、
+  ``actions/checkout`` と ``actions/setup-python`` を Node.js 24 で動く主版（v5・v6）以上で
+  使っている。Node.js 20 の版は Actions が非推奨と警告し、いずれ動かなくなる。
 
 文字列を探すだけだと、書き方を変えただけで落ちる。そこで ``bash -n`` と ``shellcheck`` の
 段は、書かれたコマンドを **実際に動かして** 確かめる。``scripts/`` の写しを作り、その 1 本を
@@ -27,12 +30,22 @@ import shutil
 import subprocess
 import tempfile
 import unittest
-from typing import List, NamedTuple
+from typing import List, NamedTuple, Optional, Tuple
 
 from tests.support import REPO_ROOT
 
-CI_YML = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
+WORKFLOWS_DIR = os.path.join(REPO_ROOT, ".github", "workflows")
+CI_YML = os.path.join(WORKFLOWS_DIR, "ci.yml")
+TAG_YML = os.path.join(WORKFLOWS_DIR, "tag.yml")
 SCRIPTS_DIR = os.path.join(REPO_ROOT, "scripts")
+
+#: Node.js 24 で動く主版の下限（Actions → 主版）。これより古い主版は Node.js 20 で動き、
+#: 「Node.js 20 is deprecated」の警告が出る。Node.js のさらに新しい主版が出て、
+#: 下限を上げるときは、この表だけを直す。
+NODE24_ACTION_MAJORS = {
+    "actions/checkout": 5,
+    "actions/setup-python": 6,
+}
 
 #: ``bash -n`` に構文エラーと見なされる行。
 SYNTAX_ERROR = "if then fi (\n"
@@ -111,6 +124,41 @@ def steps_running(text: str, job: str, command: str) -> List[Step]:
                                                                step.run)]
 
 
+def workflow_files() -> List[str]:
+    """``.github/workflows/`` の全ワークフロー（増えたものも自動で対象になる）。"""
+    return sorted(glob.glob(os.path.join(WORKFLOWS_DIR, "*.yml")) + glob.glob(os.path.join(WORKFLOWS_DIR, "*.yaml")))
+
+
+def action_uses(text: str) -> List[Tuple[str, str]]:
+    """``uses: <action>@<版>`` を、書かれた順に ``(action, 版)`` で返す（コメントの行は除く）。"""
+    found = []
+    for line in text.splitlines():
+        match = re.match(r"""^\s*(?:-\s+)?uses:\s*["']?([^\s@#"']+)@([^\s"']+)["']?(?:\s+#.*)?\s*$""", line)
+        if match:
+            found.append((match.group(1), match.group(2)))
+    return found
+
+
+def action_major(ref: str) -> Optional[int]:
+    """``v5`` ``v5.1`` ``v5.1.0`` の主版（5）。この形でない（``main`` やハッシュ）なら ``None``。"""
+    match = re.match(r"^v(\d+)(?:\.\d+){0,2}$", ref)
+    return int(match.group(1)) if match else None
+
+
+def outdated_uses(text: str) -> List[str]:
+    """``NODE24_ACTION_MAJORS`` の下限に届かない ``uses`` を、書かれたとおり（``actions/checkout@v4``）に返す。
+
+    主版を読めない書き方（``@main`` など）も、下限を確かめられないので含める。
+    """
+    outdated = []
+    for action, ref in action_uses(text):
+        floor = NODE24_ACTION_MAJORS.get(action)
+        major = action_major(ref)
+        if floor is not None and (major is None or major < floor):
+            outdated.append("{0}@{1}".format(action, ref))
+    return outdated
+
+
 class ParserTest(unittest.TestCase):
     """この解析が、ci.yml の書き方を正しく読めること（以降のテストの土台）。"""
 
@@ -118,7 +166,7 @@ class ParserTest(unittest.TestCase):
 jobs:
   first:
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: 一行
         run: echo one
       - name: 複数行
@@ -137,7 +185,7 @@ jobs:
     def test_steps_are_split_per_job_and_in_order(self):
         steps = job_steps(self.TEXT, "first")
         self.assertEqual([step.name for step in steps], ["", "一行", "複数行"])
-        self.assertEqual(steps[0].uses, "actions/checkout@v4")
+        self.assertEqual(steps[0].uses, "actions/checkout@v5")
         self.assertEqual([step.name for step in job_steps(self.TEXT, "second")], ["別のジョブ"])
 
     def test_a_single_line_run_and_a_block_run_are_read(self):
@@ -316,6 +364,63 @@ class ShellJobTest(unittest.TestCase):
         with open(log, encoding="utf-8") as handle:
             given = sorted(line.strip() for line in handle if line.strip())
         self.assertEqual(given, sorted("scripts/{0}".format(name) for name in self.names))
+
+
+class ActionVersionsTest(unittest.TestCase):
+    """使う Actions が Node.js 24 で動く主版であること（Node.js 20 の版は、非推奨の警告が出る）。"""
+
+    OLD = """\
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+"""
+
+    def test_the_check_flags_the_node20_majors(self):
+        self.assertEqual(outdated_uses(self.OLD), ["actions/checkout@v4", "actions/setup-python@v5"])
+
+    def test_the_check_flags_anything_older_than_the_floor(self):
+        text = "      - uses: actions/checkout@v3\n      - uses: actions/setup-python@v4.2.0\n"
+        self.assertEqual(outdated_uses(text), ["actions/checkout@v3", "actions/setup-python@v4.2.0"])
+
+    def test_the_check_accepts_the_floor_and_newer(self):
+        text = ("      - uses: actions/checkout@v5\n      - uses: actions/setup-python@v6\n"
+                "      - uses: actions/checkout@v6.1\n      - uses: actions/setup-python@v7.0.1\n")
+        self.assertEqual(outdated_uses(text), [])
+
+    def test_the_check_flags_a_ref_whose_major_cannot_be_read(self):
+        text = "      - uses: actions/checkout@main\n      - uses: actions/setup-python@latest\n"
+        self.assertEqual(outdated_uses(text), ["actions/checkout@main", "actions/setup-python@latest"])
+
+    def test_the_check_reads_a_trailing_comment_and_a_uses_without_a_dash(self):
+        text = "      - uses: actions/checkout@v4 # 古い\n        uses: actions/setup-python@v5\n"
+        self.assertEqual(outdated_uses(text), ["actions/checkout@v4", "actions/setup-python@v5"])
+
+    def test_the_check_reads_a_quoted_uses(self):
+        text = "      - uses: 'actions/checkout@v4'\n      - uses: \"actions/setup-python@v5\"\n"
+        self.assertEqual(outdated_uses(text), ["actions/checkout@v4", "actions/setup-python@v5"])
+
+    def test_the_check_ignores_comments_and_other_actions(self):
+        text = ("# actions/checkout@v4 から上げた\n"
+                "      # - uses: actions/setup-python@v5\n"
+                "      - uses: actions/cache@v3\n"
+                "      - uses: someone/checkout@v1\n")
+        self.assertEqual(outdated_uses(text), [])
+
+    def test_every_workflow_is_on_the_node24_majors(self):
+        for path in workflow_files():
+            with self.subTest(workflow=os.path.basename(path)):
+                with open(path, "r", encoding="utf-8") as handle:
+                    self.assertEqual(outdated_uses(handle.read()), [])
+
+    def test_ci_and_tag_are_among_the_workflows_checked(self):
+        self.assertIn(CI_YML, workflow_files())
+        self.assertIn(TAG_YML, workflow_files())
+
+    def test_both_actions_are_really_used_so_the_check_is_not_vacuous(self):
+        for path in (CI_YML, TAG_YML):
+            with self.subTest(workflow=os.path.basename(path)):
+                with open(path, "r", encoding="utf-8") as handle:
+                    used = {action for action, _ in action_uses(handle.read())}
+                self.assertEqual(used & set(NODE24_ACTION_MAJORS), set(NODE24_ACTION_MAJORS))
 
 
 class DocumentedClaimsTest(unittest.TestCase):

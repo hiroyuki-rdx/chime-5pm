@@ -26,9 +26,9 @@ jobs:
         python-version: ["3.9", "3.11", "3.13"]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -51,9 +51,9 @@ jobs:
     name: pyflakes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 
@@ -69,7 +69,7 @@ jobs:
     name: シェルスクリプト
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # bash -n は、複数のファイルを渡しても 1 つ目しか調べない（2 つ目以降は引数として
       # 渡されるだけ）。そのため 1 本ずつ実行する。scripts/ に増えたスクリプトも自動で対象になる。
       - name: 構文チェック（bash -n。1 本ずつ）
@@ -85,9 +85,9 @@ jobs:
     name: 作り置きだけで全文言を賄えること（音声合成エンジンなし）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
 

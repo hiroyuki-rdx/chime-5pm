@@ -3,7 +3,8 @@
 ``cache/history.jsonl`` に、いつ・どの放送が・どう終わったかを 1 行ずつ追記する。
 ``--status`` で直近の放送を見るためのもので、放送そのものには影響しない。
 書けなくても放送は止めない（警告を残すだけ）。読むときも、壊れた行や
-知らない版の行は黙って飛ばす。
+知らない版の行は黙って飛ばす。鳴らさなかった放送（休止中。``skipped``）や、停止要求で
+途中で止まった放送（``interrupted``）も、同じように 1 行残す。
 
 行が増えすぎないよう、``max_lines`` を超えたら新しい ``keep_lines`` 行だけに
 書き直す（一時ファイルに書いてから置き換えるので、途中で電源が落ちても
@@ -25,6 +26,16 @@ logger = logging.getLogger(__name__)
 #: 無い古い行も受け入れる。
 HISTORY_VERSION = 1
 
+#: ``result`` の値。計算で決まる 4 つ（:func:`make_entry` を参照）と、呼び出し側が明示する 2 つ。
+RESULT_OK = "ok"
+RESULT_PARTIAL = "partial"
+RESULT_FAILED = "failed"
+RESULT_ERROR = "error"
+RESULT_SKIPPED = "skipped"
+RESULT_INTERRUPTED = "interrupted"
+RESULTS = (RESULT_OK, RESULT_PARTIAL, RESULT_FAILED, RESULT_ERROR, RESULT_SKIPPED,
+           RESULT_INTERRUPTED)
+
 #: これを超えたら古い行を捨てる。
 MAX_LINES = 600
 #: 捨てるときに残す（新しい側の）行数。
@@ -34,7 +45,8 @@ KEEP_LINES = 500
 def make_entry(*, at: datetime, key: str, kind: str, played: int, total: int,
                silent: Sequence[str] = (), warnings: Sequence[str] = (),
                degraded: bool = False, error: Optional[str] = None,
-               missing: Sequence[str] = ()) -> Dict[str, Any]:
+               missing: Sequence[str] = (), result: Optional[str] = None,
+               reason: Optional[str] = None) -> Dict[str, Any]:
     """1 回の放送の履歴 1 件（JSON にできる辞書）を作る。
 
     ``at`` は放送の日時（タイムゾーン付き）で、``day`` はその日付（YYYY-MM-DD）。
@@ -48,7 +60,7 @@ def make_entry(*, at: datetime, key: str, kind: str, played: int, total: int,
     ``missing`` は後から足した項目で、``HISTORY_VERSION`` は上げていない。
     読む側は、この項目の無い古い行も受け入れること。
 
-    ``result`` は次のいずれか（上から順に判定する）。
+    ``result`` は次のいずれか。引数の ``result`` を渡さなければ、上の 4 つを上から順に判定する。
 
     ``error``
         ``error`` が渡された（放送が例外で終わった）。
@@ -58,7 +70,22 @@ def make_entry(*, at: datetime, key: str, kind: str, played: int, total: int,
         一部しか鳴らせなかった、または音にならなかった部品・積めなかった部品がある。
     ``ok``
         すべて鳴らせた。
+    ``skipped``
+        休止（「今日だけ止める」）のために鳴らさなかった。``reason`` に理由を添える。
+        再生していないので ``played`` と ``total`` は 0。
+    ``interrupted``
+        停止要求（サービスの停止など）で、再生の途中で止まった。``played`` は止まるまでに
+        鳴らせた部品の数。
+
+    引数の ``result`` は ``skipped`` / ``interrupted`` のように、呼び出し側が決める結果を
+    渡すためのもの（``None`` なら上の判定のまま）。知らない値は :class:`ValueError`。
+    ``reason`` は結果の理由で、渡されたときだけ ``"reason"`` を付ける。
+
+    ``result`` と ``reason`` も後から足した項目で、``HISTORY_VERSION`` は上げていない。
+    読む側は、知らない ``result`` の値を見ても落ちないこと（飛ばさず、そのまま表示する）。
     """
+    if result is not None and result not in RESULTS:
+        raise ValueError("履歴の結果は {0} のいずれかです: {1!r}".format("・".join(RESULTS), result))
     silent_texts = _texts(silent)
     missing_texts = _texts(missing)
     entry: Dict[str, Any] = {
@@ -67,7 +94,7 @@ def make_entry(*, at: datetime, key: str, kind: str, played: int, total: int,
         "day": at.date().isoformat(),
         "key": key,
         "kind": kind,
-        "result": _result(played, total, silent_texts, missing_texts, error),
+        "result": result or _result(played, total, silent_texts, missing_texts, error),
         "played": played,
         "total": total,
         "silent": silent_texts,
@@ -77,6 +104,8 @@ def make_entry(*, at: datetime, key: str, kind: str, played: int, total: int,
     }
     if error is not None:
         entry["error"] = error
+    if reason is not None:
+        entry["reason"] = reason
     return entry
 
 
@@ -89,14 +118,14 @@ def _texts(values: Union[str, Sequence[str]]) -> List[str]:
 
 def _result(played: int, total: int, silent: Sequence[str], missing: Sequence[str],
             error: Optional[str]) -> str:
-    """放送の結果（``error`` / ``failed`` / ``partial`` / ``ok``）を返す。"""
+    """放送の結果（``error`` / ``failed`` / ``partial`` / ``ok``）を計算する。"""
     if error is not None:
-        return "error"
+        return RESULT_ERROR
     if played == 0:
-        return "failed"
+        return RESULT_FAILED
     if played < total or silent or missing:
-        return "partial"
-    return "ok"
+        return RESULT_PARTIAL
+    return RESULT_OK
 
 
 class History:

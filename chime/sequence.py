@@ -11,6 +11,11 @@
 
 組み立ては state（再生済み・直近のひとこと）を書かない。選んだひとことは
 ``PlaybackPlan.quote`` に残し、再生できたあとに呼び出し側が記録する。
+
+積むセグメントには音量の区分（``Segment.kind``）を付ける。時報音は
+``time_signal``、蛍の光は ``music``、そのほか（作り置きの読み上げ・閉館
+アナウンス）は ``voice``。音量そのものは再生側（:mod:`chime.audio`）が
+``audio.volume`` から引くので、ここでは設定を読まない。
 """
 
 from __future__ import annotations
@@ -22,7 +27,7 @@ from datetime import date
 from typing import Any, Callable, List, Mapping, Optional, Sequence
 
 from . import timesignal
-from .audio import Segment
+from .audio import KIND_MUSIC, KIND_TIME_SIGNAL, KIND_VOICE, Segment
 from .config import DEFAULT_CONFIG
 from .phrases import closing_extra_text
 from .quotes import QuoteError, QuotePicker
@@ -205,9 +210,11 @@ class SequenceBuilder:
         return plan
 
     # -- 部品 -----------------------------------------------------------
-    def _append_audio_file(self, plan: PlaybackPlan, path: str, label: str,
+    def _append_audio_file(self, plan: PlaybackPlan, path: str, label: str, kind: str,
                            fade_in_ms: int = 0) -> None:
         """音源ファイルがあれば積む。無ければ ERROR で飛ばす（積まない）。
+
+        ``kind`` は音量の区分（``Segment.kind``）。
 
         必須セグメントのファイルが欠けていると、再生時の ``PlaybackError``
         でプラン全体が鳴らなくなる。積む前に確かめ、欠けた部品だけを省く。
@@ -223,7 +230,7 @@ class SequenceBuilder:
             plan.warnings.append(message)
             plan.missing.append(label)
             return
-        plan.segments.append(Segment(path, label=label, fade_in_ms=fade_in_ms))
+        plan.segments.append(Segment(path, label=label, fade_in_ms=fade_in_ms, kind=kind))
 
     def _append_time_signal(self, plan: PlaybackPlan, settings: Mapping[str, Any]) -> None:
         """時報音（ポ・ポ・ポ・ポーン）を積む。生成に失敗しても既存のファイルを使う。"""
@@ -235,7 +242,8 @@ class SequenceBuilder:
                 type(exc).__name__, exc)
             logger.exception(message)
             plan.warnings.append(message)
-        self._append_audio_file(plan, self.time_signal_path, "時報音（ポ・ポ・ポ・ポーン）")
+        self._append_audio_file(
+            plan, self.time_signal_path, "時報音（ポ・ポ・ポ・ポーン）", KIND_TIME_SIGNAL)
 
     def _append_announce(self, plan: PlaybackPlan, hour: int,
                          settings: Mapping[str, Any]) -> None:
@@ -262,7 +270,7 @@ class SequenceBuilder:
 
     def _append_closing_announce(self, plan: PlaybackPlan) -> None:
         self._append_audio_file(
-            plan, self.config.path("closing.announce_file"), "閉館アナウンス")
+            plan, self.config.path("closing.announce_file"), "閉館アナウンス", KIND_VOICE)
 
     def _append_closing_text(self, plan: PlaybackPlan) -> None:
         # 作り置きの列挙（chime.phrases）と同じ読み出しを使う。読み方が食い違うと、
@@ -279,7 +287,7 @@ class SequenceBuilder:
         fade_in_ms = _guard(plan, "フェードイン時間", self._closing_fade_in_ms) or 0
         self._append_audio_file(
             plan, self.config.path("closing.music_file"),
-            "蛍の光（{0}ms フェードイン）".format(fade_in_ms), fade_in_ms)
+            "蛍の光（{0}ms フェードイン）".format(fade_in_ms), KIND_MUSIC, fade_in_ms)
 
     def _append_speech(self, plan: PlaybackPlan, text: str, label: str) -> bool:
         if not text:
@@ -295,7 +303,7 @@ class SequenceBuilder:
         # 読み上げは欠けても放送全体を止めない（無音になるだけ）ので常に optional。
         # 必須なのは時報音と閉館の音源（_append_audio_file）だけ。
         plan.segments.append(Segment(path, label="{0}「{1}」".format(label, text),
-                                     optional=True))
+                                     optional=True, kind=KIND_VOICE))
         plan.spoken.append(text)
         return True
 

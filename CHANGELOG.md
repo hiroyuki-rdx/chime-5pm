@@ -3,6 +3,139 @@
 本ファイルの記法は [Keep a Changelog](https://keepachangelog.com/ja/1.1.0/) に、
 バージョン番号は [セマンティック バージョニング](https://semver.org/lang/ja/) に従う。
 
+## [6.2.0] - 2026-10-24
+
+新機能の版（改善 4 段階の 4）。休館日の指定・放送の一時休止・種類ごとの音量を追加し、停止要求で
+再生がすぐ止まるようにした。あわせて、運用中の Pi の安全面を点検する `scripts/security_check.sh` と、
+見つかった点を手順ごとに、元に戻す仕組みをつけて直す `scripts/harden.sh`、その手引き `docs/SECURITY.md` を追加した。
+**既定の設定で動かしている場合、放送の時刻と内容は変わらない**
+（休館日なし・休止なし・音量はすべて 1.0）。読み上げ文言と作り置き音声も変わらない（作り直しは不要）。
+点検と強化のスクリプトは、運用者が自分で実行したときだけ働く（更新しただけでは Pi の設定は何も変わらない）。
+**`harden.sh` は、本物の Raspberry Pi ではまだ一度も動かしていない**（偽のシステムでの試験のみ）。元に戻す仕組みは付けてあるが、限界がある（`docs/SECURITY.md` 3.2 節）。
+
+### 追加
+
+- **休館日**（`schedule.closures`）: `dates`（`"2026-11-02"` または `{"date": …, "name": "学園祭"}`）と
+  `ranges`（`{"from": …, "to": …, "name": "年末年始"}`。両端を含む）に書いた日は、時報も閉館放送も
+  鳴らさない。祝日も開館するため、祝日は自動では休まない（休む祝日はここに書く）。書き方の誤った項目は
+  その項目だけ無視して ERROR を残し（その日は通常どおり鳴る）、`--check` が直し方を出す。
+  `--schedule` は休館日を「休館 2026-12-28（月） 年末年始」の行で挟んで表示する。長い休館でも次の予定を
+  見つけられるよう、予定を探す範囲を 400 日にした
+- **放送の一時休止**: `--pause-today`（今日いっぱい）・`--pause-until YYYY-MM-DD`（その日まで。今日から
+  最長 31 日）・`--pause-off`（再開）・`--reason TEXT`。常駐中のサービスにそのまま効く（再起動は不要。
+  最大で `schedule.max_sleep_seconds`、既定 30 秒で気づく）。止めている日の放送は鳴らさず、再生の準備に
+  入っていた回は履歴に「止めていた」と残す。解除が追いかけ再生の猶予（`catchup_grace_seconds`、既定
+  120 秒）に間に合えば、その回は遅れて鳴る。記録は `cache/pause.json`（`state.pause_file`）。root では
+  実行できない（`cache/` の持ち主が root になるのを防ぐ）
+- **種類ごとの音量**（`audio.volume`）: `time_signal`（時報音）・`voice`（読み上げと閉館アナウンス）・
+  `music`（蛍の光）を 0.0〜1.0 で。ALSA の音量は高めに固定し、ここで絞る。command 方式では変えられない
+  （警告を 1 回出す）
+- `--status` に放送の休止と近い休館日（14 日以内）、`--check` に休館日の書き間違い・休止中であること・
+  休止の記録の異常を表示する。放送の履歴の結果に「止めていた（skipped）」「中断（interrupted）」を追加
+- **安全面の点検**（`scripts/security_check.sh`）: 運用中の Pi を**読むだけ**で点検する（何も書かず、
+  一時ファイルも作らず、サービスにも触れない）。Pi のアドレスを一つずつ私的・共有・グローバルに分け
+  （大学がクラス B／C のアドレスの範囲を持つと、Pi がグローバルアドレスを持つことがある）、グローバルが
+  あれば学外から届くかを確かめる方法（`nc -vz`）を表示し、SSH のパスワードログインは「届くなら高」として扱う。
+  SSH・`sudo`・防火壁・OS とカーネルの更新（再起動待ちを含む）・時刻の同期・使っていないサービス・
+  放送サービスの隔離・リポジトリの状態を調べ、項目ごとに `[OK]`・`[情報]`・`[注意]`・`[要対応]`・`[不明]` と、
+  直し方（`harden.sh` の手順の名前）を出す。`pi` でも `sudo` 付きでも動く（root が要る項目は `pi` では
+  `[不明]`）。**`[不明]` が 1 件でもあれば、まとめの行のすぐ下に「点検は完全ではありません」と表示する**
+  （`[要対応]` が 0 件でも安全と確かめられたことにはならないため、確認には `sudo bash scripts/security_check.sh`
+  を使う）。root で実行しても、apt の索引の写し（`/var/cache/apt`）を作り直さない。
+  `harden.sh` の確定待ちが残っていれば `[要対応]` で、手順（`ssh`・`firewall`・`sudo`）と、自動で元に戻るまでの分数を示す
+  （`sudo` の手順だけが止まっているときは、確定の操作を案内せず、自動で戻るのを待つよう示す）。`--user NAME`。
+  終了コードは `[要対応]` が無ければ 0、あれば 1、使い方の誤りは 2（`[不明]` では変わらない）
+- **安全面の強化**（`scripts/harden.sh`、root で実行）: 手順は `ssh`（SSH を鍵だけにする）・`firewall`
+  （nftables で入ってくる通信を SSH・mDNS・DHCP・ICMP だけにする。`--ssh-from CIDR`）・`sudo`（`sudo` に
+  パスワードを求める）・`services`（`bluetooth`・`hciuart`・`ModemManager` を止める）・`journal`（ログを再起動の
+  あとも残す）・`updates`（セキュリティ更新を自動で入れる。再起動はしない）・`service`（放送サービスに保護
+  〔sandbox〕を追加設定として足す。`--test-sound`）・`ntp`（時刻の同期を `chrony` にする。`--ntp-server HOST`）。
+  `recommended` は `services journal ssh firewall`。**どの手順も任意で、元に戻す仕組みを付けてある**
+  （`--rollback [手順…]`。変える前の姿は `/var/lib/campus-chime-harden` に、完全に写せたと確かめてから控える）。
+  変える前に条件をすべて確かめ、満たさないものがあれば理由をすべて表示して何も変えずに止まり、変えたあとに
+  効いたことを確かめ、確かめられなければその手順を自分で元に戻す（戻せたかどうかも、そのとおりに表示する）。
+  実行中の Ctrl-C・回線切れ・終了の信号でも、実行中の手順を戻してから終わる。`--dry-run` は何も変えずに内容だけを
+  表示する。放送を止めうる手順は放送の終わりを待ち、apt を動かす手順と時計を変える手順は、次の放送まで 10 分以上
+  あることも確かめる。`updates` は、OS の時間帯が放送の時間帯と違うとき、設定した放送が 4:30〜6:30 にあるときに
+  止まる。強制終了や電源断、OS が起動しない場合など、戻らないこともある（`docs/SECURITY.md` 3.2 節）
+- **`ssh` と `firewall` は、確定しないと自動で元に戻る**: 締め出される恐れのある変更なので、適用すると
+  「確定待ち」になり、**新しい端末**で入り直せたことを確かめて `sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm` するまで、
+  10 分（`--revert-after`、1〜60 分）で元に戻る（再起動しても戻る）。変更の前に開いた画面からの `--confirm` は
+  断る（`--force` で確定できる）。戻す処理は、リポジトリではなく root だけが書ける写しを実行する。
+  `--rollback-pending` で確定待ちをすぐ戻せる。すでに確定した設定を再適用して確定しなかったときは、使う前ではなく
+  最後に確定した設定へ戻る。10 分を過ぎてからの `--confirm` は、「確定できたからではない」と警告して終了コード 1 で
+  終わる。`firewall` は sshd が実際に待ち受けるポートを開ける。新しい端末は、ホームのフォルダから始まるので、
+  画面に出す確定のコマンドは `sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm` のように絶対パスで書く。
+  `sudo` の手順は、パスワードの確認が終わるまでの 5 分だけ同じ仕組みで守り（`--confirm` は要らない）、確かめられなければ
+  その場で、強制終了のときは 5 分後に NOPASSWD の設定を戻す
+- `docs/SECURITY.md`: 運用者向けの手引き。**脆弱性の連絡先**（非公開の報告のしかたと、対象・対象外）、前提、
+  進める順、確定の仕組み、手順ごとの影響と元に戻し方、毎月の点検、閉め出されたときの復旧、GitHub 側の守り、
+  PC 側の VOICEVOX、乗っ取られたかもしれないときの手順
+- `docs/SECURITY_REVIEW.md`: 2026-10 のセキュリティレビューの記録（公開版）。指摘 17 件の重さ・対策・状況、
+  Pi と GitHub でやること、今後のコードの修正候補、確かめられなかったこと、参照（CISA KEV など）
+- `tests/test_security_check.py`・`tests/test_harden_script.py`: 偽のシステム（`CHIME_SYSROOT`）と偽の
+  コマンドで本物のスクリプトを動かす（実機の設定は変えない）。`tests/test_docs.py` は、文書に書いた
+  `harden.sh` の手順・オプション・ファイルの場所がスクリプトにあること、追加設定の項目が `SANDBOX_PROPS` と
+  一致することなどを確かめる
+
+### 変更
+
+- **停止要求で再生がすぐ止まる**: `systemctl stop` / `restart` を受けると、再生中の音を 0.3 秒で
+  フェードアウトして約 1 秒以内に終わる（6.1.0 までは放送が終わるまで止まらず、蛍の光の途中なら
+  systemd が約 90 秒後に強制終了していた）。途中で止めた放送は「中断」として履歴に残し、再起動しても
+  最初から鳴らし直さない。音が出る前に止めた回は鳴らした扱いにせず、再起動後の追いかけ再生で鳴らせる。
+  ユニットに `TimeoutStopSec=30`
+- **再生の頑健化**: 1 つの音源が終わらないときは打ち切る（WAV は長さ＋10 秒、そのほかは
+  `audio.max_segment_seconds`、既定 600 秒）。pygame の初期化は 1 秒おきに 3 回まで試す。command 方式は
+  再生プログラムをプロセスグループごと止める（ラッパー経由でも残らない）
+- 予定が 1 件も無いときの警告は、続くあいだ 1 回だけにした（それまでは 1 分ごと）
+- GitHub Actions: `actions/checkout@v5`・`actions/setup-python@v6`（Node.js 24）に上げた
+- **`docs/SETUP.md`**: Imager の手順で、SSH は公開鍵認証を勧める（Windows・macOS の鍵の作り方つき。
+  パスワード認証を選んでも導入はでき、あとで `harden.sh ssh` で鍵だけにできる）。`pi` のパスワードは
+  「覚えやすいもの」ではなく、パスワード管理ソフトで作る長いランダムな文字列にする。12 章の最後に安全面の
+  手順（`sudo bash scripts/security_check.sh`）、13 章に `SECURITY.md` へのリンクを足した。`harden.sh sudo` のあと
+  `update.sh`・`setup.sh` が `sudo` の行でパスワードを聞くことを書いた。VOICEVOX ENGINE の例は
+  `-p 127.0.0.1:50021:50021`（PC の中だけで待ち受ける）にした。WSL2 から Windows 側の ENGINE へ
+  `--base-url` で届かせる回避策は全部のインターフェースが要るので、`-p 50021:50021` でコンテナを作り直す手順に
+  「学内のほかの人にも届く」注意を付けた
+- **`docs/KNOWLEDGE_BASE.md`**: 学期ごとの `apt upgrade` を、**毎月**の `apt full-upgrade` と、放送のない
+  時間（9:55〜17:05 以外）の再起動と、`security_check.sh` の確認に替えた。4-5 に、`harden.sh ntp` で
+  `chrony` に替えた Pi の再同期（`sudo systemctl restart chrony`）を足した。トラブル対処に 4-10（`harden.sh` の
+  あとで SSH で入れない）・4-11（`harden.sh sudo` のあと `update.sh`・`setup.sh` がパスワードを聞く）・
+  4-12（`harden.sh service` のあとで音が出ない。`--rollback service`）を追加し、概要・コマンド・設計上の
+  決定にも安全面の行を足した
+- **`setup.sh` は、サービスの再起動の前に、サービスが書き込むフォルダ（`cache/` と `assets/generated/`）を、
+  実行している利用者で作る**（`sudo` は使わない）。`harden.sh service` の保護の下のサービスは、無いフォルダには
+  書き込めず、新しく checkout した Pi には、再起動の時点で `cache/` がまだ無いため。root で実行したときは
+  作らず（root の持ち物になり、サービスが書けなくなる）、無いフォルダがあれば警告だけを出す。作れなくても導入は
+  止めず、`--no-service` と、再起動を控えたとき（点検が 2）には作らない。`config.json` で書き込み先を変えている
+  ときの場所は、`harden.sh service` が求めて作る
+- `README.md`・`docs/SPECIFICATION.md`（ヘッダ、2 章の変更表、4.19 章のスクリプトとテストの行、追加設定の
+  6.3 章、11 章）・`docs/REQUIREMENTS.md`（NFR-08、受け入れ条件 A-20）に、点検と強化を反映した。
+  `tests/test_docs.py` は、文書に書いたスクリプトの手順・オプション・ファイルの場所が実在することと、
+  `docs/` の全文書の「N 章」の参照が実在することを確かめる
+
+### 移行
+
+16:55〜17:02（閉館放送の前後）を避けて行う。
+
+```bash
+cd /home/pi/campus-chime
+bash scripts/update.sh
+```
+
+休館日を使うときは `config.json` の `schedule.closures` に書き、`python3 campus_chime.py --check` で
+書き方を確かめ、`sudo systemctl restart campus_chime.service` のあと `python3 campus_chime.py --schedule 40`
+で「休館」の行を確認する。
+
+安全面の点検と強化は、更新しただけでは働かない。まず `sudo bash scripts/security_check.sh`（読むだけ）で現状を
+見て、直す点があれば、`docs/SECURITY.md`（3 節の「始める前に」を先に読む）の順に
+`sudo bash scripts/harden.sh 手順名` を、放送のない時間（9:55〜17:05 以外）に 1 つずつ行う（迷ったら
+`--dry-run` で内容だけを見る。`harden.sh` は本物の Pi では未試験なので、HDMI とキーボードをつなげる用意をする）。
+`ssh` と `firewall` は、新しい端末から `sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm` するまで
+10 分で元に戻る。`pi` の公開鍵を登録してから `ssh` を適用すること。PC 側で VOICEVOX を `-p 50021:50021` で起動していたコンテナは、
+`docker rm -f voicevox` で消して `-p 127.0.0.1:50021:50021` で作り直す（`docs/SETUP.md` 8 章）。
+
 ## [6.1.0] - 2026-10-09
 
 運用の道具を足した版（改善 4 段階の 3）。設置状態の点検（`--check`）・いまの状態（`--status`）・
@@ -666,6 +799,7 @@ Lite 移行による専用機化（v2.0.0 として設計されていた内容�
 
 - 初版。定刻に「蛍の光」を再生する常駐スクリプトと systemd ユニット
 
+[6.2.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.2.0
 [6.1.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.1.0
 [6.0.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v6.0.0
 [5.3.0]: https://github.com/hiroyuki-rdx/chime-5pm/releases/tag/v5.3.0

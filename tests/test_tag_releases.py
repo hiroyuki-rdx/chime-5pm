@@ -2439,12 +2439,17 @@ class WorkflowTest(unittest.TestCase):
         self.assertRegex(self.text, r"actions/checkout@v\d+\n\s+with:\n\s+fetch-depth: 0\n")
 
     def test_the_action_versions_match_ci(self):
+        """tag.yml と ci.yml は、同じ Actions を同じ主版で使う（どちらも主版は 1 つだけ）。
+
+        主版の下限（Node.js 24 で動く版）は ``tests/test_ci_workflow.py`` が全ワークフローで確かめる。
+        """
         ci = _read(CI_WORKFLOW_PATH)
         for action in ("actions/checkout", "actions/setup-python"):
             with self.subTest(action=action):
                 used = set(re.findall(re.escape(action) + r"@(v\d+)", self.text))
+                used_by_ci = set(re.findall(re.escape(action) + r"@(v\d+)", ci))
                 self.assertEqual(len(used), 1)
-                self.assertTrue(used <= set(re.findall(re.escape(action) + r"@(v\d+)", ci)))
+                self.assertEqual(used, used_by_ci)
 
     def test_python_311_is_set_up(self):
         self.assertRegex(self.text, r"python-version: \"3\.11\"")

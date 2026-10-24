@@ -32,6 +32,12 @@ OS のローカル時刻になり、Pi では UTC のことが多い）といっ
     作り置きに無いので無音。試しの ``format`` には通さない）、``tts.engines`` に
     ``prerecorded`` が無い（Pi では読み上げがすべて無音）などが当たる。
 
+    v6.2.0 で足した設定も同じ方針で、どれも warning（ランタイムは失敗側ではなく **鳴らす側** に
+    倒れる）。休館日（``schedule.closures``）の書き方の正しくない項目は、その項目だけ無視されて
+    その日は鳴る。音量（``audio.volume``）は、数として読めなければ 1.0、範囲外は 0〜1 に丸められる。
+    ``audio.max_segment_seconds`` が正の数でなければ 600 秒になる。``state.pause_file`` が文字列
+    でないと、``Config.path`` が文字に直す（``null`` は空の保存先になる）。
+
     リストに壊れた要素が混ざるときは、warning の要素のためにリストを作り直さない。
     error の要素（``int()`` で読めない ``skip_hours`` の要素、ハッシュできない
     ``weekdays`` の要素、コマンドとして読めない ``audio.commands`` の項目）がある場合も、
@@ -64,6 +70,7 @@ OS のローカル時刻になり、Pi では UTC のことが多い）といっ
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import difflib
 import functools
@@ -78,7 +85,8 @@ from datetime import datetime, timedelta
 from typing import Any, Callable, Dict, Iterator, List, Mapping, NamedTuple, Optional, Tuple
 from zoneinfo import ZoneInfo
 
-from . import timesignal
+from . import closures, timesignal
+from .closures import ClosureCalendar
 from .config import DEFAULT_CONFIG, REMOVED_KEYS, Config
 from .jsonfile import JsonFileError, read_json
 from .scheduler import MAX_LOOKAHEAD_DAYS
@@ -475,6 +483,7 @@ _SECTIONS: Dict[str, _Section] = {
     "schedule.closing": _Section(
         "閉館放送は鳴りません",
         "閉館放送の予定を作る処理が例外になり、起動できません", _is_truthy, _DISABLE_WITH_ENABLED),
+    "schedule.closures": _Section("休館日の設定は読まれず、休館日は 1 日もありません（いつもどおり鳴らします）"),
     "audio": _Section("再生の設定は組み込みの値になります（セグメントの間の無音は 0 秒、外部コマンドは"
                       "未設定になります）"),
     "audio.mixer": _Section(
@@ -484,6 +493,7 @@ _SECTIONS: Dict[str, _Section] = {
         "外部コマンドは未設定になります（外部コマンドで再生する方式は使えません）",
         "外部コマンドで再生する方式（command）の準備が例外になり、放送が鳴りません", _not_dict_like,
         when=_command_backend_possible, unused=_COMMANDS_UNUSED),
+    "audio.volume": _Section("音量の設定は読まれず、すべての音を 1.0（絞らない音量）で鳴らします"),
     "time_signal": _Section("時報音の保存先が無くなり、時報音（ポ・ポ・ポ・ポーン）は鳴りません。"
                             "時刻アナウンスは組み込みの文言になります"),
     "time_signal.short_pip": _Section(
@@ -951,6 +961,69 @@ def _check_weather_hours(config: Config) -> List[Finding]:
     return findings
 
 
+# -- 休館日 -------------------------------------------------------------------
+_CLOSURES = "schedule.closures"
+
+#: 休館日の一覧（``schedule.closures`` の中身）→ 項目の書き方。``ClosureCalendar`` が読む一覧と
+#: 同じ名前（``tests/test_configcheck.py`` が確かめる）。
+_CLOSURE_LISTS = (
+    ("dates", '"2026-11-02" か {"date": "2026-11-02", "name": "学園祭"} の形で書いてください'),
+    ("ranges", '{"from": "2026-12-28", "to": "2027-01-04", "name": "年末年始"} の形で書いてください'
+               "（from は to と同じ日か、それより前の日付にします）"),
+)
+
+#: 1 つの一覧について、項目ごとに示す問題の最大件数（残りは件数だけ示す）。
+_MAX_CLOSURE_PROBLEMS = 10
+
+
+@contextlib.contextmanager
+def _silenced(logger: logging.Logger) -> Iterator[None]:
+    """このブロックの間だけ ``logger`` の出力を止める（抜けたら元の状態に戻す）。"""
+    was_disabled = logger.disabled
+    logger.disabled = True
+    try:
+        yield
+    finally:
+        logger.disabled = was_disabled
+
+
+def _closure_problems(settings: Any) -> List[str]:
+    """``ClosureCalendar`` が使えないと判断する項目の説明（ランタイムと同じ読み方で、同じ文）。
+
+    ``ClosureCalendar`` は作るときに、使えない項目を ERROR でログに残す。検査のために作ると
+    同じ問題がログにも出てしまうので、その間だけ止める。
+    """
+    with _silenced(closures.logger):
+        return list(ClosureCalendar(settings).problems)
+
+
+def _check_closures(config: Config) -> List[Finding]:
+    """休館日の項目が、``Scheduler`` が読める書き方か。
+
+    ``ClosureCalendar`` は、書き方の正しくない項目を **その項目だけ** 無視し（その日は休まず
+    鳴る）、どんな値でも例外にしない。したがって warning で、置き換えない。説明は
+    ``ClosureCalendar.problems`` をそのまま使い、ランタイムとの食い違いを作らない。
+
+    節そのものが ``{ … }`` でない（``null`` を含む）ときは、節の検査が指摘する。
+    """
+    value = _value(config, _CLOSURES)
+    if not isinstance(value, Mapping):
+        return []
+    findings: List[Finding] = []
+    for name, how in _CLOSURE_LISTS:
+        if name not in value:
+            continue
+        key = "{0}.{1}".format(_CLOSURES, name)
+        problems = _closure_problems({name: value[name]})
+        findings.extend(_warning(key, problem, how) for problem in problems[:_MAX_CLOSURE_PROBLEMS])
+        if len(problems) > _MAX_CLOSURE_PROBLEMS:
+            findings.append(_warning(
+                key, "{0} には、ほかにも使えない項目が {1} 件あります（最初の {2} 件だけ示しました）。"
+                     "それらの項目も使われず、その日はいつもどおり鳴ります".format(
+                         key, len(problems) - _MAX_CLOSURE_PROBLEMS, _MAX_CLOSURE_PROBLEMS), how))
+    return findings
+
+
 # -- 数値 -------------------------------------------------------------------
 class _Number(NamedTuple):
     """数値で指定するキー。
@@ -1338,6 +1411,81 @@ def _silent_engines(listed: List[str], has_unknown: bool) -> str:
             "（VOICEVOX ENGINE が動く PC では声が出ます）")
 
 
+# -- 音量・再生の打ち切り（``chime.audio`` が数として読むもの） ---------------------------
+#: 音量の区分（``audio.volume`` のキー。``chime.audio.SEGMENT_KINDS`` と同じ）→ その音の呼び名。
+#: ``tests/test_configcheck.py`` が、実装・既定の設定との食い違いを検出する。
+_VOLUME_KINDS = {
+    "time_signal": "時報音（ポ・ポ・ポ・ポーン）",
+    "voice": "読み上げ",
+    "music": "蛍の光",
+}
+
+_VOLUME_KEYS = tuple("audio.volume." + kind for kind in _VOLUME_KINDS)
+_MAX_SEGMENT = "audio.max_segment_seconds"
+
+
+def _audio_number(value: Any) -> Optional[float]:
+    """``chime.audio`` が数として読んだ値（読めなければ ``None``）。
+
+    ``bool`` と文字列（``"0.5"``）は数として読まない。``NaN`` も読めない。``float`` に直せない
+    巨大な整数は、符号どおりの無限大として読む（``chime.audio`` と同じ。巨大な負の整数も、
+    ``-1`` と同じく無音に丸める）。設定の数をふつうに ``float()`` で読むほかのキー
+    （:func:`_convert`）とは違う。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return -math.inf if value < 0 else math.inf
+    return None if math.isnan(number) else number
+
+
+def _check_volume(config: Config, kind: str) -> List[Finding]:
+    """音量が 0〜1 の数か。
+
+    ``audio.volume_for`` は例外を出さない。数として読めなければ 1.0（絞らない）、範囲外は 0〜1 に
+    丸める（負の値は 0.0 なので無音になる）。どちらも warning。
+    """
+    key = "audio.volume." + kind
+    value = _value(config, key)
+    if value is _MISSING:
+        return []
+    number = _audio_number(value)
+    if number is None:
+        problem = "は 0〜1 の数として読めません。1.0（絞らない音量）として鳴らします"
+    elif number < 0:
+        problem = "は 0〜1 の範囲外です。0.0 に丸められ、{0}は鳴りません（無音）".format(_VOLUME_KINDS[kind])
+    elif number > 1:
+        problem = "は 0〜1 の範囲外です。1.0 に丸められます（1.0 より大きくはなりません）"
+    else:
+        return []
+    return [_warning(
+        key, "{0} の値 {1} {2}".format(key, _show(value), problem),
+        "0.0（無音）〜1.0（絞らない）の数を、引用符で囲まずに書いてください（0.5 なら半分の音量）")]
+
+
+def _check_max_segment_seconds(config: Config) -> List[Finding]:
+    """1 つの音源の打ち切り秒数が、正の有限の数か。
+
+    ``audio.max_segment_seconds`` は、数として読めない・0 以下・無限大のとき既定の秒数に
+    して続ける（例外を出さない）ので warning。
+    """
+    value = _value(config, _MAX_SEGMENT)
+    if value is _MISSING:
+        return []
+    number = _audio_number(value)
+    if number is not None and number > 0 and not math.isinf(number):
+        return []
+    fallback = _default_at(_MAX_SEGMENT)
+    return [_warning(
+        _MAX_SEGMENT,
+        "{0} の値 {1} は正の数として読めません。mp3 など長さの分からない音源の打ち切りは {2} 秒として"
+        "扱います".format(_MAX_SEGMENT, _show(value), _show(fallback)),
+        "正の秒数を、引用符で囲まずに書いてください（既定は {0}。蛍の光などが鳴り終わる長さより"
+        "短くすると、途中で切れます）".format(_show(fallback)))]
+
+
 # -- 天気の地点 ---------------------------------------------------------------
 #: 緯度・経度の取りうる範囲（絶対値の上限）。
 _COORDINATES = (("latitude", "緯度", 90), ("longitude", "経度", 180))
@@ -1607,6 +1755,31 @@ def _temp_range_findings(low: int, high: int, low_key: str, high_key: str,
     return []
 
 
+# -- 休止の記録の保存先 -------------------------------------------------------------
+_PAUSE_FILE = "state.pause_file"
+
+
+def _check_pause_file(config: Config) -> List[Finding]:
+    """「今日だけ止める」の記録の保存先が、文字列か。
+
+    保存先は ``Config.path`` で読まれる。文字列でない値は ``str()`` で文字に直され、``null`` は
+    空（保存先なし）になる。例外にはならず、記録が意図した場所に残らない（空だと、記録を読むこと
+    も書くこともできず、「今日だけ止める」は使えない）だけで、時報と閉館放送は通常どおり鳴る。
+    したがって warning。空の文字列は「保存先なし」を意図した書き方として、指摘しない。
+    """
+    value = _value(config, _PAUSE_FILE)
+    if value is _MISSING or isinstance(value, str):
+        return []
+    if value is None:
+        effect = "保存先が空として扱われるため、「今日だけ止める」の記録を保存できません"
+    else:
+        effect = "文字に直した名前のファイルとして扱われ、意図した場所に記録されません"
+    return [_warning(
+        _PAUSE_FILE, "{0} の値 {1} は文字列ではありません。{2}（時報と閉館放送は通常どおり鳴ります）".format(
+            _PAUSE_FILE, _show(value), effect),
+        "ファイルの場所を文字列で書いてください（既定は {0}）".format(_show(_default_at(_PAUSE_FILE))))]
+
+
 # ---------------------------------------------------------------------------
 # 検査の一覧
 # ---------------------------------------------------------------------------
@@ -1628,6 +1801,7 @@ def _checks() -> List[Tuple[str, Check]]:
         checks.append((key, functools.partial(_check_weekdays, key=key, section=section, label=label)))
     checks.append(("schedule.hourly.skip_hours", _check_skip_hours))
     checks.append(("extra_segment.weather_hours", _check_weather_hours))
+    checks.append((_CLOSURES, _check_closures))
     checks.extend((rule.key, functools.partial(_check_number, rule=rule)) for rule in _NUMBERS)
     checks.extend([
         (_PIP_COUNT, _check_pip_timing),
@@ -1636,11 +1810,15 @@ def _checks() -> List[Tuple[str, Check]]:
         ("logging.level", _check_log_level),
         ("logging.format", _check_log_format),
         ("audio.backend", _check_audio_backend),
+        (_MAX_SEGMENT, _check_max_segment_seconds),
         ("tts.engines", _check_tts_engines),
         ("weather.open_meteo.locations", _check_locations),
     ])
+    checks.extend((key, functools.partial(_check_volume, kind=kind))
+                  for key, kind in zip(_VOLUME_KEYS, _VOLUME_KINDS))
     checks.extend((key, functools.partial(_check_template, key=key)) for key in _TEMPLATE_FIELDS)
     checks.append((_PRERECORD, _check_prerecord))
+    checks.append((_PAUSE_FILE, _check_pause_file))
     return checks
 
 

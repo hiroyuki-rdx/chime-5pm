@@ -13,7 +13,8 @@ from zoneinfo import ZoneInfo
 
 from tests.support import logs_enabled
 
-from chime.history import HISTORY_VERSION, KEEP_LINES, MAX_LINES, History, make_entry
+from chime.history import (HISTORY_VERSION, KEEP_LINES, MAX_LINES, RESULTS, History,
+                           make_entry)
 
 TZ = ZoneInfo("Asia/Tokyo")
 NOON = datetime(2026, 8, 26, 12, 0, tzinfo=TZ)
@@ -141,6 +142,70 @@ class MakeEntryTest(unittest.TestCase):
     def test_arguments_are_keyword_only(self):
         with self.assertRaises(TypeError):
             make_entry(NOON, "hourly:12", "hourly", 3, 3)  # type: ignore[misc]
+
+
+class ExplicitResultTest(unittest.TestCase):
+    """休止（``skipped``）と停止要求での中断（``interrupted``）は、呼び出し側が結果を決める。"""
+
+    def test_the_known_results(self):
+        self.assertEqual(RESULTS, ("ok", "partial", "failed", "error", "skipped", "interrupted"))
+
+    def test_without_a_result_the_computed_one_is_kept(self):
+        # 今までの判定（error → failed → partial → ok）は、そのまま。
+        self.assertEqual(entry(played=3, total=3)["result"], "ok")
+        self.assertEqual(entry(played=3, total=3, result=None)["result"], "ok")
+        self.assertEqual(entry(played=1, total=3, result=None)["result"], "partial")
+        self.assertEqual(entry(played=0, total=3, result=None)["result"], "failed")
+        self.assertEqual(entry(played=0, total=0, error="x", result=None)["result"], "error")
+
+    def test_a_skipped_entry_has_no_playback_and_a_reason(self):
+        made = make_entry(at=NOON, key="hourly:12", kind="hourly", played=0, total=0,
+                          result="skipped", reason="休止: 学園祭の準備")
+        self.assertEqual(made["result"], "skipped")
+        self.assertEqual(made["reason"], "休止: 学園祭の準備")
+        self.assertEqual((made["played"], made["total"]), (0, 0))
+        self.assertNotIn("error", made)
+
+    def test_an_interrupted_entry_keeps_how_far_it_got(self):
+        made = entry(played=2, total=5, result="interrupted")
+        self.assertEqual(made["result"], "interrupted")
+        self.assertEqual((made["played"], made["total"]), (2, 5))
+        self.assertNotIn("reason", made)
+
+    def test_the_explicit_result_wins_over_the_computed_one(self):
+        # played == 0 なら計算では failed。呼び出し側が決めた結果を優先する。
+        self.assertEqual(entry(played=0, total=0, result="skipped")["result"], "skipped")
+        self.assertEqual(entry(played=0, total=4, error="x", result="interrupted")["result"],
+                         "interrupted")
+
+    def test_every_known_result_can_be_given(self):
+        for result in RESULTS:
+            self.assertEqual(entry(result=result)["result"], result)
+
+    def test_an_unknown_result_is_refused(self):
+        for result in ("skip", "", "OK", 1):
+            with self.assertRaises(ValueError, msg=repr(result)):
+                entry(result=result)
+
+    def test_the_reason_is_added_only_when_given(self):
+        self.assertNotIn("reason", entry())
+        self.assertNotIn("reason", entry(reason=None))
+        self.assertEqual(entry(reason="休止")["reason"], "休止")
+        self.assertEqual(entry(reason="")["reason"], "")
+
+    def test_the_new_fields_come_after_the_existing_ones(self):
+        keys = list(entry(error="x", reason="休止", result="skipped"))
+        self.assertEqual(keys[-2:], ["error", "reason"])
+        self.assertEqual(keys[:12], ["v", "at", "day", "key", "kind", "result", "played", "total",
+                                     "silent", "missing", "warnings", "degraded"])
+
+    def test_the_version_is_not_raised_for_the_new_values(self):
+        self.assertEqual(entry(result="skipped", reason="休止")["v"], HISTORY_VERSION)
+        self.assertEqual(HISTORY_VERSION, 1)
+
+    def test_the_entry_is_json_serializable(self):
+        made = entry(played=0, total=0, result="skipped", reason="休止: 点検")
+        self.assertEqual(json.loads(json.dumps(made, ensure_ascii=False)), made)
 
 
 class HistoryTestCase(unittest.TestCase):
@@ -442,6 +507,24 @@ class RecentTest(HistoryTestCase):
     def test_missing_file(self):
         self.assertEqual(History(self.path).recent(), [])
         self.assertFalse(os.path.exists(self.directory))
+
+    def test_skipped_and_interrupted_entries_are_read_back(self):
+        log = History(self.path)
+        log.append(entry(0))
+        log.append(entry(1, played=0, total=0, result="skipped", reason="休止: 点検"))
+        log.append(entry(2, played=2, total=5, result="interrupted"))
+        read = log.recent(10)
+        self.assertEqual(self.numbers(read), [2, 1, 0])
+        self.assertEqual([item["result"] for item in read], ["interrupted", "skipped", "ok"])
+        self.assertEqual(read[1]["reason"], "休止: 点検")
+
+    def test_a_line_with_a_result_this_version_does_not_know_is_still_read(self):
+        # 将来の版が足す結果でも、読む側は落ちず、飛ばさず、そのまま返す。
+        os.makedirs(self.directory)
+        with open(self.path, "w", encoding="utf-8") as handle:
+            handle.write(self.dump(0, result="paused-by-someone") + "\n")
+        [only] = History(self.path).recent()
+        self.assertEqual(only["result"], "paused-by-someone")
 
     def test_empty_file(self):
         os.makedirs(self.directory)

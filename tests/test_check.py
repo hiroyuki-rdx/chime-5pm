@@ -37,15 +37,18 @@ import shutil
 import tempfile
 import time
 import unittest
+from datetime import date, datetime, timedelta
 from unittest import mock
+from zoneinfo import ZoneInfo
 
 from tests.support import ASSETS_DIR, SHIPPED_QUOTES, block_network, logs_enabled, make_wav
 
 from chime import check, configcheck
 from chime.check import (INFO, NG, OK, WARNING, Result, check_settings, check_sounds, check_voices,
-                         check_writable, display_width, pad, prerecorded_coverage, render_section,
-                         run_check, shown_path, summarize)
+                         check_writable, describe_pause, display_width, pad, pause_record_unusable, pause_span,
+                         prerecorded_coverage, render_section, run_check, shown_path, summarize)
 from chime.config import DEFAULT_CONFIG, Config, deep_merge
+from chime.pause import Pause
 from chime.phrases import CoverageTooLarge, collect_phrases
 from chime.tts import MANIFEST_FILENAME, TTSService, prerecorded_filename
 
@@ -2002,6 +2005,399 @@ class RenderingTest(unittest.TestCase):
             run_check(make_config(tmp), out=out, euid=0)
         self.assertNotIn("\033", out.getvalue())
         self.assertIn("== 書き込み ==", out.getvalue())
+
+
+TODAY = date(2026, 10, 14)
+
+
+class LogWatcher(logging.Handler):
+    """ロガーに付けて、流れたログの本文を集める（点検がログを画面の外へ漏らさないことの確認）。"""
+
+    def __init__(self, name):
+        super().__init__(level=logging.DEBUG)
+        self.messages = []
+        self.target = logging.getLogger(name)
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+    def __enter__(self):
+        self.target.addHandler(self)
+        return self
+
+    def __exit__(self, *exc_info):
+        self.target.removeHandler(self)
+
+
+class ClosureCheckTest(InstallCase):
+    """休館日の設定（``schedule.closures``）の使えない項目は、``--check`` に 1 件ずつ警告で出る。
+
+    項目の読み方は ``ClosureCalendar`` が決め、``chime.configcheck`` がその説明をそのまま使って
+    設定の節に警告として挙げる。ここでは、``--check`` の画面にどう出るかを確かめる。
+    """
+
+    BAD = {"dates": ["tomorrow", {"date": "2026-13-01"}, 5],
+           "ranges": [{"from": "2026-12-28"}, {"from": "2026-12-28", "to": "2026-12-01"}]}
+
+    def config_with(self, closures):
+        return make_config(self.root, {"schedule": {"closures": closures}})
+
+    def closure_results(self, closures):
+        return [result for result in check_settings(self.config_with(closures))
+                if result.title.startswith("schedule.closures")]
+
+    def test_the_default_has_no_problems(self):
+        self.assertEqual(self.closure_results({"dates": [], "ranges": []}), [])
+        self.assertEqual(self.closure_results({"dates": ["2026-11-02"], "ranges": [
+            {"from": "2026-12-28", "to": "2027-01-04", "name": "年末年始"}]}), [])
+
+    def test_every_unusable_entry_is_one_warning_with_its_place_and_a_fix(self):
+        results = self.closure_results(self.BAD)
+        self.assertEqual(len(results), 5)
+        for result in results:
+            self.assertEqual(result.level, WARNING)
+            self.assertIn("その日はいつもどおり鳴らします", result.detail)
+            self.assertTrue(result.fix)
+        self.assertIn("schedule.closures.dates の 1 番目", results[0].detail)
+        self.assertIn("schedule.closures.ranges の 2 番目", results[4].detail)
+
+    def test_the_problems_are_warnings_in_the_settings_section_not_ngs(self):
+        results = check_settings(self.config_with(self.BAD))
+        self.assertEqual(levels(results).count(NG), 0)
+        self.assertNotIn("設定の書き方", [result.title for result in results])  # 「問題なし」とは言わない
+
+    def test_a_clean_setting_still_says_the_settings_are_fine(self):
+        results = check_settings(self.config_with({"dates": ["2026-11-02"], "ranges": []}))
+        self.assertEqual(only(results, "設定の書き方").level, OK)
+
+    def test_warnings_alone_exit_with_0_and_are_counted_once_each(self):
+        code, output = self.run_check(self.config_with(self.BAD))
+        self.assertEqual(code, 0, output)
+        self.assertIn("結果: 警告 5 件。", output)
+        self.assertEqual(output.count("の 1 番目"), 2)   # dates と ranges に 1 件ずつ。二重に出さない
+
+    def test_many_problems_are_capped_and_the_rest_are_counted(self):
+        results = self.closure_results({"dates": ["x"] * 15})
+        self.assertEqual(len(results), 11)
+        self.assertIn("ほかにも使えない項目が 5 件あります", results[-1].detail)
+
+    def test_the_check_does_not_repeat_the_problems_in_the_log(self):
+        with LogWatcher("chime.closures") as closures_log, logs_enabled():
+            self.run_check(self.config_with(self.BAD))
+        self.assertEqual(closures_log.messages, [])
+        self.assertFalse(logging.getLogger("chime.closures").disabled)
+
+    def test_the_runtime_would_use_the_same_words(self):
+        from chime.closures import ClosureCalendar
+        with logs_enabled(), self.assertLogs("chime.closures", level="ERROR"):
+            problems = ClosureCalendar(self.BAD).problems
+        details = [result.detail for result in self.closure_results(self.BAD)]
+        for problem in problems:
+            self.assertTrue(any(problem in detail for detail in details), problem)
+
+
+class PauseSpanTest(unittest.TestCase):
+    def test_a_span_and_a_single_day(self):
+        self.assertEqual(pause_span(date(2026, 10, 1), date(2026, 10, 5)), "10/01〜10/05")
+        self.assertEqual(pause_span(date(2026, 10, 1), date(2026, 10, 1)), "10/01")
+        self.assertEqual(pause_span(date(2026, 12, 30), date(2027, 1, 3)), "12/30〜01/03")
+
+    def test_describing_a_pause(self):
+        moment = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        self.assertEqual(describe_pause(Pause(date(2026, 10, 1), date(2026, 10, 5), moment, "学園祭")),
+                         "10/01〜10/05（学園祭）")
+        self.assertEqual(describe_pause(Pause(date(2026, 10, 1), date(2026, 10, 1), moment, "")),
+                         "10/01")
+
+    def test_a_reason_is_kept_on_one_line_without_control_characters(self):
+        moment = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        pause = Pause(date(2026, 10, 1), date(2026, 10, 1), moment, "  1 行目\n2 行目\x1b[31m\ud800  ")
+        text = describe_pause(pause)
+        self.assertEqual(text, "10/01（1 行目 2 行目 [31m）")
+        text.encode("utf-8")
+
+    def test_a_reason_of_only_blanks_is_no_reason(self):
+        moment = datetime(2026, 10, 1, 9, 0, tzinfo=ZoneInfo("Asia/Tokyo"))
+        self.assertEqual(describe_pause(Pause(date(2026, 10, 1), date(2026, 10, 1), moment, " \n ")),
+                         "10/01")
+
+
+class PauseCheckTest(InstallCase):
+    """休止の記録（``cache/pause.json``）。止めているなら情報、使えないなら警告。放送は止まらない。"""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("chime.check._today", return_value=TODAY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.pause_path = self.path("cache", "pause.json")
+
+    def put(self, **record):
+        values = {"v": 1, "first_day": "2026-10-14", "last_day": "2026-10-15",
+                  "set_at": "2026-10-14T09:00:00+09:00", "reason": "点検"}
+        values.update(record)
+        self.write_json(self.pause_path, values)
+
+    def results(self, config=None):
+        """書き込みの節にある、休止の記録の項目（無ければ空）。"""
+        return [result for result in check_writable(config or self.config, PI_UID, "pi:pi")
+                if result.title == "cache/pause.json"]
+
+    def test_no_record_says_nothing(self):
+        self.assertEqual(self.results(), [])
+        code, output = self.run_check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("結果: すべて OK です。", output)
+        self.assertNotIn("pause.json", output)
+
+    def test_an_active_pause_is_information_with_the_way_to_lift_it(self):
+        self.put()
+        [result] = self.results()
+        self.assertEqual(result.level, INFO)
+        self.assertEqual(result.detail,
+                         "止めています: 10/14〜10/15（点検）。再開するには python3 campus_chime.py --pause-off を実行します")
+        self.assertEqual(result.fix, "")
+
+    def test_an_active_pause_is_not_a_problem(self):
+        self.put()
+        code, output = self.run_check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("情報  cache/pause.json", output)
+        self.assertIn("結果: すべて OK です。", output)
+
+    def test_the_pause_is_in_the_write_section(self):
+        self.put()
+        sections = dict(check.collect(self.config, euid=PI_UID, account="pi:pi"))
+        self.assertIn("cache/pause.json", [result.title for result in sections["書き込み"]])
+        self.assertEqual([heading for heading, _ in check.collect(self.config, PI_UID, "pi:pi")],
+                         ["設定", "作り置きの音声", "音源", "書き込み"])
+
+    def test_a_pause_without_a_reason(self):
+        self.put(reason="", last_day="2026-10-14")
+        [result] = self.results()
+        self.assertTrue(result.detail.startswith("止めています: 10/14。"), result.detail)
+
+    def test_an_expired_record_says_nothing(self):
+        self.put(first_day="2026-10-10", last_day="2026-10-13")
+        self.assertEqual(self.results(), [])
+
+    def test_a_record_that_ends_today_is_still_a_pause(self):
+        self.put(first_day="2026-10-13", last_day="2026-10-14")
+        [result] = self.results()
+        self.assertEqual(result.level, INFO)
+
+    def test_a_record_that_is_not_in_the_right_shape_is_a_warning(self):
+        for record in ({"v": 2}, {"first_day": "x"}, {"last_day": "2026-02-30"},
+                       {"first_day": "2026-10-20", "last_day": "2026-10-14"},
+                       {"first_day": "2026-10-01", "last_day": "2026-12-31"}):
+            with self.subTest(record=record):
+                self.put(**record)
+                [result] = self.results()
+                self.assertEqual(result.level, WARNING)
+                self.assertIn("中身を使えません", result.detail)
+                self.assertIn("止めていないものとして放送します", result.detail)
+                self.assertIn("python3 campus_chime.py --pause-off で消せます", result.fix)
+
+    def test_a_record_that_is_not_an_object_is_a_warning(self):
+        for text in ("[]", "5", "\"x\"", "null"):
+            with self.subTest(text=text):
+                with open(self.pause_path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                [result] = self.results()
+                self.assertEqual(result.level, WARNING)
+
+    def test_a_broken_json_file_is_a_warning_naming_the_problem(self):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write("{ \"v\": 1,")
+        [result] = self.results()
+        self.assertEqual(result.level, WARNING)
+        self.assertIn("JSON の書き方が正しくありません", result.detail)
+        self.assertIn("止めていないものとして放送します", result.detail)
+
+    def test_a_file_that_is_not_utf8_is_a_warning(self):
+        with open(self.pause_path, "wb") as handle:
+            handle.write(b"\xff\xfe\x00")
+        [result] = self.results()
+        self.assertEqual(result.level, WARNING)
+        self.assertIn("UTF-8", result.detail)
+
+    def test_a_json_nested_too_deeply_is_a_warning(self):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write("[" * 100000)
+        [result] = self.results()
+        self.assertEqual(result.level, WARNING)
+
+    def test_a_folder_in_its_place_is_a_warning(self):
+        os.makedirs(self.pause_path)
+        [result] = self.results()
+        self.assertEqual(result.level, WARNING)
+        self.assertIn("フォルダ", result.detail)
+        self.assertIn("放送は止まりません", result.detail)
+        self.assertIn("そのフォルダを移すか消してください", result.fix)
+
+    def test_a_file_that_cannot_be_read_is_a_warning_with_the_fix_for_reading(self):
+        self.put()
+        real_access = os.access
+        with mock.patch("chime.check.os.access",
+                        lambda path, mode: False if path == self.pause_path else real_access(path, mode)):
+            [result] = self.results()
+        self.assertEqual(result.level, WARNING)
+        self.assertIn("読めません", result.detail)
+        self.assertIn("止めていないものとして鳴ります", result.detail)
+        self.assertEqual(result.fix, "chmod u+r {0}".format(self.pause_path))
+
+    def test_the_fix_for_a_file_of_someone_else_is_chown(self):
+        self.put()
+        self.owners[self.pause_path] = 0
+        real_access = os.access
+        with mock.patch("chime.check.os.access",
+                        lambda path, mode: False if path == self.pause_path else real_access(path, mode)):
+            [result] = self.results()
+        self.assertEqual(result.fix, "sudo chown pi:pi {0}".format(self.pause_path))
+
+    def unusable(self, config=None, path=None, today=TODAY):
+        return pause_record_unusable(config or self.config, path or self.pause_path, today)
+
+    def put_bytes(self, data):
+        with open(self.pause_path, "wb") as handle:
+            handle.write(data)
+
+    def clear_record(self):
+        if os.path.isdir(self.pause_path):
+            os.rmdir(self.pause_path)
+        elif os.path.exists(self.pause_path):
+            os.remove(self.pause_path)
+
+    def test_the_record_is_unusable_exactly_when_the_check_warns(self):
+        # --status が「使えません」と案内するのは、--check が警告にする記録と同じもの。
+        real_access = os.access
+        states = {
+            "無い": lambda: None,
+            "止めている": lambda: self.put(),
+            "最終日が今日": lambda: self.put(first_day="2026-10-13", last_day="2026-10-14"),
+            "期限が切れた": lambda: self.put(first_day="2026-10-10", last_day="2026-10-13"),
+            "知らない版": lambda: self.put(v=2),
+            "日付がカレンダーにない": lambda: self.put(last_day="2026-02-30"),
+            "長すぎる期間": lambda: self.put(first_day="2026-10-01", last_day="2026-12-31"),
+            "壊れた JSON": lambda: self.put_bytes(b"{ \"v\": 1,"),
+            "UTF-8 でない": lambda: self.put_bytes(b"\xff\xfe\x00"),
+            "オブジェクトでない": lambda: self.put_bytes(b"[]"),
+            "入れ子が深すぎる": lambda: self.put_bytes(b"[" * 100000),
+            "フォルダ": lambda: os.makedirs(self.pause_path),
+        }
+        for label, arrange in states.items():
+            with self.subTest(label):
+                self.clear_record()
+                arrange()
+                warned = any(result.level == WARNING for result in self.results())
+                self.assertEqual(self.unusable(), warned)
+        self.clear_record()
+        self.put()
+        with mock.patch("chime.check.os.access",
+                        lambda path, mode: False if path == self.pause_path else real_access(path, mode)):
+            self.assertTrue(self.unusable())   # 読めない
+
+    def test_the_known_states_are_judged_as_expected(self):
+        self.assertFalse(self.unusable())
+        self.put()
+        self.assertFalse(self.unusable())
+        self.put(v=2)
+        self.assertTrue(self.unusable())
+        self.put(first_day="2026-10-10", last_day="2026-10-13")
+        self.assertFalse(self.unusable())
+
+    def test_the_day_is_the_one_given_not_the_one_of_the_config(self):
+        # 渡された今日で期限を判断する（--status はアプリの時計の今日を渡す）。
+        self.put(first_day="2026-10-10", last_day="2026-10-13")
+        with mock.patch("chime.check._today", side_effect=AssertionError("設定の今日は使わない")):
+            self.assertFalse(self.unusable(today=TODAY))
+            self.assertFalse(self.unusable(today=date(2026, 10, 20)))
+        self.put(v=2)
+        self.assertTrue(self.unusable(today=TODAY))
+
+    def test_the_record_judged_is_the_one_at_the_given_place(self):
+        # 動いているアプリが読む場所（PauseStore.path）の記録を判断する。設定の場所ではなく、渡された場所。
+        elsewhere = self.path("run", "pause.json")
+        os.makedirs(os.path.dirname(elsewhere))
+        with open(elsewhere, "w", encoding="utf-8") as handle:
+            handle.write("{ broken")
+        self.assertTrue(self.unusable(path=elsewhere))
+        self.assertFalse(self.unusable())   # 設定の場所には何も無い
+        self.put()
+        self.assertFalse(self.unusable())
+        os.remove(self.pause_path)
+        self.assertTrue(self.unusable(path=elsewhere))
+
+    def test_an_empty_place_is_not_an_unusable_record(self):
+        self.assertFalse(self.unusable(path=""))
+
+    def test_judging_leaves_the_record_and_the_log_alone(self):
+        self.put(v=2)
+        before = (os.stat(self.pause_path).st_mtime_ns, sorted(os.listdir(self.path("cache"))))
+        with LogWatcher("chime.pause") as watcher, logs_enabled():
+            self.assertTrue(self.unusable())
+        self.assertEqual(watcher.messages, [])
+        self.assertEqual((os.stat(self.pause_path).st_mtime_ns, sorted(os.listdir(self.path("cache")))), before)
+
+    def test_no_place_for_the_record_means_pausing_is_not_used(self):
+        config = make_config(self.root, {"state": {"pause_file": ""}})
+        self.assertEqual([result for result in check_writable(config, PI_UID, "pi:pi")
+                          if "pause" in result.title], [])
+
+    def test_a_record_somewhere_else_is_named_by_its_path(self):
+        elsewhere = self.path("run", "pause.json")
+        os.makedirs(os.path.dirname(elsewhere))
+        self.write_json(elsewhere, {"v": 1, "first_day": "2026-10-14", "last_day": "2026-10-14",
+                                    "set_at": "2026-10-14T09:00:00+09:00", "reason": ""})
+        config = make_config(self.root, {"state": {"pause_file": elsewhere}})
+        [result] = [r for r in check_writable(config, PI_UID, "pi:pi") if r.title == "run/pause.json"]
+        self.assertEqual(result.level, INFO)
+
+    def test_the_check_does_not_repeat_the_problem_in_the_log(self):
+        with open(self.pause_path, "w", encoding="utf-8") as handle:
+            handle.write("{ broken")
+        self.put(v=2)
+        with LogWatcher("chime.pause") as watcher, logs_enabled():
+            self.results()
+            self.run_check()
+        self.assertEqual(watcher.messages, [])
+        self.assertFalse(logging.getLogger("chime.pause").disabled)
+
+    def test_the_pause_is_judged_by_the_days_of_the_config_zone(self):
+        today = []
+        with mock.patch("chime.check._today", side_effect=lambda config: today.append(config) or TODAY):
+            self.put()
+            self.results()
+        self.assertEqual(len(today), 1)
+
+    def test_a_pause_problem_never_turns_the_check_into_a_failure(self):
+        os.makedirs(self.pause_path)
+        code, output = self.run_check()
+        self.assertEqual(code, 0, output)
+        self.assertIn("結果: 警告 1 件。", output)
+
+    def test_the_pause_record_is_left_untouched(self):
+        self.put()
+        before = (os.stat(self.pause_path).st_mtime_ns, sorted(os.listdir(self.path("cache"))))
+        self.run_check()
+        self.assertEqual((os.stat(self.pause_path).st_mtime_ns, sorted(os.listdir(self.path("cache")))),
+                         before)
+
+    def test_nothing_is_created_for_a_record_that_does_not_exist(self):
+        shutil.rmtree(self.path("cache"))
+        self.run_check()
+        self.assertFalse(os.path.exists(self.path("cache")))
+
+
+class TodayTest(unittest.TestCase):
+    def test_today_follows_the_configured_zone(self):
+        config = make_config("/opt/chime", {"timezone": "Pacific/Kiritimati"})   # UTC+14
+        zone = ZoneInfo("Pacific/Kiritimati")
+        self.assertIn(check._today(config) - datetime.now(zone).date(), (timedelta(0), timedelta(days=1)))
+
+    def test_an_unknown_zone_falls_back_to_the_machine_date(self):
+        config = make_config("/opt/chime", {"timezone": "No/Such_Zone"})
+        self.assertIn(check._today(config) - date.today(), (timedelta(0), timedelta(days=1), timedelta(days=-1)))
 
 
 if __name__ == "__main__":
