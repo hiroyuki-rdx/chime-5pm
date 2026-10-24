@@ -26,17 +26,24 @@
 #   sudo bash scripts/harden.sh --test-sound          # service の手順の保護をかけたまま、12 時の時報を 1 回鳴らして確かめる
 #
 # 共通のオプション: --user NAME（サービスの利用者。既定 pi）、--revert-after MINUTES（1〜60。既定 10）、
-# --force（確認の一部を飛ばす。使いどころは手順ごとに表示します）、-h|--help。
+# --force（確認の一部を飛ばす。使いどころは手順ごとに表示します。いま SSH でつないでいる自分の
+# 接続が防火壁で切れる場合は、--force でも止めます）、-h|--help。
 # 複数の手順は一度に指定できる（例: services journal）。条件はすべての手順の分を先に確かめ、
 # 実行は services journal updates ntp service sudo ssh firewall の順に行う。終了コードは 0 = 成功、
 # 1 = 中止・失敗、2 = 使い方の誤り。
 #
 # ssh と firewall は、締め出される恐れのある変更なので、適用すると「確定待ち」になる。
 # 別の端末で入り直して確かめ、sudo bash scripts/harden.sh --confirm で確定する。確定しないと、
-# --revert-after の分数で自動で元に戻る（再起動しても戻る）。元に戻す処理は、リポジトリの版ではなく
-# root だけが書ける /var/lib/campus-chime-harden/harden.sh の写しを実行する。
+# --revert-after の分数で自動で元に戻る（再起動しても戻る）。すでに確定してある設定を変えて確定
+# しなかったときは、harden.sh を使う前ではなく、最後に確定した設定に戻る。元に戻す処理は、
+# リポジトリの版ではなく root だけが書ける /var/lib/campus-chime-harden/harden.sh の写しを実行する。
+# sudo の手順も、パスワードの確認が終わるまでの 5 分だけ「確定待ち」にする（--confirm は要らない）。
+# Ctrl-C・回線切れ・強制終了などでパスワードを確かめられなかったときは、NOPASSWD の設定を元に戻す
+# （止められたときはその場で、プロセスが消えたときは 5 分後の自動復元で）。
+# どの手順も、途中で止められたら（Ctrl-C など）、その手順を元に戻してから終わる。
 # 放送の最中にサービスを止めないよう、service・updates・ntp（と nftables を入れる firewall）は、
-# 先に campus_chime.py --wait-idle で放送の終わりを待つ。
+# 先に campus_chime.py --wait-idle で放送の終わりを待つ。apt を動かす手順と時計を変える手順
+# （updates・ntp・nftables を入れる firewall）は、さらに次の放送まで 10 分以上あることを確かめる。
 #
 set -euo pipefail
 
@@ -78,6 +85,12 @@ APT_UPGRADE_DROPIN=/etc/systemd/system/apt-daily-upgrade.timer.d/50-campus-chime
 SERVICE_NAME=campus_chime.service
 SERVICE_DROPIN=/etc/systemd/system/campus_chime.service.d/50-campus-chime-harden.conf
 CHRONY_SOURCES=/etc/chrony/sources.d/campus-chime-harden.sources
+# 自動復元が元に戻した手順の記録（--confirm が、確定できなかった理由を正直に伝えるため）。
+REVERTED_FILE="${STATE_DIR}/reverted"
+# sudo の手順が NOPASSWD を外している間の安全網（確定待ち）の長さ（分）。
+SUDO_WINDOW=5
+# apt を動かす手順・時計を変える手順の前に、次の放送まで空けておく分数。
+LOOKAHEAD_MINUTES=10
 
 ALL_STEPS=(ssh firewall sudo services journal updates service ntp)
 # 実行する順。止めても害の少ないものから、締め出される恐れのある ssh・firewall を最後に行う。
@@ -104,6 +117,12 @@ ROLLBACK_LIST=()
 PRE_FAIL=0
 NOW=""
 CURRENT_STEP=""
+SSH_PORTS=()
+SSH_PORTS_NOTE=""
+CUR_PEERS=()
+CUR_PEERS_WHY=""
+CHIME_CONFIG_JSON=""
+CHIME_CONFIG_STATE=""
 declare -A STEP_SKIP=()
 
 log() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
@@ -130,6 +149,10 @@ quote_cmd() {
   out="$(printf '%q ' "$@")"
   printf '%s' "${out% }"
 }
+
+# 画面に出す「次に打つコマンド」。新しい SSH の画面は ホームのフォルダから始まるので、
+# 相対パス（scripts/harden.sh）ではなく、このスクリプトの絶対パスで書く。
+harden_cmd() { printf 'sudo bash %q' "${SCRIPT_PATH}"; }
 
 join_comma() {
   local out="" item
@@ -193,10 +216,21 @@ created_has() {
   [ -f "${STATE_DIR}/created/$1" ] && grep -Fxq -- "$2 $3" "${STATE_DIR}/created/$1"
 }
 
+# 控え $2 が、元のファイル $1 の完全な写しか（中身が同じか。シンボリックリンクなら行き先が同じか）。
+backup_is_complete() {
+  if [ -L "$1" ]; then
+    [ -L "$2" ] && [ "$(readlink "$1")" = "$(readlink "$2")" ]
+  else
+    [ -f "$2" ] && cmp -s "$1" "$2"
+  fi
+}
+
 # ファイル $2 を書き換える・消す前に呼ぶ。元のファイルがあれば一度だけ控え（2 回目以降は最初の
-# 控えを残す）、無ければ「この手順が作った」と記録する。
+# 控えを残す）、無ければ「この手順が作った」と記録する。控えは、別名に最後まで写し、中身が同じと
+# 確かめてから本来の名前に置く（途中で失敗・停止した写しを、元のファイルとして戻さないため）。
+# 控えを完全に作れないときは 1 を返す（呼ぶ側は、そのファイルを変更しない）。
 claim_path() {
-  local step="$1" path="$2" real backup
+  local step="$1" path="$2" real backup tmp
   real="${SYSROOT}${path}"
   backup="${STATE_DIR}/backup/${step}${path}"
   if [ -e "${backup}" ] || [ -L "${backup}" ]; then
@@ -207,7 +241,12 @@ claim_path() {
   fi
   if [ -e "${real}" ] || [ -L "${real}" ]; then
     mkdir -p "${backup%/*}" || return 1
-    cp -a "${real}" "${backup}" || return 1
+    tmp="${backup}.harden-tmp.$$"
+    rm -rf -- "${tmp}"
+    if ! cp -a "${real}" "${tmp}" || ! backup_is_complete "${real}" "${tmp}" || ! mv -f "${tmp}" "${backup}"; then
+      rm -rf -- "${tmp}"
+      return 1
+    fi
     state_log "backup ${step} ${path}"
   else
     record_created "${step}" f "${path}" || return 1
@@ -226,10 +265,23 @@ ensure_dir() {
   if [ -n "${parent}" ]; then
     ensure_dir "${step}" "${parent}" "${mode}" || return 1
   fi
-  mkdir "${SYSROOT}${path}" || return 1
+  # 作る前に記録する（作った直後に止められても、戻すときに消せるように。無ければ戻すとき何もしない）。
   record_created "${step}" d "${path}" || return 1
+  mkdir "${SYSROOT}${path}" || return 1
   chmod "${mode}" "${SYSROOT}${path}" || return 1
   state_log "mkdir ${step} ${path}"
+}
+
+# 締め出しにつながる変更（ssh・sudo）を始める直前に、ここまでに書いたもの（元のファイルの控え・確定待ちの
+# 記録・自動復元の時計の単位ファイルと root の写し）をディスクへ出す。別名に書いて mv で置いただけだと、
+# 電源が落ちたとき、変更そのもの（消す・置き換える）だけがディスクに残り、安全網が空のファイルになりうる。
+flush_before_risky_change() {
+  case "$1" in
+    ssh | sudo) ;;
+    *) return 0 ;;
+  esac
+  command -v sync > /dev/null 2>&1 || return 0
+  sync || warn "sync に失敗しました。電源が落ちたときの備えが弱くなります（強制終了や回線切れには、影響しません）。"
 }
 
 # 手順 $1 のファイル $2 を、内容 $4・mode $3 で書く（元の控えを取ってから、一時ファイル経由で）。
@@ -240,6 +292,7 @@ put_file() {
     return 0
   fi
   claim_path "${step}" "${path}" || { warn "元のファイルの控えを作れません: ${path}"; return 1; }
+  flush_before_risky_change "${step}"
   write_atomic "${SYSROOT}${path}" "${mode}" "${content}" || { warn "書き込めません: ${path}"; return 1; }
   state_log "write ${step} ${path}"
 }
@@ -252,6 +305,7 @@ del_file() {
     return 0
   fi
   claim_path "${step}" "${path}" || { warn "元のファイルの控えを作れません: ${path}"; return 1; }
+  flush_before_risky_change "${step}"
   rm -f "${SYSROOT}${path}" || { warn "削除できません: ${path}"; return 1; }
   state_log "remove ${step} ${path}"
 }
@@ -271,13 +325,24 @@ restore_one() {
   fi
 }
 
+# パス $1 の書きかけの一時ファイル（write_atomic・restore_one が、止められて残したもの）を消す。
+sweep_tmp() {
+  local f
+  for f in "${SYSROOT}$1".harden-tmp.*; do
+    if [ -e "${f}" ] || [ -L "${f}" ]; then
+      rm -f -- "${f}" || true
+    fi
+  done
+}
+
 # 手順 $1 が変えたファイルを元に戻す: 控えを戻し、自分で作ったものを（作った順の逆に）消す。
 # 1 つでも失敗したら 1 を返すが、残りは続ける。成功するまで控えと記録は消さない。
+# 書きかけの控え（*.harden-tmp.*）は戻さない。
 restore_step_files() {
   local step="$1" rc=0 base files file entries=() i line kind path
   base="${STATE_DIR}/backup/${step}"
   if [ -d "${base}" ]; then
-    if ! files="$(find "${base}" \( -type f -o -type l \) -print)"; then
+    if ! files="$(find "${base}" \( -type f -o -type l \) ! -name '*.harden-tmp.*' -print)"; then
       warn "控えの一覧を読めませんでした: ${base}"
       rc=1
       files=""
@@ -285,6 +350,7 @@ restore_step_files() {
     while IFS= read -r file; do
       [ -n "${file}" ] || continue
       path="${file#"${base}"}"
+      sweep_tmp "${path}"
       if restore_one "${file}" "${SYSROOT}${path}"; then
         state_log "restore ${step} ${path}"
       else
@@ -301,6 +367,7 @@ restore_step_files() {
       path="${line#* }"
       case "${kind}" in
         f)
+          sweep_tmp "${path}"
           if ! rm -f -- "${SYSROOT}${path}"; then
             warn "削除できません: ${path}"
             rc=1
@@ -324,7 +391,97 @@ restore_step_files() {
 }
 
 cleanup_step_state() {
-  rm -rf "${STATE_DIR}/backup/${1:?}" "${STATE_DIR}/created/${1:?}" "${STATE_DIR}/applied/${1:?}"
+  rm -rf "${STATE_DIR}/backup/${1:?}" "${STATE_DIR}/created/${1:?}" "${STATE_DIR}/applied/${1:?}" \
+    "${STATE_DIR}/confirmed/${1:?}" "${STATE_DIR}/confirmed/${1:?}.prev" || return 1
+  reverted_forget "$1"
+}
+
+# ---------------------------------------------------------------------------
+# 確定した設定の控え（ssh・firewall）
+# ---------------------------------------------------------------------------
+# --confirm のときに、確定した設定のファイルを confirmed/<手順>/<絶対パス> に写す。すでに確定した
+# 手順を変えて、確定しないまま自動復元が働くときは、harden.sh を使う前ではなく、ここへ戻す。
+
+confirmed_has() { [ -f "${STATE_DIR}/confirmed/$1/.complete" ]; }
+
+# 手順 $1 の確定した設定として、実システムのファイル $2... を控える（別名に写し、最後に置き換える）。
+# 古い控えは、新しい控えを置くまで消さない（消してから置くと、その間に止められたとき、どちらも無くなって、
+# 自動復元が確定した設定ではなく元の状態へ戻してしまう）。古い控えは .prev に退け、新しい控えを置けたら消す。
+# 止められて .prev が残ったときは、confirmed_recover がロックを取るときに直す。
+snapshot_confirmed() {
+  local step="$1" dir tmp prev path
+  shift
+  dir="${STATE_DIR}/confirmed/${step}"
+  tmp="${dir}.harden-tmp.$$"
+  prev="${dir}.prev"
+  rm -rf -- "${tmp}"
+  mkdir -p "${tmp}" || return 1
+  for path in "$@"; do
+    if [ ! -f "${SYSROOT}${path}" ]; then
+      warn "確定した設定のファイルがありません: ${path}"
+      rm -rf -- "${tmp}"
+      return 1
+    fi
+    if ! { mkdir -p "${tmp}${path%/*}" && cp -a "${SYSROOT}${path}" "${tmp}${path}" \
+      && backup_is_complete "${SYSROOT}${path}" "${tmp}${path}"; }; then
+      warn "確定した設定を控えられません: ${path}"
+      rm -rf -- "${tmp}"
+      return 1
+    fi
+  done
+  : > "${tmp}/.complete" || { rm -rf -- "${tmp}"; return 1; }
+  rm -rf -- "${prev}" || { rm -rf -- "${tmp}"; return 1; }
+  if [ -e "${dir}" ] && ! mv "${dir}" "${prev}"; then
+    rm -rf -- "${tmp}"
+    return 1
+  fi
+  if ! mv "${tmp}" "${dir}"; then
+    if [ -e "${prev}" ] && [ ! -e "${dir}" ]; then
+      mv "${prev}" "${dir}" || true
+    fi
+    rm -rf -- "${tmp}"
+    return 1
+  fi
+  rm -rf -- "${prev}" || true
+  state_log "confirmed ${step}"
+}
+
+# snapshot_confirmed が入れ替えの途中で止められて、古い控え（<手順>.prev）が残っていれば直す。
+# 新しい控えが置かれていれば古い控えは要らない。置かれていなければ、古い控えを元の名前に戻す
+# （確定の記録は終わっていないので、自動復元は、前に確定した設定へ戻る）。
+confirmed_recover() {
+  local prev cur
+  for prev in "${STATE_DIR}"/confirmed/*.prev; do
+    [ -d "${prev}" ] || continue
+    cur="${prev%.prev}"
+    if [ -f "${cur}/.complete" ] || [ ! -f "${prev}/.complete" ]; then
+      rm -rf -- "${prev}" || true
+    else
+      rm -rf -- "${cur}" || true
+      mv "${prev}" "${cur}" || true
+    fi
+  done
+}
+
+# 手順 $1 の確定した設定のファイルを、実システムへ戻す。1 つでも失敗したら 1。
+restore_confirmed_files() {
+  local base="${STATE_DIR}/confirmed/$1" files file path rc=0
+  if ! files="$(find "${base}" -type f ! -name '.complete' ! -name '*.harden-tmp.*' -print)"; then
+    warn "確定した設定の一覧を読めませんでした: ${base}"
+    return 1
+  fi
+  while IFS= read -r file; do
+    [ -n "${file}" ] || continue
+    path="${file#"${base}"}"
+    sweep_tmp "${path}"
+    if restore_one "${file}" "${SYSROOT}${path}"; then
+      state_log "restore-confirmed $1 ${path}"
+    else
+      warn "確定した設定へ戻せません: ${path}"
+      rc=1
+    fi
+  done <<< "${files}"
+  return "${rc}"
 }
 
 # ---------------------------------------------------------------------------
@@ -417,11 +574,17 @@ step_touched() {
 # 確定待ちの記録: STEP=適用した時刻（エポック秒）と window=自動で戻るまでの分数。
 pending_has() { meta_get "${PENDING_FILE}" "$1" > /dev/null 2>&1; }
 pending_epoch() { meta_get "${PENDING_FILE}" "$1" 2>/dev/null || true; }
-pending_window() { meta_get "${PENDING_FILE}" window 2>/dev/null || true; }
+# 窓の分数。確定待ちの手順が 1 つも無いときの window だけの記録（止められて残ったもの）は、無いものとして扱う。
+pending_window() {
+  [ -n "$(pending_list)" ] || return 0
+  meta_get "${PENDING_FILE}" window 2>/dev/null || true
+}
 
+# 確定待ちの手順を、戻す順の逆（古い→新しい）に表示する。sudo は NOPASSWD を外している間だけ載る
+# （パスワードを確かめたら外す。確定の操作は要らない）。
 pending_list() {
   local s
-  for s in ssh firewall; do
+  for s in ssh firewall sudo; do
     if pending_has "${s}"; then
       printf '%s\n' "${s}"
     fi
@@ -435,11 +598,44 @@ pending_set() {
 }
 
 pending_remove() {
-  local file
+  local file s others=0
   file="${PENDING_FILE}"
-  meta_del "${file}" "$1" || return 1
-  if [ -z "$(pending_list)" ]; then
+  for s in ssh firewall sudo; do
+    if [ "${s}" != "$1" ] && pending_has "${s}"; then
+      others=1
+    fi
+  done
+  if [ "${others}" -eq 0 ]; then
+    # 最後の 1 つは、キーを外す前に、ファイルごと消す（途中で止められても window だけのファイルを残さない）。
     rm -f "${file}" || return 1
+  else
+    meta_del "${file}" "$1" || return 1
+  fi
+}
+
+# 自動復元が元に戻した手順の記録（REVERTED_FILE）: epoch=いつ、<手順>=original（harden.sh を使う前）
+# または confirmed（最後に確定した設定）。--confirm が「もう戻っている」と正直に伝えるために使う。
+reverted_steps() {
+  local s
+  for s in ssh firewall sudo; do
+    if meta_get "${REVERTED_FILE}" "${s}" > /dev/null 2>&1; then
+      printf '%s\n' "${s}"
+    fi
+  done
+}
+
+reverted_record() {
+  now
+  meta_set "${REVERTED_FILE}" epoch "${NOW}" || return 1
+  meta_set "${REVERTED_FILE}" "$1" "$2"
+}
+
+# 手順 $1 の記録を消す（手で戻した・もう一度適用した、など。記録が空になったらファイルも消す）。
+reverted_forget() {
+  [ -f "${REVERTED_FILE}" ] || return 0
+  meta_del "${REVERTED_FILE}" "$1" || return 1
+  if [ -z "$(reverted_steps)" ]; then
+    rm -f "${REVERTED_FILE}" || return 1
   fi
 }
 
@@ -480,6 +676,9 @@ acquire_lock() {
   else
     flock -n 9 || fail "ほかの harden.sh が実行中です。終わってからもう一度実行してください。何も変更していません。"
   fi
+  # 前の実行が止められて残した書きかけの一時ファイル（ロックを持っている間だけ消せる）。
+  find "${STATE_DIR}" -name '*.harden-tmp.*' -exec rm -rf {} + 2> /dev/null || true
+  confirmed_recover
 }
 
 # 元に戻すときは、利用者がいなくても進める（放送の確認が要る手順だけが、確認できずに失敗する）。
@@ -535,12 +734,87 @@ os_problem() {
   fi
 }
 
+# 次の放送の再生開始までの秒数を表示する。campus_chime.py --schedule 1 の出力（標準入力）の
+# 「現在時刻: 日付 時刻」と、最初の「時報 日付 時刻（再生開始 時刻）」の行を読む（どちらも放送の時間帯の
+# 時刻）。「現在時刻」の行が無ければ、引数 1 の時間帯で今を求める。予定が 1 つもなければ none。
+# 読み取れなければ終了コード 3。
+NEXT_PY='
+import re
+import sys
+import datetime
+
+text = sys.stdin.read()
+now = None
+m = re.search(r"現在時刻: (\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)", text)
+if m:
+    now = datetime.datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")
+elif len(sys.argv) > 1 and sys.argv[1]:
+    try:
+        import zoneinfo
+        now = datetime.datetime.now(zoneinfo.ZoneInfo(sys.argv[1])).replace(tzinfo=None)
+    except Exception:
+        sys.exit(3)
+else:
+    sys.exit(3)
+m = re.search(r"^\s*- \S+ (\d{4}-\d\d-\d\d) (\d\d:\d\d:\d\d)（再生開始 (\d\d:\d\d:\d\d)）", text, re.M)
+if not m:
+    if "予定されたイベントはありません" in text:
+        print("none")
+        sys.exit(0)
+    sys.exit(3)
+at = datetime.datetime.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")
+play = datetime.datetime.strptime(m.group(1) + " " + m.group(3), "%Y-%m-%d %H:%M:%S")
+if play > at:
+    play -= datetime.timedelta(days=1)
+print(int((play - now).total_seconds()))
+'
+
+# 次の放送まで $1 分以上あることを確かめる。近ければ、放送が終わるまで待てる範囲（--wait-idle と同じ
+# 6 分まで）なら待ち、待てなければ断る。読み取れなければ、--force がなければ断る。
+ensure_lookahead() {
+  local ahead="$1" tries=0 out secs wait_s tz
+  tz="$(chime_timezone 2> /dev/null || true)"
+  while :; do
+    secs=""
+    if out="$(as_user python3 "${REPO_DIR}/campus_chime.py" --schedule 1 2> /dev/null)"; then
+      secs="$(printf '%s\n' "${out}" | python3 -I -c "${NEXT_PY}" "${tz}" 2> /dev/null)" || secs=""
+    fi
+    if [ -z "${secs}" ]; then
+      if [ "${FORCE}" -eq 1 ]; then
+        warn "次の放送の時刻を読み取れません（campus_chime.py --schedule 1）。--force が付いているので進めます。"
+        return 0
+      fi
+      warn "次の放送の時刻を読み取れません（campus_chime.py --schedule 1）。放送の直前でないと確かめられないので止めます。承知のうえなら --force を付けてください。"
+      return 1
+    fi
+    if [ "${secs}" = none ] || [ "${secs}" -ge $((ahead * 60)) ]; then
+      return 0
+    fi
+    wait_s=$((secs + 180))
+    if [ "${tries}" -ge 2 ] || [ "${wait_s}" -gt 360 ]; then
+      warn "次の放送まで約 $(((secs < 0 ? 0 : secs) / 60 + 1)) 分です。apt を動かす手順と時計を変える手順は、次の放送まで ${ahead} 分以上あるときだけ行います。放送のない時間に、もう一度実行してください。"
+      return 1
+    fi
+    say "次の放送が近いので、終わるまで約 $((wait_s / 60 + 1)) 分待ちます。"
+    sleep "${wait_s}"
+    tries=$((tries + 1))
+    runuser -u "${TARGET_USER}" -- python3 "${REPO_DIR}/campus_chime.py" --wait-idle || {
+      warn "放送の時間帯が終わりませんでした。放送のない時間に、もう一度実行してください。"
+      return 1
+    }
+  done
+}
+
 # 放送の最中にサービスを止めたり apt を動かしたりしないよう、放送の終わりを待つ（最大 6 分）。
+# $1（分）が 1 以上なら、次の放送までそれだけあることも確かめる（apt や時計の変更は長引くため）。
 # campus_chime.py が無いときは警告して続ける。
 ensure_idle() {
-  local rc=0
+  local ahead="${1:-0}" rc=0
   if [ "${DRY_RUN}" -eq 1 ]; then
     plan "放送の最中でないことを確認: runuser -u ${TARGET_USER} -- python3 ${REPO_DIR}/campus_chime.py --wait-idle"
+    if [ "${ahead}" -gt 0 ]; then
+      plan "次の放送まで ${ahead} 分以上あることを確認: runuser -u ${TARGET_USER} -- python3 ${REPO_DIR}/campus_chime.py --schedule 1"
+    fi
     return 0
   fi
   if [ ! -f "${REPO_DIR}/campus_chime.py" ]; then
@@ -550,12 +824,36 @@ ensure_idle() {
   say "放送の最中でないことを確認します（放送の最中なら、終わるまで最大 6 分待ちます）。"
   runuser -u "${TARGET_USER}" -- python3 "${REPO_DIR}/campus_chime.py" --wait-idle || rc=$?
   case "${rc}" in
-    0) return 0 ;;
-    1) warn "放送の時間帯が終わりませんでした。放送のない時間に、もう一度実行してください。" ;;
-    2) warn "設定ファイル（config.json）を読めないため、放送の時間帯かどうか確認できませんでした。上の表示のとおり直してください。" ;;
-    *) warn "放送の時間帯の確認に失敗しました（終了コード ${rc}）。" ;;
+    0) ;;
+    1) warn "放送の時間帯が終わりませんでした。放送のない時間に、もう一度実行してください。"; return 1 ;;
+    2) warn "設定ファイル（config.json）を読めないため、放送の時間帯かどうか確認できませんでした。上の表示のとおり直してください。"; return 1 ;;
+    *) warn "放送の時間帯の確認に失敗しました（終了コード ${rc}）。"; return 1 ;;
   esac
-  return 1
+  if [ "${ahead}" -gt 0 ]; then
+    ensure_lookahead "${ahead}" || return 1
+  fi
+}
+
+# 読むだけの apt の呼び出し（apt-cache policy・apt-get -s）は、これを通す: apt_read 道具名 引数...
+# root で apt を動かすと、索引の写し（/var/cache/apt の pkgcache.bin・srcpkgcache.bin）を作り直して
+# しまう。--dry-run は何も変えないと約束しているので、その保存先を空にして何も書かせない（索引はそのつど
+# メモリの中に作る）。scripts/security_check.sh の apt_read と同じ。
+apt_read() {
+  local tool="$1"
+  shift
+  "${tool}" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= "$@"
+}
+
+# apt-get install の前に一覧を新しくする（古い一覧のままだと、入れるときに 404 になる）。失敗は警告にとどめる
+# （一覧が新しければ入れられるため）。入れられなかったときの案内は apt_install_hint。
+apt_refresh() {
+  if ! sys apt-get update; then
+    warn "apt-get update が失敗しました。ネットワーク（学内の網につながっているか、名前が引けるか）を確かめてください。古い一覧のまま続けます。"
+  fi
+}
+
+apt_install_hint() {
+  warn "ネットワークにつながっているか確かめ、sudo apt update を実行してから、もう一度実行してください。"
 }
 
 unit_exists() {
@@ -605,6 +903,24 @@ revert_timer_content() {
     'WantedBy=timers.target'
 }
 
+# 自動復元の時計を張り直した印（番号）。時計が起こした --rollback-pending は、起きたときの番号を覚えておき、
+# ほかの harden.sh の終わりを待ったあとに番号が変わっていれば、その間に時計が張り直されている
+# （新しい窓の分だけ待つと案内した変更を、古い時計の実行が、すぐ戻してしまわないため）。
+REVERT_GEN_FILE="${STATE_DIR}/revert_gen"
+
+revert_gen() {
+  local gen=""
+  { gen="$(<"${REVERT_GEN_FILE}")"; } 2> /dev/null || true
+  [[ "${gen}" =~ ^[0-9]{1,15}$ ]] || gen=""
+  printf '%s' "${gen}"
+}
+
+revert_gen_bump() {
+  local gen
+  gen="$(revert_gen)"
+  write_atomic "${REVERT_GEN_FILE}" 600 "$(( 10#${gen:-0} + 1 ))" || warn "自動復元の時計の番号を書けません（${STATE_REAL}/revert_gen）。"
+}
+
 # 自動復元の時計を張る。root だけが書ける写し（状態の置き場の harden.sh）を実行するので、リポジトリ
 # （pi が書ける）の版は使わない。enable してあるので、確定前に再起動しても、起動の N 分後に戻る。
 # restart で、N 分を数え直す。
@@ -619,7 +935,7 @@ arm_revert() {
     plan "実行: systemctl restart campus-chime-harden-revert.timer（${minutes} 分後に自動で元に戻す）"
     return 0
   fi
-  tmp="${STATE_DIR}/harden.sh.new.$$"
+  tmp="${STATE_DIR}/harden.sh.harden-tmp.$$"
   if ! { cp "${SCRIPT_PATH}" "${tmp}" && chmod 700 "${tmp}" && mv -f "${tmp}" "${STATE_DIR}/harden.sh"; } 2>/dev/null; then
     rm -f "${tmp}"
     warn "自動復元用の写し（${STATE_REAL}/harden.sh）を作れません。"
@@ -633,13 +949,15 @@ arm_revert() {
   systemctl daemon-reload || return 1
   systemctl enable campus-chime-harden-revert.timer || return 1
   systemctl restart campus-chime-harden-revert.timer || return 1
+  # 時計を数え直せてから番号を進める（張れなかったときに、待っている古い実行を止めてしまわないため）。
+  revert_gen_bump
 }
 
 # 確定待ちの手順 $1 を記録して、自動復元の時計を張る。変更を有効にする前に呼ぶ。2 つ目の手順が
-# 加わるときは、前の窓との大きいほうを使う。
+# 加わるときは、前の窓との大きいほうを使う。窓の分数は $2（無ければ --revert-after）。
 arm_for() {
   local step="$1" window old
-  window="${REVERT_AFTER}"
+  window="${2:-${REVERT_AFTER}}"
   old="$(pending_window)"
   if [ -n "${old}" ] && [ "${old}" -gt "${window}" ]; then
     window="${old}"
@@ -648,8 +966,11 @@ arm_for() {
     arm_revert "${window}"
     return 0
   fi
-  pending_set "${step}" "${window}" || { warn "確定待ちの記録を書けません。"; return 1; }
+  # 時計を先に張り、確定待ちの記録はそのあとに書く。逆だと、記録だけがあって時計が無い状態で止められたとき
+  # （kill -9・電源断）、案内が約束する自動復元を、誰もしない。時計だけがあって記録が無い状態は害がない
+  # （時計が起きても、戻すものが無いだけ）。
   arm_revert "${window}" || { warn "自動復元の時計を張れませんでした。"; return 1; }
+  pending_set "${step}" "${window}" || { warn "確定待ちの記録を書けません。"; return 1; }
 }
 
 # 時計と単位ファイル、root の写しを片づける。1 つでも失敗したら 1（その場合は単位ファイルを残す）。
@@ -679,6 +1000,7 @@ disarm_revert() {
 #   collapse CIDR...       重なりをまとめて 1 行ずつ表示する（nft の interval 集合は重なりを許さない）
 #   uncovered CSV ADDR...  CSV のネットワークのどれにも入らない ADDR を表示する
 #   net24 ADDR             ADDR を含む /24（IPv6 は /64）を表示する
+#   first CIDR             CIDR の中の代表のアドレス（ネットワークアドレスの次。狭すぎれば先頭）を表示する
 CIDR_PY='
 import ipaddress
 import sys
@@ -710,6 +1032,10 @@ elif op == "uncovered":
 elif op == "net24":
     addr = ipaddress.ip_address(args[0])
     print(ipaddress.ip_network("%s/%d" % (addr, 24 if addr.version == 4 else 64), strict=False))
+elif op == "first":
+    net = ipaddress.ip_network(args[0], strict=False)
+    narrow = 31 if net.version == 4 else 127
+    print(net.network_address + 1 if net.prefixlen < narrow else net.network_address)
 else:
     sys.exit(3)
 '
@@ -717,12 +1043,106 @@ else:
 cidr_tool() { python3 -I -c "${CIDR_PY}" "$@"; }
 
 # ---------------------------------------------------------------------------
+# 放送の設定（campus_chime.py --print-config）
+# ---------------------------------------------------------------------------
+
+# 利用者 TARGET_USER として実行する（root なら runuser。その利用者本人なら、そのまま）。
+as_user() {
+  if [ "${IS_ROOT}" -eq 1 ]; then
+    runuser -u "${TARGET_USER}" -- "$@"
+  else
+    "$@"
+  fi
+}
+
+# 設定の JSON（--print-config）を CHIME_CONFIG_JSON に読む（1 回だけ）。戻り値: 0 = 読めた、
+# 1 = 読めない（campus_chime.py が無い・設定が壊れている）、2 = 読めない立場（root でも
+# ${TARGET_USER} 本人でもない --dry-run）。
+load_chime_config() {
+  case "${CHIME_CONFIG_STATE}" in
+    ok) return 0 ;;
+    fail) return 1 ;;
+    skip) return 2 ;;
+  esac
+  if [ ! -f "${REPO_DIR}/campus_chime.py" ]; then
+    CHIME_CONFIG_STATE=fail
+    return 1
+  fi
+  if [ "${IS_ROOT}" -eq 0 ] && [ "$(id -un 2>/dev/null)" != "${TARGET_USER}" ]; then
+    CHIME_CONFIG_STATE=skip
+    return 2
+  fi
+  if ! CHIME_CONFIG_JSON="$(as_user python3 "${REPO_DIR}/campus_chime.py" --print-config 2>/dev/null)"; then
+    CHIME_CONFIG_STATE=fail
+    return 1
+  fi
+  CHIME_CONFIG_STATE=ok
+}
+
+# 設定のうち、時間帯（timezone）と、apt のタイマーと重なる放送の時刻を調べる。
+#   tz                  設定の timezone を表示する（標準入力は設定の JSON）
+#   quiet               04:30〜06:30 に鳴る放送（時報・閉館放送）を 1 行ずつ表示する（標準入力は設定の JSON）
+#   same A B            時間帯 A と B が（名前が違っても）同じ UTC との差かを、終了コードで答える
+CFG_PY='
+import datetime
+import json
+import sys
+
+op = sys.argv[1]
+if op == "tz":
+    value = json.load(sys.stdin).get("timezone")
+    print(value if isinstance(value, str) else "")
+elif op == "quiet":
+    sched = json.load(sys.stdin).get("schedule") or {}
+    low, high = 4 * 60 + 30, 6 * 60 + 30
+    found = []
+    hourly = sched.get("hourly") or {}
+    if hourly.get("enabled", True):
+        minute = int(hourly.get("minute", 0))
+        skip = {int(h) for h in hourly.get("skip_hours") or []}
+        for hour in range(int(hourly.get("start_hour", 10)), int(hourly.get("end_hour", 16)) + 1):
+            if hour not in skip and 0 <= hour <= 23 and low <= hour * 60 + minute <= high:
+                found.append("%02d:%02d の時報" % (hour, minute))
+    closing = sched.get("closing") or {}
+    if closing.get("enabled", True):
+        hour, minute = int(closing.get("hour", 16)), int(closing.get("minute", 57))
+        if low <= hour * 60 + minute <= high:
+            found.append("%02d:%02d の閉館放送" % (hour, minute))
+    for line in found:
+        print(line)
+elif op == "same":
+    import zoneinfo
+    first, second = zoneinfo.ZoneInfo(sys.argv[2]), zoneinfo.ZoneInfo(sys.argv[3])
+    start = datetime.datetime(2026, 1, 1, 12, tzinfo=datetime.timezone.utc)
+    for step in range(0, 366 * 2, 7):
+        moment = start + datetime.timedelta(days=step / 2)
+        if moment.astimezone(first).utcoffset() != moment.astimezone(second).utcoffset():
+            sys.exit(1)
+else:
+    sys.exit(3)
+'
+
+# 放送の時間帯（設定の timezone）を表示する。読めなければ 1。
+chime_timezone() {
+  local tz
+  load_chime_config || return 1
+  tz="$(printf '%s' "${CHIME_CONFIG_JSON}" | python3 -I -c "${CFG_PY}" tz 2> /dev/null)" || return 1
+  # 設定は ${TARGET_USER} が書き換えられる。画面に出すコマンド（timedatectl set-timezone ...）に混ざらないよう、
+  # 時間帯の名前として普通の文字だけを受け付ける。
+  [[ "${tz}" =~ ^[A-Za-z0-9_+./-]+$ ]] || return 1
+  printf '%s' "${tz}"
+}
+
+# ---------------------------------------------------------------------------
 # 手順 ssh: SSH を鍵だけにする
 # ---------------------------------------------------------------------------
 
 SSH_ALLOW_USER=""
 SSH_KEY_COUNT=0
+SSH_ACCEPTED_ALGOS=""
 PATH_PROBLEM=""
+PROBE_WHY=""
+SSH_PORTS_RC=""
 
 ssh_dropin_content() {
   printf '%s\n' \
@@ -751,6 +1171,159 @@ config_value() {
     fi
   done <<< "$1"
   return 1
+}
+
+# 「キー 値」の行の並びから、キー $2 の値を（複数あれば全部）1 行ずつ表示する。
+config_values() {
+  local k v
+  while read -r k v; do
+    if [ "${k}" = "$2" ]; then
+      printf '%s\n' "${v}"
+    fi
+  done <<< "$1"
+}
+
+# sshd が待ち受けるポートを SSH_PORTS に入れる（sshd -T の port の行と、listenaddress の行の host:port・
+# [v6]:port のポート、ssh.socket 経由なら ListenStream）。調べた結果は覚えておく。調べられなければ 1
+# （SSH_PORTS は空）。
+# SSH が動いていない・sshd がない・root でない、のときは 22 とみなして 0（理由は SSH_PORTS_NOTE）。
+# listenaddress の値 $1（host:port・[v6]:port）のポートを表示する。ポートの無い形（port の無い IPv4・
+# [::1]・:: のようなかっこの無い IPv6）は何も表示しない（その待ち受けのポートは port の行が示す）。
+listen_port_of() {
+  case "$1" in
+    \[*\]) ;;
+    \[*\]:*) printf '%s' "${1##*\]:}" ;;
+    *:*:*) ;;
+    *:*) printf '%s' "${1##*:}" ;;
+  esac
+}
+
+detect_ssh_ports() {
+  if [ -z "${SSH_PORTS_RC}" ]; then
+    SSH_PORTS_RC=0
+    read_ssh_ports || SSH_PORTS_RC=1
+  fi
+  return "${SSH_PORTS_RC}"
+}
+
+read_ssh_ports() {
+  local cfg value listen line got=0 ports=() port seen=" " i
+  SSH_PORTS=()
+  SSH_PORTS_NOTE=""
+  if ! command -v sshd > /dev/null 2>&1; then
+    SSH_PORTS=(22)
+    SSH_PORTS_NOTE="sshd が入っていないので、SSH のポートは 22 とみなします。"
+    return 0
+  fi
+  if ! unit_active ssh.service && ! unit_active ssh.socket; then
+    SSH_PORTS=(22)
+    SSH_PORTS_NOTE="SSH が動いていないので、SSH のポートは 22 とみなします。"
+    return 0
+  fi
+  if [ "${IS_ROOT}" -eq 0 ]; then
+    SSH_PORTS=(22)
+    SSH_PORTS_NOTE="root でないので sshd の設定を読めません。SSH のポートは 22 とみなします（実際の実行では sshd -T で調べます）。"
+    return 0
+  fi
+  cfg="$(sshd_effective 203.0.113.1)" || return 1
+  while IFS= read -r value; do
+    [ -z "${value}" ] || ports+=("${value}")
+  done < <(config_values "${cfg}" port)
+  # ListenAddress host:port で指したポートは、port の行（既定の 22）に出ないことがある。
+  while IFS= read -r value; do
+    value="$(listen_port_of "${value%% *}")"
+    [ -z "${value}" ] || ports+=("${value}")
+  done < <(config_values "${cfg}" listenaddress)
+  if unit_active ssh.socket; then
+    listen="$(systemctl show -p Listen ssh.socket 2> /dev/null)" || return 1
+    while IFS= read -r line; do
+      [[ "${line}" == Listen=* ]] || continue
+      line="${line#Listen=}"
+      line="${line%% *}"
+      ports+=("${line##*:}")
+      got=1
+    done <<< "${listen}"
+    [ "${got}" -eq 1 ] || return 1
+  fi
+  for port in "${ports[@]}"; do
+    if [[ ! "${port}" =~ ^[0-9]{1,5}$ ]] || [ "$((10#${port}))" -lt 1 ] || [ "$((10#${port}))" -gt 65535 ]; then
+      return 1
+    fi
+    port="$((10#${port}))"
+    if [[ "${seen}" != *" ${port} "* ]]; then
+      seen+="${port} "
+      # 小さい順に並べて入れる（sort に頼らない）。
+      for ((i = 0; i < ${#SSH_PORTS[@]}; i++)); do
+        if [ "${port}" -lt "${SSH_PORTS[i]}" ]; then
+          break
+        fi
+      done
+      SSH_PORTS=("${SSH_PORTS[@]:0:i}" "${port}" "${SSH_PORTS[@]:i}")
+    fi
+  done
+  [ "${#SSH_PORTS[@]}" -gt 0 ] || return 1
+}
+
+# 画面に出す SSH の接続のコマンド（ポートが 22 でなければ -p を付ける）。引数は ssh への追加の指定。
+ssh_login_cmd() {
+  local port=22 p has22=0
+  detect_ssh_ports || true
+  if [ "${#SSH_PORTS[@]}" -gt 0 ]; then
+    port="${SSH_PORTS[0]}"
+    for p in "${SSH_PORTS[@]}"; do
+      [ "${p}" != 22 ] || has22=1
+    done
+    [ "${has22}" -eq 0 ] || port=22
+  fi
+  if [ "${port}" = 22 ]; then
+    printf 'ssh %s%s@campus-chime.local' "${*:+$* }" "${TARGET_USER}"
+  else
+    printf 'ssh -p %s %s%s@campus-chime.local' "${port}" "${*:+$* }" "${TARGET_USER}"
+  fi
+}
+
+# いま SSH でつながっている相手を CUR_PEERS に入れる（ループバックは除く）。調べられなければ、理由を
+# CUR_PEERS_WHY に入れて 1。SSH_PORTS が空なら 22。
+collect_ssh_peers() {
+  local out line peer cols=() filter p ports=("${SSH_PORTS[@]}")
+  CUR_PEERS=()
+  CUR_PEERS_WHY=""
+  [ "${#ports[@]}" -gt 0 ] || ports=(22)
+  if ! command -v ss > /dev/null 2>&1; then
+    CUR_PEERS_WHY="ss が見つかりません"
+    return 1
+  fi
+  filter="( sport = :${ports[0]}"
+  for p in "${ports[@]:1}"; do
+    filter+=" or sport = :${p}"
+  done
+  filter+=" )"
+  if ! out="$(ss -H -t -n state established "${filter}" 2>&1)"; then
+    CUR_PEERS_WHY="ss が失敗しました: ${out}"
+    return 1
+  fi
+  while IFS= read -r line; do
+    [ -n "${line}" ] || continue
+    read -r -a cols <<< "${line}"
+    peer="${cols[${#cols[@]} - 1]}"
+    peer="${peer%:*}"
+    peer="${peer#\[}"
+    peer="${peer%\]}"
+    peer="${peer%%\%*}"
+    peer="${peer#::ffff:}"
+    case "${peer}" in
+      127.* | ::1) continue ;;
+    esac
+    CUR_PEERS+=("${peer}")
+  done <<< "${out}"
+}
+
+# この画面を動かしているのが SSH 経由か（sshd の下にいる、または SSH の環境変数がある）。
+operator_on_ssh() {
+  if [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}${SSH_TTY:-}" ]; then
+    return 0
+  fi
+  session_start_epoch > /dev/null 2>&1
 }
 
 # AuthorizedKeysFile の書き方（%h・%u・%U・%%）を展開する。相対パスは利用者のホームから。
@@ -799,9 +1372,35 @@ path_is_safe() {
   fi
 }
 
+# ssh-keygen -l が括弧で示す鍵の種類 $1（ED25519・RSA など）を、sshd が受け付けるか。
+# 受け付ける署名の一覧（sshd -T の pubkeyacceptedalgorithms）が分からないとき（root でない）は、
+# OpenSSH 9.2 が既定で受け付けない DSA だけを除く。知らない種類は、sshd に任せて数える。
+key_type_usable() {
+  local want alg
+  case "$1" in
+    ED25519) want="ssh-ed25519" ;;
+    ED25519-SK) want="sk-ssh-ed25519@openssh.com" ;;
+    ECDSA) want="ecdsa-sha2-nistp256 ecdsa-sha2-nistp384 ecdsa-sha2-nistp521" ;;
+    ECDSA-SK) want="sk-ecdsa-sha2-nistp256@openssh.com" ;;
+    RSA) want="rsa-sha2-512 rsa-sha2-256 ssh-rsa" ;;
+    DSA) want="ssh-dss" ;;
+    *) return 0 ;;
+  esac
+  if [ -z "${SSH_ACCEPTED_ALGOS}" ]; then
+    [ "$1" != DSA ]
+    return
+  fi
+  for alg in ${want}; do
+    case ",${SSH_ACCEPTED_ALGOS}," in
+      *",${alg},"*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 # 鍵のファイル $1 を調べる（$2 が yes なら、/ からの各ディレクトリも）。使える鍵の数を SSH_KEY_COUNT に足す。
 check_key_file() {
-  local file="$1" strict="$2" dir out line count=0 info owner mode
+  local file="$1" strict="$2" dir out line count=0 info owner mode type
   if ! path_is_safe "${file}"; then
     refuse "${PATH_PROBLEM}。sshd はこの鍵を使いません（chmod go-w と chown で直してください）。"
     return 0
@@ -832,12 +1431,19 @@ check_key_file() {
     return 0
   fi
   while read -r line; do
-    if [ -n "${line}" ]; then
+    [ -n "${line}" ] || continue
+    type=""
+    if [[ "${line}" =~ \(([A-Za-z0-9-]+)\)[[:space:]]*$ ]]; then
+      type="${BASH_REMATCH[1]}"
+    fi
+    if key_type_usable "${type}"; then
       count=$((count + 1))
+    else
+      say "  ${file}: ${type} の鍵は、この sshd が受け付けないので数に入れません（鍵だけにすると、この鍵では入れません）。"
     fi
   done <<< "${out}"
   SSH_KEY_COUNT=$((SSH_KEY_COUNT + count))
-  say "  ${file}: 鍵が ${count} 本あります。"
+  say "  ${file}: 使える鍵が ${count} 本あります。"
 }
 
 print_key_howto() {
@@ -858,7 +1464,16 @@ MESSAGE
 check_other_accounts() {
   local all name uid home shell file others=() lacking=()
   SSH_ALLOW_USER="${TARGET_USER}"
-  all="$(getent passwd 2>/dev/null || true)"
+  # 一覧を取れないと、ほかのアカウントを見落として AllowUsers で締め出しかねない。
+  if ! all="$(getent passwd 2>/dev/null)" || [ -z "${all}" ]; then
+    if [ "${FORCE}" -eq 1 ]; then
+      warn "アカウントの一覧（getent passwd）を取れません。--force が付いているので、AllowUsers は書かずに進めます。"
+      SSH_ALLOW_USER=""
+    else
+      refuse "アカウントの一覧（getent passwd）を取れません。ほかにログインできるアカウントを見落とすと締め出すので止めます。承知のうえなら --force を付けてください。"
+    fi
+    return 0
+  fi
   while IFS=: read -r name _ uid _ _ home shell; do
     [ -n "${name}" ] || continue
     [ "${name}" != "${TARGET_USER}" ] || continue
@@ -906,10 +1521,12 @@ preflight_ssh() {
   if ! grep -Eiq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d' "${SYSROOT}${SSHD_MAIN}" 2>/dev/null; then
     refuse "${SSHD_MAIN} が /etc/ssh/sshd_config.d/ を読み込みません（Include がありません）。この設定ファイルは効かないので、手では ${SSHD_MAIN} を直す必要があります。"
   fi
+  SSH_ACCEPTED_ALGOS=""
   if [ "${IS_ROOT}" -eq 1 ]; then
     if cfg="$(sshd_effective 203.0.113.1)"; then
       akf="$(config_value "${cfg}" authorizedkeysfile || printf '%s' "${akf}")"
       strict="$(config_value "${cfg}" strictmodes || printf yes)"
+      SSH_ACCEPTED_ALGOS="$(config_value "${cfg}" pubkeyacceptedalgorithms || true)"
     else
       refuse "sshd の設定を読めません: ${cfg}"
       return 0
@@ -930,7 +1547,7 @@ preflight_ssh() {
     fi
   done
   if [ "${SSH_KEY_COUNT}" -eq 0 ]; then
-    refuse "${TARGET_USER} の使える公開鍵がありません。鍵だけにすると、誰も入れなくなります。"
+    refuse "${TARGET_USER} の使える公開鍵がありません（ssh-dss の鍵は OpenSSH 9.2 では使えません）。鍵だけにすると、誰も入れなくなります。"
     print_key_howto
   fi
   check_other_accounts
@@ -944,8 +1561,11 @@ preflight_ssh() {
 
   desired="$(ssh_dropin_content)"
   if step_done ssh && file_is "${SSHD_DROPIN}" 644 "${desired}"; then
-    if pending_has ssh; then
-      STEP_SKIP[ssh]="適用済みですが、まだ確定していません。別の端末で確かめて、sudo bash scripts/harden.sh --confirm を実行してください。"
+    if [ "${IS_ROOT}" -eq 1 ] && ! ssh_probe_all; then
+      # ファイルは同じでも、ほかの設定（別のドロップインや Match）で、パスワードログインが効いてしまっている。
+      warn "設定のファイルは適用済みと同じですが、sshd はまだ鍵だけになっていません: ${PROBE_WHY} もう一度適用します。"
+    elif pending_has ssh; then
+      STEP_SKIP[ssh]="適用済みですが、まだ確定していません。別の端末で確かめて、$(harden_cmd) --confirm を実行してください。"
     else
       STEP_SKIP[ssh]="すでに適用済みです。"
     fi
@@ -961,10 +1581,50 @@ apply_ssh() {
   put_file ssh "${SSHD_DROPIN}" 644 "${content}" || return 1
 }
 
+# 接続元 $1 から TARGET_USER が入るときの sshd の設定が、鍵だけ（パスワードなし・鍵あり）になっているか。
+# なっていなければ、理由を PROBE_WHY に入れて 1。
+ssh_probe_one() {
+  local addr="$1" out value key want
+  if ! out="$(sshd_effective "${addr}")"; then
+    PROBE_WHY="sshd -T が失敗しました（接続元 ${addr}）: ${out}"
+    return 1
+  fi
+  for key in passwordauthentication kbdinteractiveauthentication pubkeyauthentication; do
+    want=no
+    [ "${key}" != pubkeyauthentication ] || want=yes
+    value="$(config_value "${out}" "${key}" || true)"
+    if [ "${value}" != "${want}" ]; then
+      PROBE_WHY="接続元 ${addr} からの設定が ${key} ${value:-（なし）} のままです（Match ブロックや、設定の読み込み順が原因かもしれません）。"
+      return 1
+    fi
+  done
+}
+
+# 4 つの例の接続元と、いま SSH でつながっている相手（その人の PC に効く Match Address を見逃さないため）、
+# 防火壁で SSH を許す各ネットワークの代表のアドレスで、sshd の設定を確かめる。
+ssh_probe_all() {
+  local addr net seen=" "
+  PROBE_WHY=""
+  detect_ssh_ports || true
+  collect_ssh_peers || true
+  for addr in 203.0.113.1 10.0.0.1 192.168.1.1 172.16.0.1 "${CUR_PEERS[@]}"; do
+    [[ "${seen}" != *" ${addr} "* ]] || continue
+    seen+="${addr} "
+    ssh_probe_one "${addr}" || return 1
+  done
+  for net in "${FW_SSH_V4[@]}" "${FW_SSH_V6[@]}"; do
+    addr="$(cidr_tool first "${net}" 2> /dev/null || true)"
+    [ -n "${addr}" ] || continue
+    [[ "${seen}" != *" ${addr} "* ]] || continue
+    seen+="${addr} "
+    ssh_probe_one "${addr}" || return 1
+  done
+}
+
 verify_ssh() {
-  local addr out value key want
+  local out
   if [ "${DRY_RUN}" -eq 1 ]; then
-    plan "確認: sshd -t と、4 つの接続元（203.0.113.1・10.0.0.1・192.168.1.1・172.16.0.1）での sshd -T（passwordauthentication no など）"
+    plan "確認: sshd -t と、4 つの接続元（203.0.113.1・10.0.0.1・192.168.1.1・172.16.0.1）、いま SSH でつながっている相手、防火壁で許すネットワークでの sshd -T（passwordauthentication no など）"
     plan "実行: systemctl reload ssh（いまの接続は切れません）"
     return 0
   fi
@@ -972,21 +1632,10 @@ verify_ssh() {
     warn "sshd -t が失敗しました: ${out}"
     return 1
   fi
-  for addr in 203.0.113.1 10.0.0.1 192.168.1.1 172.16.0.1; do
-    if ! out="$(sshd_effective "${addr}")"; then
-      warn "sshd -T が失敗しました（接続元 ${addr}）: ${out}"
-      return 1
-    fi
-    for key in passwordauthentication kbdinteractiveauthentication pubkeyauthentication; do
-      want=no
-      [ "${key}" != pubkeyauthentication ] || want=yes
-      value="$(config_value "${out}" "${key}" || true)"
-      if [ "${value}" != "${want}" ]; then
-        warn "接続元 ${addr} からの設定が ${key} ${value:-（なし）} のままです（Match ブロックや、設定の読み込み順が原因かもしれません）。"
-        return 1
-      fi
-    done
-  done
+  if ! ssh_probe_all; then
+    warn "${PROBE_WHY}"
+    return 1
+  fi
   if unit_active ssh.service; then
     systemctl reload ssh || { warn "systemctl reload ssh が失敗しました。"; return 1; }
   else
@@ -996,18 +1645,30 @@ verify_ssh() {
   pending_set ssh "$(pending_window)" || return 1
 }
 
-rollback_ssh() {
-  local rc=0 out
-  restore_step_files ssh || rc=1
+# 設定のファイルを戻したあと、sshd が読み直す（sshd -t が通ったときだけ）。
+ssh_reload_after_restore() {
+  local out
   if command -v sshd > /dev/null 2>&1 && unit_active ssh.service; then
     if out="$(sshd -t 2>&1)"; then
-      systemctl reload ssh || { warn "systemctl reload ssh が失敗しました。"; rc=1; }
+      systemctl reload ssh || { warn "systemctl reload ssh が失敗しました。"; return 1; }
     else
       warn "元の設定に戻したあとの sshd -t が失敗しました（reload はしません）: ${out}"
-      rc=1
+      return 1
     fi
   fi
+}
+
+rollback_ssh() {
+  local rc=0
+  restore_step_files ssh || rc=1
+  ssh_reload_after_restore || rc=1
   return "${rc}"
+}
+
+# 確定した設定（confirmed/ssh）へ戻す。
+confirmed_restore_ssh() {
+  restore_confirmed_files ssh || return 1
+  ssh_reload_after_restore
 }
 
 # ---------------------------------------------------------------------------
@@ -1022,7 +1683,18 @@ FW_INSTALL_NFT=0
 OWN_V4=()
 OWN_V6=()
 
+# SSH を開けるポートの書き方（1 つなら 22、複数なら { 22, 2222 }）。
+fw_dport_expr() {
+  if [ "${#SSH_PORTS[@]}" -le 1 ]; then
+    printf '%s' "${SSH_PORTS[0]:-22}"
+  else
+    printf '{ %s }' "$(join_comma "${SSH_PORTS[@]}")"
+  fi
+}
+
 build_ruleset() {
+  local dport
+  dport="$(fw_dport_expr)"
   printf '%s\n' \
     "table ${FW_FAMILY} ${FW_TABLE_NAME}" \
     "delete table ${FW_FAMILY} ${FW_TABLE_NAME}" \
@@ -1053,10 +1725,10 @@ build_ruleset() {
     printf '%s\n' '    udp dport 5353 ip saddr @local_v4 accept'
   fi
   if [ "${#FW_SSH_V4[@]}" -gt 0 ]; then
-    printf '%s\n' '    tcp dport 22 ip saddr @ssh_v4 accept'
+    printf '    tcp dport %s ip saddr @ssh_v4 accept\n' "${dport}"
   fi
   if [ "${#FW_SSH_V6[@]}" -gt 0 ]; then
-    printf '%s\n' '    tcp dport 22 ip6 saddr @ssh_v6 accept'
+    printf '    tcp dport %s ip6 saddr @ssh_v6 accept\n' "${dport}"
   fi
   printf '%s\n' \
     '    fib daddr type { broadcast, multicast } drop' \
@@ -1134,41 +1806,26 @@ fw_parse_ssh_from() {
   done
 }
 
-# いま SSH でつながっている相手（ss の peer 列）が、許す範囲に入っているか。入っていないと、
-# 防火壁を入れた瞬間に切れる。
+# いま SSH でつながっている相手（ss の peer 列。sshd の全部のポートについて）が、許す範囲に入っているか。
+# 入っていないと、防火壁を入れた瞬間に切れる。--force は、自分自身が SSH でつないでいるとき
+# （この画面が sshd の下にあるとき）は効かない（自分の接続を切る確認を飛ばさせないため）。
 fw_check_ssh_peers() {
-  local out line peer cols=() allowed peers=() uncovered example
-  if ! command -v ss > /dev/null 2>&1; then
-    fw_peer_check_unavailable "ss が見つかりません"
+  local allowed uncovered example peer
+  if ! collect_ssh_peers; then
+    fw_peer_check_unavailable "${CUR_PEERS_WHY}"
     return 0
   fi
-  if ! out="$(ss -H -t -n state established '( sport = :22 )' 2>&1)"; then
-    fw_peer_check_unavailable "ss が失敗しました: ${out}"
-    return 0
-  fi
-  while IFS= read -r line; do
-    [ -n "${line}" ] || continue
-    read -r -a cols <<< "${line}"
-    peer="${cols[${#cols[@]} - 1]}"
-    peer="${peer%:*}"
-    peer="${peer#\[}"
-    peer="${peer%\]}"
-    peer="${peer%%\%*}"
-    peer="${peer#::ffff:}"
-    case "${peer}" in
-      127.* | ::1) continue ;;
-    esac
-    peers+=("${peer}")
-  done <<< "${out}"
-  [ "${#peers[@]}" -gt 0 ] || return 0
+  [ "${#CUR_PEERS[@]}" -gt 0 ] || return 0
   allowed="$(join_comma "${FW_SSH_V4[@]}" "${FW_SSH_V6[@]}")"
   allowed="${allowed// /}"
-  uncovered="$(cidr_tool uncovered "${allowed}" "${peers[@]}")" || { refuse "接続元の判定に失敗しました。"; return 0; }
+  uncovered="$(cidr_tool uncovered "${allowed}" "${CUR_PEERS[@]}")" || { refuse "接続元の判定に失敗しました。"; return 0; }
   while IFS= read -r peer; do
     [ -n "${peer}" ] || continue
     example="$(cidr_tool net24 "${peer}" 2>/dev/null || printf '%s' "${peer}")"
-    if [ "${FORCE}" -eq 1 ]; then
+    if [ "${FORCE}" -eq 1 ] && ! operator_on_ssh; then
       warn "いま SSH でつながっている ${peer} は、許す範囲に入っていません。--force が付いているので進めます（この接続は切れます）。"
+    elif [ "${FORCE}" -eq 1 ]; then
+      refuse "いま SSH でつながっている ${peer} は、許す範囲に入っていません。この画面も SSH でつないでいるので、このまま防火壁を入れるとこの接続が切れます（--force でも止めます）。--ssh-from ${example} を付けて、もう一度実行してください。"
     else
       refuse "いま SSH でつながっている ${peer} は、許す範囲に入っていません。このまま防火壁を入れると、この接続が切れます。--ssh-from ${example} を付けて、もう一度実行してください。"
     fi
@@ -1183,9 +1840,43 @@ fw_peer_check_unavailable() {
   fi
 }
 
-# 同じ入力に別の防火壁（input フックの base chain を持つ別の表）があると、重なって予想外の動きになる。
+# 別の表の表示 $1 に、入力を実際に止める・選り分ける base chain があるか。policy accept で規則が 1 つも
+# ない input の chain（Debian の標準の /etc/nftables.conf の空の骨組み）は、何も止めないので数えない。
+fw_input_chain_active() {
+  local line trimmed in_chain=0 policy=accept rules=0
+  while IFS= read -r line; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    if [ "${in_chain}" -eq 0 ]; then
+      if [[ "${trimmed}" == *"hook input"* ]]; then
+        in_chain=1
+        rules=0
+        policy=accept
+        if [[ "${trimmed}" =~ policy[[:space:]]+([a-z]+) ]]; then
+          policy="${BASH_REMATCH[1]}"
+        fi
+      fi
+    else
+      case "${trimmed}" in
+        "}"*)
+          in_chain=0
+          if [ "${policy}" != accept ] || [ "${rules}" -gt 0 ]; then
+            return 0
+          fi
+          ;;
+        "") ;;
+        *) rules=$((rules + 1)) ;;
+      esac
+    fi
+  done <<< "$1"
+  # 閉じていない（読み切れない）chain は、安全のため「止める」ものとして扱う。
+  [ "${in_chain}" -eq 0 ] || return 0
+  return 1
+}
+
+# 同じ入力に別の防火壁（input フックの base chain に規則か drop の policy を持つ別の表）があると、
+# 重なって予想外の動きになる。
 fw_check_other_tables() {
-  local tables family name body other_tables=""
+  local tables family name body other_tables="" harmless=""
   if ! tables="$(nft list tables 2>&1)"; then
     refuse "nft list tables が失敗しました: ${tables}"
     return 0
@@ -1197,9 +1888,16 @@ fw_check_other_tables() {
     fi
     body="$(nft list table "${family}" "${name}" 2>/dev/null || true)"
     if [[ "${body}" == *"hook input"* ]]; then
-      other_tables+=" ${family}/${name}"
+      if fw_input_chain_active "${body}"; then
+        other_tables+=" ${family}/${name}"
+      else
+        harmless+=" ${family}/${name}"
+      fi
     fi
   done <<< "${tables}"
+  if [ -n "${harmless}" ]; then
+    say "  ${harmless# } は入力の chain が policy accept で規則が無い空の表（Debian の標準の骨組み）なので、何も止めません。そのまま進めます。"
+  fi
   [ -n "${other_tables}" ] || return 0
   say "  いまの nft の表:" >&2
   printf '%s\n' "${tables}" | sed 's/^/    /' >&2
@@ -1259,6 +1957,18 @@ preflight_firewall() {
   else
     say "  SSH を許す範囲（--ssh-from）: ${FW_SSH_V4[*]} ${FW_SSH_V6[*]}"
   fi
+  # 開けるポートは、sshd が実際に待ち受けているもの（22 とは限らない）。
+  if ! detect_ssh_ports; then
+    SSH_PORTS=(22)
+    if [ "${FORCE}" -eq 1 ]; then
+      warn "sshd が待ち受けるポートを調べられません（sshd -T / ssh.socket）。--force が付いているので、22 だけを開けます。"
+    else
+      refuse "sshd が待ち受けるポートを調べられません（sshd -T / ssh.socket）。開けるポートが分からないまま防火壁を入れると、新しい SSH 接続が切れるので止めます。承知のうえなら --force を付けてください（22 だけを開けます）。"
+    fi
+  elif [ -n "${SSH_PORTS_NOTE}" ]; then
+    say "  ${SSH_PORTS_NOTE}"
+  fi
+  say "  SSH を開けるポート: ${SSH_PORTS[*]}"
   fw_check_ssh_peers
 
   FW_RULESET="$(build_ruleset)"
@@ -1270,11 +1980,16 @@ preflight_firewall() {
   if [ "${PRE_FAIL}" -eq 0 ] && step_done firewall && nft list table "${FW_FAMILY}" "${FW_TABLE_NAME}" > /dev/null 2>&1; then
     if pending_has firewall; then
       if file_is "${STATE_REAL}/firewall.nft" 600 "${FW_RULESET}"; then
-        STEP_SKIP[firewall]="適用済みですが、まだ確定していません。別の端末で確かめて、sudo bash scripts/harden.sh --confirm を実行してください。"
+        STEP_SKIP[firewall]="適用済みですが、まだ確定していません。別の端末で確かめて、$(harden_cmd) --confirm を実行してください。"
       fi
     elif [ "$(meta_get "${STATE_DIR}/applied/firewall" persisted 2>/dev/null || true)" = 1 ] \
       && file_is "${FW_NFT_FILE}" 644 "${FW_RULESET}" && file_is "${FW_UNIT}" 644 "$(fw_unit_content)"; then
-      STEP_SKIP[firewall]="すでに適用済みです。"
+      # 再起動のあとも防火壁が入るには、永続化のユニットが有効でなければならない。
+      if [ "$(unit_enabled_state campus-chime-firewall.service)" = enabled ]; then
+        STEP_SKIP[firewall]="すでに適用済みです。"
+      else
+        warn "防火壁の設定は適用済みと同じですが、campus-chime-firewall.service が有効になっていません（再起動すると防火壁が消えます）。もう一度適用します。"
+      fi
     fi
   fi
 }
@@ -1282,11 +1997,13 @@ preflight_firewall() {
 apply_firewall() {
   local work="${STATE_DIR}/firewall.nft"
   if [ "${FW_INSTALL_NFT}" -eq 1 ]; then
-    ensure_idle || return 1
-    sys apt-get install -y nftables || { warn "nftables を入れられませんでした。"; return 1; }
+    ensure_idle "${LOOKAHEAD_MINUTES}" || return 1
+    # 入れる前に記録する（入れた直後に止められても、入れたと分かるように）。
     if [ "${DRY_RUN}" -eq 0 ]; then
       record_first firewall installed_nft 1 || return 1
     fi
+    apt_refresh
+    sys apt-get install -y nftables || { warn "nftables を入れられませんでした。"; apt_install_hint; return 1; }
   fi
   if [ "${DRY_RUN}" -eq 1 ]; then
     plan_file "${FW_NFT_FILE}（確定したときに書く。それまでは ${STATE_REAL}/firewall.nft）" 644 "${FW_RULESET}"
@@ -1327,6 +2044,11 @@ persist_firewall() {
     warn "防火壁の表がいま読み込まれていません。"
     return 2
   fi
+  # 適用が最後まで終わっていない（途中で止められた）と、下書きは、読み込んで確かめたルールとは限らない。
+  if ! step_done firewall; then
+    warn "防火壁の適用が最後まで終わっていません（途中で止められたようです）。いま読み込まれている表と下書きが同じとは限らないので、確定しません。"
+    return 2
+  fi
   boot_now="$(cat "${PROC_DIR}/sys/kernel/random/boot_id" 2>/dev/null || true)"
   boot_then="$(meta_get "${STATE_DIR}/applied/firewall" boot_id 2>/dev/null || true)"
   if [ -z "${boot_now}" ] || [ "${boot_now}" != "${boot_then}" ]; then
@@ -1340,6 +2062,26 @@ persist_firewall() {
   systemctl daemon-reload || return 1
   systemctl enable campus-chime-firewall.service || return 1
   meta_set "${STATE_DIR}/applied/firewall" persisted 1 || return 1
+}
+
+# 確定した防火壁（confirmed/firewall）へ戻す: ファイルとユニットを確定した版にして、その表を読み込み直す
+# （この版は確定済みなので、下書きもこれにそろえる）。
+confirmed_restore_firewall() {
+  local out file="${SYSROOT}${FW_NFT_FILE}"
+  restore_confirmed_files firewall || return 1
+  systemctl daemon-reload || return 1
+  systemctl enable campus-chime-firewall.service || return 1
+  nft -c -f "${file}" || { warn "確定した防火壁のルールを nft が受け付けません。"; return 1; }
+  nft -f "${file}" || { warn "確定した防火壁を読み込み直せませんでした。"; return 1; }
+  if ! out="$(nft list table "${FW_FAMILY}" "${FW_TABLE_NAME}" 2>&1)"; then
+    warn "確定した防火壁を読み込んだのに、表が見つかりません: ${out}"
+    return 1
+  fi
+  if [[ "${out}" != *"hook input"* ]] || [[ "${out}" != *"policy drop"* ]]; then
+    warn "確定した防火壁の表に、入力の drop が見つかりません。"
+    return 1
+  fi
+  write_atomic "${STATE_DIR}/firewall.nft" 600 "$(cat "${file}")" || return 1
 }
 
 rollback_firewall() {
@@ -1489,6 +2231,8 @@ preflight_sudo() {
     return 0
   fi
   say "  外す対象: ${SUDO_FILES[*]:-（なし）}"
+  say "  ${TARGET_USER} のパスワードを知っていることを確かめてください（知らないと、外したあと sudo を使えません）。"
+  say "  外している間は ${SUDO_WINDOW} 分の安全網（確定待ち）を張ります。パスワードを確かめられなかったとき（Ctrl-C・回線切れ・強制終了を含む）は、元に戻します。"
 }
 
 apply_sudo() {
@@ -1496,6 +2240,9 @@ apply_sudo() {
   if [ "${DRY_RUN}" -eq 1 ] && [ "${IS_ROOT}" -eq 0 ]; then
     plan "root で、/etc/sudoers.d/ の中の ${TARGET_USER} 専用の NOPASSWD ファイルを、控えを取ってから外す"
   fi
+  # 先に安全網を張る: 確定待ち（${SUDO_WINDOW} 分）と自動復元の時計。外したあとにプロセスが消えても
+  # （kill -9・電源断・回線切れ）、時計が NOPASSWD のファイルを戻す。
+  arm_for sudo "${SUDO_WINDOW}" || return 1
   for f in "${SUDO_FILES[@]}"; do
     del_file sudo "${f}" || return 1
   done
@@ -1509,7 +2256,7 @@ verify_sudo() {
     plan "確認: runuser -u ${TARGET_USER} -- sudo -k、sudo -n -v（パスワードが要ること）、sudo -v（パスワードを入力）"
     return 0
   fi
-  say "sudo がパスワードを求めることを確かめます。${TARGET_USER} のパスワードを入力してください。"
+  say "sudo がパスワードを求めることを確かめます。${TARGET_USER} のパスワードを入力してください（${SUDO_WINDOW} 分以内。入力しない・間違える・Ctrl-C のときは、NOPASSWD の設定を元に戻します）。"
   runuser -u "${TARGET_USER}" -- sudo -k || true
   if runuser -u "${TARGET_USER}" -- sudo -n -v > /dev/null 2>&1; then
     warn "パスワードなしで sudo が通ってしまいます（NOPASSWD の規則がほかにも残っています）。"
@@ -1520,6 +2267,10 @@ verify_sudo() {
     return 1
   fi
   runuser -u "${TARGET_USER}" -- sudo -k || true
+  # パスワードを確かめられた。安全網（sudo の確定待ち）だけを外す。ssh・firewall の確定待ちと時計は
+  # そのまま残す（確定待ちが空になったときだけ、時計を片づける）。
+  pending_remove sudo || { warn "sudo の確定待ちの記録を消せません。"; return 1; }
+  settle_revert || true
 }
 
 rollback_sudo() {
@@ -1573,6 +2324,11 @@ preflight_services() {
       SVC_PRESENT+=("${unit}")
       SVC_ENABLED["${unit}"]="$(unit_enabled_state "${unit}")"
       SVC_ACTIVE["${unit}"]="$(unit_state "${unit}")"
+      if [ -z "${SVC_ENABLED[${unit}]}" ] || [ -z "${SVC_ACTIVE[${unit}]}" ]; then
+        # 元の状態を調べられないまま止めると、戻すときに元どおりにできない。
+        refuse "${unit} の状態を調べられません（systemctl is-enabled / is-active が答えませんでした）。元の状態を控えられないので止めます。もう一度実行してください。"
+        continue
+      fi
       say "  ${unit}: ${SVC_ENABLED[${unit}]}、${SVC_ACTIVE[${unit}]}"
       if [ "${SVC_ENABLED[${unit}]}" != masked ] || [ "${SVC_ACTIVE[${unit}]}" = active ]; then
         all_done=0
@@ -1629,8 +2385,9 @@ rollback_services() {
   local rc=0 unit file was_enabled was_active
   file="${STATE_DIR}/applied/services"
   for unit in "${SERVICES_UNITS[@]}"; do
+    # 控えがあれば、中身が空でも戻す（unmask だけは必ず行う）。
+    meta_get "${file}" "unit.${unit}.enabled" > /dev/null 2>&1 || continue
     was_enabled="$(meta_get "${file}" "unit.${unit}.enabled" 2>/dev/null || true)"
-    [ -n "${was_enabled}" ] || continue
     was_active="$(meta_get "${file}" "unit.${unit}.active" 2>/dev/null || true)"
     systemctl unmask "${unit}" || { warn "${unit} の mask を外せませんでした。"; rc=1; continue; }
     if [ "${was_enabled}" = enabled ]; then
@@ -1747,7 +2504,7 @@ updates_collect_patterns() {
   local policy line rest part o l n expr pattern parts=()
   local -A seen=()
   UPD_PATTERNS=()
-  if ! policy="$(apt-cache policy 2>&1)"; then
+  if ! policy="$(apt_read apt-cache policy 2>&1)"; then
     refuse "apt-cache policy が失敗しました: ${policy}"
     return 0
   fi
@@ -1793,9 +2550,51 @@ updates_collect_patterns() {
   done <<< "${policy}"
 }
 
+# apt のタイマーは OS の時間帯で動く（OnCalendar）。放送の時間帯（設定の timezone）と OS の時間帯が違うと、
+# 5:00 に動かすつもりが放送の時間帯（9:55〜17:05）に入りうる（OS が UTC なら 14:00）。時間帯が同じこと、
+# 設定の放送が 04:30〜06:30（タイマーの動く 5:00〜6:00 ごろの前後）に無いことを確かめる。
+updates_check_timing() {
+  local chime_tz os_tz found rc=0
+  load_chime_config || rc=$?
+  if [ "${rc}" -eq 2 ]; then
+    say "  （root でも ${TARGET_USER} でもないので、放送の設定を読めません。時間帯と放送の時刻の確認は、実際の実行のときに行います）"
+    return 0
+  fi
+  if [ "${rc}" -ne 0 ] || ! chime_tz="$(chime_timezone)"; then
+    timing_problem "放送の設定（campus_chime.py --print-config の timezone）を読めないので、apt のタイマー（5:00〜6:00 ごろ）が放送の時間帯と重ならないか確かめられません。"
+    return 0
+  fi
+  if ! command -v timedatectl > /dev/null 2>&1 || ! os_tz="$(timedatectl show -p Timezone --value 2> /dev/null)" || [ -z "${os_tz}" ]; then
+    timing_problem "OS の時間帯（timedatectl show -p Timezone）を調べられないので、apt のタイマーが放送の時間帯と重ならないか確かめられません。"
+    return 0
+  fi
+  if [ "${os_tz}" != "${chime_tz}" ] && ! python3 -I -c "${CFG_PY}" same "${os_tz}" "${chime_tz}" 2> /dev/null; then
+    timing_problem "OS の時間帯（${os_tz}）が、放送の時間帯（${chime_tz}）と違います。apt のタイマーは OS の時間帯で動くので、5:00 のつもりが放送の時間帯に入ることがあります（UTC なら 14:00 です）。sudo timedatectl set-timezone ${chime_tz} を実行してから、もう一度実行してください。"
+    return 0
+  fi
+  if ! found="$(printf '%s' "${CHIME_CONFIG_JSON}" | python3 -I -c "${CFG_PY}" quiet 2> /dev/null)"; then
+    timing_problem "放送の設定（schedule）から放送の時刻を読み取れません。"
+    return 0
+  fi
+  if [ -n "${found}" ]; then
+    timing_problem "放送の予定（$(printf '%s' "${found}" | tr '\n' ' ' | sed 's/ $//')）が、apt のタイマーの動く時間（5:00〜6:00 ごろ）の前後（4:30〜6:30）にあります。apt の更新が放送とぶつかります。"
+    return 0
+  fi
+  say "  OS の時間帯は放送と同じ（${chime_tz}）で、4:30〜6:30 に放送はありません。タイマーの 5:00〜6:00 ごろは安全です。"
+}
+
+timing_problem() {
+  if [ "${FORCE}" -eq 1 ]; then
+    warn "$1 --force が付いているので、このまま進めます。"
+  else
+    refuse "$1 承知のうえなら --force を付けてください。"
+  fi
+}
+
 preflight_updates() {
   local unit
   log "確認: updates"
+  updates_check_timing
   updates_collect_patterns
   if [ "${#UPD_PATTERNS[@]}" -eq 0 ]; then
     refuse "apt の配布元（apt-cache policy の release 行）から、自動更新の対象を見つけられません。ネットワークと /etc/apt/sources.list を確かめてください。"
@@ -1823,12 +2622,14 @@ preflight_updates() {
 }
 
 apply_updates() {
-  ensure_idle || return 1
+  ensure_idle "${LOOKAHEAD_MINUTES}" || return 1
   if [ "${UPD_INSTALL}" -eq 1 ]; then
-    sys apt-get install -y unattended-upgrades || { warn "unattended-upgrades を入れられませんでした。"; return 1; }
+    # 入れる前に記録する（入れた直後に止められても、戻すときに入れたと分かるように）。
     if [ "${DRY_RUN}" -eq 0 ]; then
       record_first updates installed_by_us 1 || return 1
     fi
+    apt_refresh
+    sys apt-get install -y unattended-upgrades || { warn "unattended-upgrades を入れられませんでした。"; apt_install_hint; return 1; }
   fi
   put_file updates "${APT_UPGRADES_CONF}" 644 "$(updates_conf_content)" || return 1
   put_file updates "${APT_PERIODIC_CONF}" 644 "$(updates_periodic_content)" || return 1
@@ -1873,13 +2674,13 @@ verify_updates() {
   systemctl list-timers 'apt-daily*' --no-pager || true
 }
 
-# 戻すときに放送を待つのは手で戻すときだけ（自動復元では待たない）。
+# 戻すときに放送を待つのは手で戻すときだけ（自動復元では待たない）。$1 は、次の放送まで空ける分数。
 ROLLBACK_IDLE=1
 rollback_idle() {
   if [ "${ROLLBACK_IDLE}" -eq 0 ]; then
     return 0
   fi
-  ensure_idle
+  ensure_idle "${1:-0}"
 }
 
 rollback_updates() {
@@ -1887,8 +2688,9 @@ rollback_updates() {
   restore_step_files updates || rc=1
   systemctl daemon-reload || rc=1
   systemctl restart apt-daily.timer apt-daily-upgrade.timer || rc=1
-  if [ "$(meta_get "${STATE_DIR}/applied/updates" installed_by_us 2>/dev/null || true)" = 1 ]; then
-    if rollback_idle; then
+  # 入れる前に記録するので、実際には入っていないこともある（入っていなければ何もしない）。
+  if [ "$(meta_get "${STATE_DIR}/applied/updates" installed_by_us 2>/dev/null || true)" = 1 ] && pkg_installed unattended-upgrades; then
+    if rollback_idle "${LOOKAHEAD_MINUTES}"; then
       apt-get purge -y unattended-upgrades || { warn "unattended-upgrades を削除できませんでした。"; rc=1; }
     else
       rc=1
@@ -1908,7 +2710,8 @@ ANALYZE_BASE_RC=0
 SCORE_BEFORE=""
 
 # 設定（--print-config の JSON）から、サービスが書く場所のディレクトリを 1 行ずつ表示する。
-# 相対パスはリポジトリからの相対。
+# chime/config.py の Config.resolve と同じ解き方: まず ~ を展開し（HOME は呼ぶ側が、サービスの利用者の
+# ホームにして渡す）、相対パスはリポジトリからの相対。
 DIRS_PY='
 import json
 import os
@@ -1932,7 +2735,11 @@ for keys, is_dir in ((("state", "file"), False), (("state", "history_file"), Fal
     value = pick(*keys)
     if value is None:
         continue
-    path = os.path.normpath(value if os.path.isabs(value) else os.path.join(repo, value))
+    expanded = os.path.expanduser(value)
+    path = os.path.normpath(expanded if os.path.isabs(expanded) else os.path.join(repo, expanded))
+    if path.startswith("//"):
+        # POSIX は先頭の // を残す（normpath しても //home/pi のまま）。/ 1 つにそろえる。
+        path = "/" + path.lstrip("/")
     directory = path if is_dir else os.path.dirname(path)
     if directory not in seen:
         seen.append(directory)
@@ -1976,41 +2783,61 @@ build_sandbox_props() {
   )
 }
 
+# ドロップインの中身。ユニットファイルでは % が指定子（%t など）として展開されるので、パスの % は %% と書く
+# （systemd-run -p に渡す値は展開されないので、SANDBOX_PROPS そのものは直さない）。
 service_dropin_content() {
+  local prop lines=()
+  for prop in "${SANDBOX_PROPS[@]}"; do
+    case "${prop}" in
+      ReadWritePaths=*) lines+=("${prop//\%/%%}") ;;
+      *) lines+=("${prop}") ;;
+    esac
+  done
   printf '%s\n' \
     '# scripts/harden.sh service が作成（元に戻す: sudo bash scripts/harden.sh --rollback service）' \
     '[Service]' \
-    "${SANDBOX_PROPS[@]}"
+    "${lines[@]}"
 }
 
-# 利用者 TARGET_USER として実行する（root なら runuser。その利用者本人なら、そのまま）。
-as_user() {
-  if [ "${IS_ROOT}" -eq 1 ]; then
-    runuser -u "${TARGET_USER}" -- "$@"
-  else
-    "$@"
+# ディレクトリ $1 を ${TARGET_USER} が作れるか。無ければ、いちばん近い既存の親に書けるかを調べる。
+# 作れなければ、そのとおりに直す方法つきで事前の確認の問題にする。
+service_check_creatable() {
+  local dir="$1" parent="$1"
+  if [ -d "${dir}" ]; then
+    if ! as_user test -w "${dir}"; then
+      warn "書き込み先 ${dir} には、${TARGET_USER} が書き込めません。サービスが状態を保存できません（sudo chown -R ${TARGET_USER}:${TARGET_USER} $(printf '%q' "${dir}") で直せます）。"
+    fi
+    return 0
+  fi
+  while [ -n "${parent}" ] && [ ! -d "${parent}" ]; do
+    parent="${parent%/*}"
+  done
+  [ -n "${parent}" ] || parent=/
+  if ! as_user test -w "${parent}"; then
+    refuse "書き込み先 ${dir} を、${TARGET_USER} は作れません（${parent} に書き込めません）。次を実行してから、もう一度実行してください: sudo mkdir -p $(printf '%q' "${dir}") && sudo chown ${TARGET_USER}:${TARGET_USER} $(printf '%q' "${dir}")"
   fi
 }
 
 # 書き込み先のディレクトリを求める。求められなければ事前の確認の問題にする。
 service_collect_dirs() {
-  local json dirs dir
+  local dirs dir rc=0 real real_home broad cand
   SVC_RW_DIRS=()
   if [ ! -f "${REPO_DIR}/campus_chime.py" ]; then
     refuse "campus_chime.py が見つかりません（${REPO_DIR}）。設定から書き込み先を求められません。"
     return 0
   fi
-  if [ "${IS_ROOT}" -eq 0 ] && [ "$(id -un 2>/dev/null)" != "${TARGET_USER}" ]; then
+  load_chime_config || rc=$?
+  if [ "${rc}" -eq 2 ]; then
     # --dry-run だけ。root でも ${TARGET_USER} 本人でもないと、設定を読めない。
     say "  （root でも ${TARGET_USER} でもないので、設定を読めません。書き込み先は、実際の実行のときに求めます）"
     SVC_RW_DIRS=("<設定の書き込み先>")
     return 0
   fi
-  if ! json="$(as_user python3 "${REPO_DIR}/campus_chime.py" --print-config 2>/dev/null)"; then
+  if [ "${rc}" -ne 0 ]; then
     refuse "設定を読めません（campus_chime.py --print-config が失敗）。config.json を直してから、もう一度実行してください。"
     return 0
   fi
-  if ! dirs="$(printf '%s' "${json}" | python3 -I -c "${DIRS_PY}" "${REPO_DIR}" 2>/dev/null)"; then
+  if ! dirs="$(printf '%s' "${CHIME_CONFIG_JSON}" | HOME="${USER_HOME}" python3 -I -c "${DIRS_PY}" "${REPO_DIR}" 2>/dev/null)"; then
     refuse "設定の JSON から書き込み先を求められません。"
     return 0
   fi
@@ -2023,13 +2850,26 @@ service_collect_dirs() {
         continue
         ;;
     esac
+    # 広すぎる場所か。シンボリックリンクの先（realpath）も同じ基準で見る。
+    real="$(realpath -m -- "${dir}" 2> /dev/null || printf '%s' "${dir}")"
+    real_home="$(realpath -m -- "${USER_HOME}" 2> /dev/null || printf '%s' "${USER_HOME}")"
+    broad=0
+    for cand in "${dir}" "${real}"; do
+      case "${cand}" in
+        / | /etc | /usr | /var | /home | "${USER_HOME}" | "${real_home}") broad=1 ;;
+      esac
+    done
+    if [ "${broad}" -eq 1 ]; then
+      refuse "設定の書き込み先 ${dir} は広すぎます。サービスに書かせてはいけない場所なので、config.json のパス（state・tts.cache_dir・time_signal.output_file）を直してください。"
+      continue
+    fi
     case "${dir}" in
-      / | /etc | /usr | /var | /home | "${USER_HOME}")
-        refuse "設定の書き込み先 ${dir} は広すぎます。サービスに書かせてはいけない場所なので、config.json のパス（state・tts.cache_dir・time_signal.output_file）を直してください。"
-        continue
-        ;;
       *[[:space:]]*)
         refuse "設定の書き込み先 ${dir} に空白があります。systemd の設定に安全に書けないので、空白のないパスにしてください。"
+        continue
+        ;;
+      *'$'* | *\\*)
+        refuse "設定の書き込み先 ${dir} に \$ か \\ があります。systemd の設定に安全に書けないので、使わないパスにしてください。"
         continue
         ;;
     esac
@@ -2040,6 +2880,7 @@ service_collect_dirs() {
       "${REPO_DIR}"/*) ;;
       *) warn "書き込み先 ${dir} はリポジトリの外です。サービスに書き込みを許します。" ;;
     esac
+    service_check_creatable "${dir}"
     SVC_RW_DIRS+=("${dir}")
   done <<< "${dirs}"
   if [ "${#SVC_RW_DIRS[@]}" -eq 0 ]; then
@@ -2059,6 +2900,36 @@ analyze_score() {
   printf '（取得できません）'
 }
 
+# ディレクトリ $1 と $2 が同じ場所か（末尾の / や、シンボリックリンク経由の違いは同じとみなす）。
+same_dir() {
+  local a="${1%/}" b="${2%/}"
+  [ "${a}" = "${b}" ] && return 0
+  [ "$(realpath -m "${a}" 2> /dev/null)" = "$(realpath -m "${b}" 2> /dev/null)" ]
+}
+
+# 入っているユニットが動かす場所（WorkingDirectory と ExecStart の campus_chime.py）が、このスクリプトのある
+# リポジトリと同じか。違うと、書き込み先を違う config.json から求めてしまい、本当の書き込み先を許せない。
+service_check_unit_location() {
+  local unit_file="$1" line wd="" exec_dir="" word
+  while IFS= read -r line || [ -n "${line}" ]; do
+    case "${line}" in
+      WorkingDirectory=*) wd="${line#WorkingDirectory=}"; wd="${wd#-}" ;;
+      ExecStart=*)
+        for word in ${line#ExecStart=}; do
+          case "${word}" in
+            */campus_chime.py) exec_dir="${word%/campus_chime.py}" ;;
+          esac
+        done
+        ;;
+    esac
+  done < "${unit_file}"
+  if [ -n "${wd}" ] && ! same_dir "${wd}" "${REPO_DIR}"; then
+    refuse "${SERVICE_NAME} は ${wd} で動いていますが、このスクリプトは ${REPO_DIR} にあります。書き込み先は、動いているほうの config.json から求める必要があります。${wd}/scripts/harden.sh を使ってください。"
+  elif [ -n "${exec_dir}" ] && ! same_dir "${exec_dir}" "${REPO_DIR}"; then
+    refuse "${SERVICE_NAME} は ${exec_dir}/campus_chime.py を動かしますが、このスクリプトは ${REPO_DIR} にあります。${exec_dir}/scripts/harden.sh を使ってください。"
+  fi
+}
+
 preflight_service() {
   local unit_file="${SYSROOT}/etc/systemd/system/${SERVICE_NAME}" line unit_user=""
   log "確認: service"
@@ -2074,6 +2945,7 @@ preflight_service() {
     if [ -n "${unit_user}" ] && [ "${unit_user}" != "${TARGET_USER}" ]; then
       refuse "${SERVICE_NAME} は ${unit_user} で動きますが、--user は ${TARGET_USER} です。書き込み先の持ち主が合わなくなるので、--user ${unit_user} を付けてください。"
     fi
+    service_check_unit_location "${unit_file}"
   fi
   if ! command -v systemd-analyze > /dev/null 2>&1; then
     refuse "systemd-analyze が見つかりません。"
@@ -2106,8 +2978,9 @@ make_user_dir() {
   if [ -n "${parent}" ]; then
     make_user_dir "${parent}" || return 1
   fi
-  runuser -u "${TARGET_USER}" -- mkdir -p "${dir}" || { warn "${dir} を作れませんでした。"; return 1; }
+  # 作る前に記録する（作った直後に止められても、戻すときに消せるように。無ければ戻すとき何もしない）。
   record_created service r "${dir}" || return 1
+  runuser -u "${TARGET_USER}" -- mkdir -p "${dir}" || { warn "${dir} を作れませんでした。"; return 1; }
 }
 
 apply_service() {
@@ -2122,7 +2995,8 @@ apply_service() {
 
 verify_service() {
   local out out_rc=0 line since problems="" score_after
-  local bad_re='Unknown key name|Unknown lvalue|Unknown section|Failed to parse|Invalid'
+  local dir
+  local bad_re='Unknown |ignoring|Failed to parse|Failed to resolve|Invalid'
   if [ "${DRY_RUN}" -eq 1 ]; then
     plan "確認: systemd-analyze verify ${SERVICE_NAME}（知らない項目の警告があれば失敗）"
     ensure_idle
@@ -2147,6 +3021,10 @@ verify_service() {
     return 1
   fi
   ensure_idle || return 1
+  # 再起動の前に、書き込み先が全部あることを確かめる（無いディレクトリは、保護の下ではサービスが作れない）。
+  for dir in "${SVC_RW_DIRS[@]}"; do
+    make_user_dir "${dir}" || return 1
+  done
   systemctl daemon-reload || { warn "systemctl daemon-reload が失敗しました。"; return 1; }
   now
   since="${NOW}"
@@ -2203,9 +3081,9 @@ run_test_sound() {
     -p SupplementaryGroups=audio -p "WorkingDirectory=${REPO_DIR}" \
     -p Environment=SDL_AUDIODRIVER=alsa -p Environment=PYTHONUNBUFFERED=1 -p NoNewPrivileges=yes \
     "${args[@]}" /usr/bin/python3 "${REPO_DIR}/campus_chime.py" --test-hourly 12; then
-    say "終わりました（終了コード 0）。音が出たかを確かめてください。出なければ、sudo bash scripts/harden.sh --rollback service で戻せます。"
+    say "終わりました（終了コード 0）。音が出たかを確かめてください。出なければ、$(harden_cmd) --rollback service で戻せます。"
   else
-    warn "時報の再生が失敗しました（終了コード $?）。保護の設定が合わない可能性があります。sudo bash scripts/harden.sh --rollback service で戻せます。"
+    warn "時報の再生が失敗しました（終了コード $?）。保護の設定が合わない可能性があります。$(harden_cmd) --rollback service で戻せます。"
     return 1
   fi
 }
@@ -2220,6 +3098,26 @@ run_test_sound() {
 
 NTP_SERVERS_EFFECTIVE=()
 NTP_INSTALL=0
+NTP_REPLACES_TIMESYNCD=0
+NTP_OTHER_REMOVALS=()
+
+# apt-get -s install chrony の出力 $1 を読む。systemd-timesyncd が削除されるなら NTP_REPLACES_TIMESYNCD=1
+# （戻すときに入れ直す。入っているかを別に調べない。調べそこなって控えそこなわないため）、それ以外が
+# 削除されるなら NTP_OTHER_REMOVALS に入れる。
+ntp_parse_plan() {
+  local word pkg
+  NTP_REPLACES_TIMESYNCD=0
+  NTP_OTHER_REMOVALS=()
+  while read -r word pkg _; do
+    if [ "${word}" = Remv ]; then
+      if [ "${pkg}" = systemd-timesyncd ]; then
+        NTP_REPLACES_TIMESYNCD=1
+      else
+        NTP_OTHER_REMOVALS+=("${pkg}")
+      fi
+    fi
+  done <<< "$1"
+}
 
 # timesyncd の NTP= を（本体の設定と timesyncd.conf.d/*.conf の順に）読んで 1 行ずつ表示する。
 # 空の代入は、それまでの分を消す。
@@ -2267,10 +3165,11 @@ ntp_sources_content() {
 }
 
 preflight_ntp() {
-  local host sim_out word pkg others=() carried="" chrony_ready=0
+  local host sim_out carried="" chrony_ready=0
   log "確認: ntp"
   NTP_SERVERS_EFFECTIVE=()
   NTP_INSTALL=0
+  NTP_REPLACES_TIMESYNCD=0
   if pkg_installed chrony && unit_active chrony.service; then
     chrony_ready=1
   fi
@@ -2306,31 +3205,43 @@ preflight_ntp() {
     return 0
   fi
   NTP_INSTALL=1
-  if ! sim_out="$(apt-get -s install chrony 2>&1)"; then
+  if ! sim_out="$(apt_read apt-get -s install chrony 2>&1)"; then
     refuse "apt-get -s install chrony（試しの実行）が失敗しました: ${sim_out}"
     return 0
   fi
-  while read -r word pkg _; do
-    if [ "${word}" = Remv ] && [ "${pkg}" != systemd-timesyncd ]; then
-      others+=("${pkg}")
-    fi
-  done <<< "${sim_out}"
-  if [ "${#others[@]}" -gt 0 ]; then
-    refuse "chrony を入れると、systemd-timesyncd 以外のパッケージ（${others[*]}）も削除されます。apt の計画: ${sim_out//$'\n'/ ; }"
+  ntp_parse_plan "${sim_out}"
+  if [ "${#NTP_OTHER_REMOVALS[@]}" -gt 0 ]; then
+    refuse "chrony を入れると、systemd-timesyncd 以外のパッケージ（${NTP_OTHER_REMOVALS[*]}）も削除されます。apt の計画: ${sim_out//$'\n'/ ; }"
+  fi
+}
+
+# 事前の確認の試しの実行は、古い一覧のままだったかもしれない。一覧を新しくしたあとにもう一度試して、
+# systemd-timesyncd 以外が削除されるなら、入れずに止める。
+ntp_recheck_plan() {
+  local sim_out
+  [ "${DRY_RUN}" -eq 0 ] || return 0
+  if ! sim_out="$(apt_read apt-get -s install chrony 2>&1)"; then
+    warn "一覧を新しくしたあとの apt-get -s install chrony（試しの実行）が失敗しました: ${sim_out}"
+    apt_install_hint
+    return 1
+  fi
+  ntp_parse_plan "${sim_out}"
+  if [ "${#NTP_OTHER_REMOVALS[@]}" -gt 0 ]; then
+    warn "一覧を新しくしたら、chrony を入れると systemd-timesyncd 以外のパッケージ（${NTP_OTHER_REMOVALS[*]}）も削除されると分かりました。入れずに止めます。"
+    return 1
   fi
 }
 
 apply_ntp() {
-  local replaced=0 i
-  ensure_idle || return 1
+  local i
+  ensure_idle "${LOOKAHEAD_MINUTES}" || return 1
   if [ "${NTP_INSTALL}" -eq 1 ]; then
-    if pkg_installed systemd-timesyncd; then
-      replaced=1
-    fi
-    if [ "${DRY_RUN}" -eq 0 ] && [ "${replaced}" -eq 1 ]; then
+    if [ "${DRY_RUN}" -eq 0 ] && [ "${NTP_REPLACES_TIMESYNCD}" -eq 1 ]; then
       record_first ntp replaced_timesyncd 1 || return 1
     fi
-    sys apt-get install -y chrony || { warn "chrony を入れられませんでした。"; return 1; }
+    apt_refresh
+    ntp_recheck_plan || return 1
+    sys apt-get install -y chrony || { warn "chrony を入れられませんでした。"; apt_install_hint; return 1; }
   fi
   if [ "${#NTP_SERVERS_EFFECTIVE[@]}" -gt 0 ]; then
     ensure_dir ntp "${CHRONY_SOURCES%/*}" 755 || return 1
@@ -2355,7 +3266,7 @@ apply_ntp() {
   if [ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)" = yes ]; then
     say "時刻が同期しました。"
   else
-    warn "90 秒待っても、時刻の同期（NTPSynchronized）が yes になりませんでした。時計はそのまま動き続けます。同期しないままなら、sudo bash scripts/harden.sh --rollback ntp で戻せます。"
+    warn "90 秒待っても、時刻の同期（NTPSynchronized）が yes になりませんでした。時計はそのまま動き続けます。同期しないままなら、$(harden_cmd) --rollback ntp で戻せます。"
   fi
   chronyc -n sources || true
   say "docs/KNOWLEDGE_BASE.md の systemctl restart systemd-timesyncd は、今後 systemctl restart chrony になります。"
@@ -2376,8 +3287,14 @@ rollback_ntp() {
   local rc=0
   restore_step_files ntp || rc=1
   if [ "$(meta_get "${STATE_DIR}/applied/ntp" replaced_timesyncd 2>/dev/null || true)" = 1 ]; then
-    if rollback_idle; then
-      apt-get install -y systemd-timesyncd || { warn "systemd-timesyncd を入れ直せませんでした。"; rc=1; }
+    if pkg_installed systemd-timesyncd; then
+      # chrony を入れる前に止まったなど、timesyncd がまだ入っているなら、入れ直さない（有効にするだけ）。
+      systemctl enable --now systemd-timesyncd || { warn "systemd-timesyncd を有効にできませんでした。"; rc=1; }
+    elif rollback_idle "${LOOKAHEAD_MINUTES}"; then
+      if ! apt-get update; then
+        warn "apt-get update が失敗しました。ネットワーク（学内の網につながっているか、名前が引けるか）を確かめてください。古い一覧のまま続けます。"
+      fi
+      apt-get install -y systemd-timesyncd || { warn "systemd-timesyncd を入れ直せませんでした。"; apt_install_hint; rc=1; }
       systemctl enable --now systemd-timesyncd || { warn "systemd-timesyncd を有効にできませんでした。"; rc=1; }
     else
       rc=1
@@ -2479,7 +3396,7 @@ step_report() {
       say "セキュリティ更新は、毎朝 5:40〜6:00 ごろに自動で入ります。再起動はしません。カーネルの更新は、放送のない時間（9:55〜17:05 以外）に手で再起動します（security_check.sh が知らせます）。念のため、月に 1 回は sudo apt update && sudo apt full-upgrade と再起動を手でも行ってください。"
       ;;
     service)
-      say "放送サービスに保護をかけました。音が出るかは『sudo bash scripts/harden.sh --test-sound』で確かめられます。"
+      say "放送サービスに保護をかけました。音が出るかは『$(harden_cmd) --test-sound』で確かめられます。"
       ;;
     ntp)
       say "時刻同期を chrony にしました。"
@@ -2490,6 +3407,15 @@ step_report() {
 step_needs_idle() {
   case "$1" in
     service | updates | ntp) return 0 ;;
+    firewall) [ "${FW_INSTALL_NFT}" -eq 1 ] ;;
+    *) return 1 ;;
+  esac
+}
+
+# apt を動かす・時計を変える手順は長引くので、次の放送まで余裕があることも確かめる。
+step_needs_lookahead() {
+  case "$1" in
+    updates | ntp) return 0 ;;
     firewall) [ "${FW_INSTALL_NFT}" -eq 1 ] ;;
     *) return 1 ;;
   esac
@@ -2514,6 +3440,42 @@ rollback_step() {
   state_log "rollback ${step}"
 }
 
+# 手順 $1 の確定した設定（confirmed/）へ戻す。ssh は確定した drop-in を戻して sshd に読み直させ、
+# firewall は確定したルールとユニットを戻して、その表を読み込み直す。
+confirmed_restore_step() {
+  case "$1" in
+    ssh) confirmed_restore_ssh ;;
+    firewall) confirmed_restore_firewall ;;
+    *) return 1 ;;
+  esac
+}
+
+# 確定していない再適用を取り消す。すでに確定した設定があれば、harden.sh を使う前ではなく、そこへ戻す
+# （鍵だけの SSH やファイアウォールを、再適用の失敗で失わないため）。無ければ（初めての適用なら）手順を
+# 丸ごと元に戻す。成功したら REVERT_KIND に confirmed か original を入れる。手で --rollback するときは
+# これを通さず、いつも丸ごと元に戻す。
+REVERT_KIND=""
+revert_step() {
+  local step="$1"
+  REVERT_KIND=""
+  if confirmed_has "${step}"; then
+    if ! confirmed_restore_step "${step}"; then
+      state_log "revert ${step} FAILED"
+      return 1
+    fi
+    if pending_has "${step}"; then
+      pending_remove "${step}" || { warn "確定待ちの記録を消せません。"; return 1; }
+    fi
+    # 再適用の始めに外した「適用済み」の印を、確定した状態に合わせて戻す。
+    meta_set "${STATE_DIR}/applied/${step}" "done" 1 || return 1
+    REVERT_KIND=confirmed
+    state_log "revert ${step} to confirmed"
+    return 0
+  fi
+  rollback_step "${step}" || return 1
+  REVERT_KIND=original
+}
+
 # 確定待ちが空になったら、自動復元の時計を片づける。
 settle_revert() {
   if [ -n "$(pending_list)" ]; then
@@ -2525,21 +3487,56 @@ settle_revert() {
   fi
 }
 
-# 適用か確認に失敗した手順を、その場で元に戻す。戻せたかどうかを、そのとおりに伝える。
+# 確定待ちが空なのに、自動復元の単位ファイル・root の写しが残っているのは、時計を張る途中で止められたあと
+# （時計を先に張るので、確定待ちの記録より前に止められるとこうなる）か、片づけに失敗したあと。害はないが、
+# 変更を始める前に片づける。
+settle_orphan_revert() {
+  [ "${DRY_RUN}" -eq 0 ] || return 0
+  [ -z "$(pending_list)" ] || return 0
+  if [ -e "${SYSROOT}${REVERT_TIMER}" ] || [ -e "${SYSROOT}${REVERT_SERVICE}" ] || [ -e "${STATE_DIR}/harden.sh" ]; then
+    state_log "settle orphan revert units"
+    settle_revert || true
+  fi
+}
+
+# sudo の手順で NOPASSWD を外したまま止まったときの案内。パスワードが分からないと sudo を使えない。
+# （同じ案内を 2 回出さない）
+SUDO_ADVICE_SHOWN=0
+sudo_password_advice() {
+  [ "${SUDO_ADVICE_SHOWN}" -eq 0 ] || return 0
+  SUDO_ADVICE_SHOWN=1
+  warn "sudo の手順では、${TARGET_USER} のパスワードが分からないと、sudo を付けた操作ができません。パスワードが分からないときは、そのまま ${SUDO_WINDOW} 分待ってください（自動復元の時計が NOPASSWD の設定を戻します）。待てないときは、この Pi のキーボードと画面（コンソール）から root として、bash $(printf '%q' "${SCRIPT_PATH}") --rollback sudo を実行してください。"
+}
+
+# 元に戻せなかった手順 $1 の案内。時計が動いていれば、それも伝える。
+rollback_failure_advice() {
+  local step="$1" window
+  window="$(pending_window)"
+  if pending_has "${step}"; then
+    warn "元に戻せませんでした（手順 ${step}）。自動復元の時計は動いたままなので、${window:-${REVERT_AFTER}} 分以内に自動でもう一度戻します。手で戻すなら $(harden_cmd) --rollback ${step} です。"
+  else
+    warn "元に戻せませんでした（手順 ${step}）。上の表示を確かめ、$(harden_cmd) --rollback ${step} を実行してください。"
+  fi
+  if [ "${step}" = sudo ]; then
+    sudo_password_advice
+  fi
+}
+
+# 適用か確認に失敗した（または、止められた）手順を、その場で元に戻す。戻せたかどうかを、そのとおりに伝える。
 undo_step() {
   local step="$1" reason="$2"
   warn "手順 ${step} は適用できませんでした（${reason}）。元に戻します。"
   ROLLBACK_IDLE=0
-  if rollback_step "${step}"; then
+  if revert_step "${step}"; then
     settle_revert || true
-    ok "元に戻しました（手順 ${step}）。"
+    if [ "${REVERT_KIND}" = confirmed ]; then
+      ok "元に戻しました（手順 ${step}。以前に確定した設定に戻しました）。"
+    else
+      ok "元に戻しました（手順 ${step}）。"
+    fi
     return 0
   fi
-  if pending_has "${step}"; then
-    warn "元に戻せませんでした（手順 ${step}）。自動復元の時計は動いたままなので、${REVERT_AFTER} 分以内に自動でもう一度戻します。手で戻すなら sudo bash scripts/harden.sh --rollback ${step} です。"
-  else
-    warn "元に戻せませんでした（手順 ${step}）。上の表示を確かめ、sudo bash scripts/harden.sh --rollback ${step} を実行してください。"
-  fi
+  rollback_failure_advice "${step}"
   return 1
 }
 
@@ -2554,6 +3551,10 @@ run_step() {
       CURRENT_STEP=""
       return 1
     fi
+  fi
+  if [ "${DRY_RUN}" -eq 0 ]; then
+    # もう一度適用するので、「自動で元に戻った」記録は古くなる。
+    reverted_forget "${step}" || true
   fi
   if ! step_apply "${step}"; then
     undo_step "${step}" "変更の途中で失敗した" || true
@@ -2581,27 +3582,39 @@ run_step() {
 }
 
 print_pending_notice() {
-  local steps window
-  steps="$(pending_list | tr '\n' ' ')"
-  steps="${steps% }"
-  [ -n "${steps}" ] || return 0
+  local list=() others=() step window
+  mapfile -t list < <(pending_list)
+  [ "${#list[@]}" -gt 0 ] || return 0
   window="$(pending_window)"
+  window="${window:-${REVERT_AFTER}}"
+  for step in "${list[@]}"; do
+    if [ "${step}" != sudo ]; then
+      others+=("${step}")
+    fi
+  done
+  if [ "${#others[@]}" -lt "${#list[@]}" ]; then
+    log "sudo のパスワードの確認が終わっていません"
+    say "NOPASSWD を外したまま、パスワードの確認が終わっていません。${window} 分以内に、自動で元に戻ります（確定の操作は要りません）。"
+    say "  ${TARGET_USER} のパスワードが分かるなら、いま戻せます: $(harden_cmd) --rollback sudo"
+    say "  分からないなら、そのまま待ってください（戻るまで sudo は使えません）。"
+  fi
+  [ "${#others[@]}" -gt 0 ] || return 0
   log "次にすること: 別の端末で確かめてから、確定する"
-  say "確定待ちの変更: ${steps}"
-  say "このままだと ${window:-${REVERT_AFTER}} 分で自動で元に戻ります（確定する前に再起動しても、起動の ${window:-${REVERT_AFTER}} 分後に戻ります）。"
+  say "確定待ちの変更: ${others[*]}"
+  say "このままだと ${window} 分で自動で元に戻ります（確定する前に再起動しても、起動の ${window} 分後に戻ります）。"
   say "  1. この画面は閉じずに、新しい端末（別の画面）を開く。"
   say "  2. 鍵で入れることを確かめる:"
-  say "       ssh ${TARGET_USER}@campus-chime.local"
+  say "       $(ssh_login_cmd)"
   say "  3. （ssh のとき）パスワードでは入れないことを確かめる:"
-  say "       ssh -o PubkeyAuthentication=no -o PreferredAuthentications=password ${TARGET_USER}@campus-chime.local"
+  say "       $(ssh_login_cmd -o PubkeyAuthentication=no -o PreferredAuthentications=password)"
   say "     『Permission denied (publickey)』と出れば正しい動きです。"
   say "  4. その新しい端末で、確定する:"
-  say "       sudo bash scripts/harden.sh --confirm"
-  say "確定しないで元に戻すなら: sudo bash scripts/harden.sh --rollback-pending"
+  say "       $(harden_cmd) --confirm"
+  say "確定しないで元に戻すなら: $(harden_cmd) --rollback-pending"
 }
 
 run_apply() {
-  local step ordered=() s want skipped_all=1
+  local step ordered=() s want skipped_all=1 need_idle ahead
   if [ "${DRY_RUN}" -eq 0 ]; then
     require_root
   fi
@@ -2639,12 +3652,23 @@ run_apply() {
     fi
   done
   if [ "${DRY_RUN}" -eq 0 ] && [ "${skipped_all}" -eq 0 ]; then
+    need_idle=0
+    ahead=0
     for step in "${ordered[@]}"; do
-      if [ -z "${STEP_SKIP[${step}]:-}" ] && step_needs_idle "${step}"; then
-        ensure_idle || fail "放送の最中でないことを確認できませんでした。何も変更していません。"
-        break
+      [ -z "${STEP_SKIP[${step}]:-}" ] || continue
+      if step_needs_idle "${step}"; then
+        need_idle=1
+      fi
+      if step_needs_lookahead "${step}"; then
+        ahead="${LOOKAHEAD_MINUTES}"
       fi
     done
+    if [ "${need_idle}" -eq 1 ]; then
+      ensure_idle "${ahead}" || fail "放送の最中、または放送の直前でないことを確認できませんでした。何も変更していません。"
+    fi
+  fi
+  if [ "${DRY_RUN}" -eq 0 ] && [ "${skipped_all}" -eq 0 ]; then
+    settle_orphan_revert
   fi
   for step in "${ordered[@]}"; do
     if [ -n "${STEP_SKIP[${step}]:-}" ]; then
@@ -2653,7 +3677,7 @@ run_apply() {
     fi
     if ! run_step "${step}"; then
       print_pending_notice
-      fail "手順 ${step} を適用できませんでした。ここで止めます（前の手順で適用したものは、そのまま残っています。一覧は sudo bash scripts/harden.sh）。"
+      fail "手順 ${step} を適用できませんでした。ここで止めます（前の手順で適用したものは、そのまま残っています。一覧は $(harden_cmd)）。"
     fi
   done
   if [ "${DRY_RUN}" -eq 1 ]; then
@@ -2721,13 +3745,39 @@ check_session_age() {
   fi
 }
 
+# 自動復元が元に戻した手順の記録（REVERTED_FILE）を、そのまま伝える。
+report_reverted() {
+  local steps=() step kind epoch when=""
+  mapfile -t steps < <(reverted_steps)
+  [ "${#steps[@]}" -gt 0 ] || return 0
+  epoch="$(meta_get "${REVERTED_FILE}" epoch 2>/dev/null || true)"
+  if [ -n "${epoch}" ]; then
+    when="$(date -d "@${epoch}" '+%F %T' 2>/dev/null || true)"
+  fi
+  warn "確定されないまま自動復元（--rollback-pending）が働いて、次の変更はすでに元に戻されています${when:+（${when}）}。"
+  for step in "${steps[@]}"; do
+    kind="$(meta_get "${REVERTED_FILE}" "${step}" 2>/dev/null || true)"
+    if [ "${kind}" = confirmed ]; then
+      warn "  ${step}: 最後に確定した設定に戻りました（今回の変更は効いていません）。"
+    else
+      warn "  ${step}: harden.sh を使う前の状態に戻りました（守りは効いていません）。"
+    fi
+  done
+  warn "もう一度適用するなら: $(harden_cmd) ${steps[*]}（ssh・firewall は、適用したあとの案内のとおり別の端末で確かめて、${REVERT_AFTER} 分以内に $(harden_cmd) --confirm）。firewall に --ssh-from を付けていたなら、同じ指定を付けます。"
+}
+
 run_confirm() {
   local step latest=0 epoch failed=0 unconfirmed=0 rc steps=()
   require_root
   acquire_lock 0
   if [ -z "$(pending_list)" ]; then
-    say "確定する変更はありません。"
     settle_revert || exit 1
+    if [ -n "$(reverted_steps)" ]; then
+      warn "確定する変更はありません。ただし、これは確定できたからではありません。"
+      report_reverted
+      exit 1
+    fi
+    say "確定する変更はありません。"
     return 0
   fi
   mapfile -t steps < <(pending_list)
@@ -2746,25 +3796,57 @@ run_confirm() {
         rc=0
         persist_firewall || rc=$?
         if [ "${rc}" -eq 0 ]; then
-          pending_remove firewall || failed=1
-          say "防火壁を確定しました（再起動後も有効です: campus-chime-firewall.service）。"
-        elif [ "${rc}" -eq 2 ]; then
-          if [ "$(meta_get "${STATE_DIR}/applied/firewall" persisted 2>/dev/null || true)" = 1 ]; then
-            pending_remove firewall || failed=1
-            warn "新しい防火壁は確定しませんでした。以前に確定した防火壁が、そのまま残っています。入れ直して（sudo bash scripts/harden.sh firewall）から、もう一度確定してください。"
+          # 確定した版を控えてから、確定待ちを外す（控えられなければ、確定待ちを残す）。
+          if snapshot_confirmed firewall "${FW_NFT_FILE}" "${FW_UNIT}" && pending_remove firewall; then
+            say "防火壁を確定しました（再起動後も有効です: campus-chime-firewall.service）。"
           else
-            warn "防火壁は確定しませんでした。入れ直して（sudo bash scripts/harden.sh firewall）から、もう一度確定してください。"
-            ROLLBACK_IDLE=0
+            warn "防火壁の確定を記録できませんでした。"
+            failed=1
+          fi
+        elif [ "${rc}" -eq 2 ]; then
+          unconfirmed=1
+          ROLLBACK_IDLE=0
+          if confirmed_has firewall; then
+            if revert_step firewall; then
+              warn "新しい防火壁は確定しませんでした。以前に確定した防火壁に戻してあります。入れ直して（$(harden_cmd) firewall）から、もう一度確定してください。"
+            else
+              failed=1
+            fi
+          else
+            warn "防火壁は確定しませんでした。入れ直して（$(harden_cmd) firewall）から、もう一度確定してください。"
             rollback_step firewall || failed=1
           fi
-          unconfirmed=1
         else
           failed=1
         fi
         ;;
       ssh)
-        pending_remove ssh || failed=1
-        say "SSH の鍵だけの設定を確定しました。"
+        if ! step_done ssh; then
+          warn "SSH の適用が最後まで終わっていません（途中で止められたようです）。設定を確かめ終えていないので、確定しません。"
+          unconfirmed=1
+          ROLLBACK_IDLE=0
+          if confirmed_has ssh; then
+            if revert_step ssh; then
+              warn "新しい SSH の設定は確定しませんでした。以前に確定した設定に戻してあります。もう一度適用して（$(harden_cmd) ssh）から、確定してください。"
+            else
+              failed=1
+            fi
+          else
+            warn "SSH の鍵だけの設定は確定しませんでした。もう一度適用して（$(harden_cmd) ssh）から、確定してください。"
+            rollback_step ssh || failed=1
+          fi
+        elif snapshot_confirmed ssh "${SSHD_DROPIN}" && pending_remove ssh; then
+          say "SSH の鍵だけの設定を確定しました。"
+        else
+          warn "SSH の確定を記録できませんでした。"
+          failed=1
+        fi
+        ;;
+      sudo)
+        # sudo は確定の操作で確定するものではない（パスワードの確認が終わると自動で確定待ちが外れる）。
+        # 残っているのは、確認が終わる前に止まったということ。
+        warn "手順 sudo は、パスワードの確認が終わっていません（途中で止まったようです）。--confirm では確定できません。$(pending_window) 分以内に自動で元に戻ります。いま戻すなら $(harden_cmd) --rollback-pending です。"
+        unconfirmed=1
         ;;
     esac
   done
@@ -2775,8 +3857,12 @@ run_confirm() {
   if [ "${unconfirmed}" -eq 1 ]; then
     fail "確定できなかった手順があります（上の警告）。確定できたものだけが確定しています。"
   fi
+  if [ -n "$(reverted_steps)" ]; then
+    warn "なお、別の手順がすでに自動で元に戻されています。"
+    report_reverted
+  fi
   log "確定しました"
-  say "状態の確認: sudo bash scripts/harden.sh（一覧）、bash scripts/security_check.sh（点検）"
+  say "状態の確認: $(harden_cmd)（一覧）、bash $(printf '%q' "${REPO_DIR}/scripts/security_check.sh")（点検）"
 }
 
 # 手順を指定された順に（指定がなければ、適用したものを新しい順に）元に戻す。
@@ -2790,10 +3876,16 @@ run_rollback() {
   else
     rollback_order
     targets=("${ROLLBACK_LIST[@]}")
+    # 手順を指定しない --rollback は、すべてを手で戻す操作。もう触っていない手順の「自動で元に戻った」記録も消す。
+    for step in "${ALL_STEPS[@]}"; do
+      reverted_forget "${step}" || true
+    done
   fi
   ROLLBACK_IDLE=1
   SERVICE_RESTARTED=1
   for step in "${targets[@]}"; do
+    # 手で戻すなら、「自動で元に戻った」という記録は要らない（戻すものが無くても消す）。
+    reverted_forget "${step}" || true
     touched=0
     step_touched "${step}" && touched=1
     pending_has "${step}" && touched=1
@@ -2853,9 +3945,19 @@ rollback_order() {
 # 戻しは放送に触れない）。ほかの harden.sh が動いていても、最大 30 分待って、必ずやり切る。
 # 1 つでも戻せなければ失敗で終わる（時計の単位が Restart=on-failure で 60 秒後にやり直す）。
 run_rollback_pending() {
-  local steps=() step i failed=() rc=0
+  local steps=() step i failed=() rc=0 done_steps=() item gen_start gen_now
   require_root
+  # 起きたときの時計の番号を覚えてから、ロックを待つ。
+  gen_start="$(revert_gen)"
   acquire_lock 1800
+  gen_now="$(revert_gen)"
+  if [ -n "${gen_start}" ] && [ -n "${gen_now}" ] && [ "${gen_start}" != "${gen_now}" ]; then
+    # ロックを待つ間に、ほかの harden.sh が自動復元の時計を張り直した（窓を数え直した）。新しい時計が、新しい窓の
+    # 終わりに戻すので、古い時計のこの実行は、確定待ちの変更に触らない。
+    say "自動復元の時計は、待っている間に張り直されました。新しい時計が戻すので、この実行は何もしません。"
+    state_log "rollback-pending skipped (revert timer re-armed: ${gen_start} -> ${gen_now})"
+    return 0
+  fi
   ROLLBACK_IDLE=0
   mapfile -t steps < <(pending_list)
   if [ "${#steps[@]}" -eq 0 ]; then
@@ -2869,15 +3971,27 @@ run_rollback_pending() {
   for ((i = ${#steps[@]} - 1; i >= 0; i--)); do
     step="${steps[i]}"
     CURRENT_STEP="${step}"
-    if rollback_step "${step}"; then
-      ok "元に戻しました（手順 ${step}）。"
+    if revert_step "${step}"; then
+      if [ "${REVERT_KIND}" = confirmed ]; then
+        ok "元に戻しました（手順 ${step}。以前に確定した設定に戻しました）。"
+      else
+        ok "元に戻しました（手順 ${step}）。"
+      fi
+      done_steps+=("${step}:${REVERT_KIND}")
     else
       warn "元に戻せませんでした（手順 ${step}）。確定待ちと自動復元の時計を残して、やり直します。"
+      if [ "${step}" = sudo ]; then
+        sudo_password_advice
+      fi
       failed+=("${step}")
       rc=1
     fi
   done
   CURRENT_STEP=""
+  # 戻した手順を記録する（あとで --confirm を実行した人に、すでに戻っていると伝えるため）。
+  for item in "${done_steps[@]}"; do
+    reverted_record "${item%%:*}" "${item#*:}" || warn "自動で元に戻したことの記録を書けません。"
+  done
   if [ "${rc}" -ne 0 ]; then
     fail "元に戻せなかった手順があります: ${failed[*]}"
   fi
@@ -2900,13 +4014,38 @@ run_list() {
     printf '  %-9s %-10s %s\n' "${step}" "${label}" "$(step_title "${step}")"
   done
   print_pending_notice
+  if [ -n "$(reverted_steps)" ]; then
+    log "自動で元に戻された変更があります"
+    report_reverted
+  fi
+  list_check_service_dirs
   say ""
-  say "使い方: sudo bash scripts/harden.sh STEP...（--dry-run で内容だけ確認、--rollback で戻す、-h で説明）"
+  say "使い方: $(harden_cmd) STEP...（--dry-run で内容だけ確認、--rollback で戻す、-h で説明）"
+}
+
+# service の手順の保護の下で書き込みを許したディレクトリが、いまも全部あるか。無いディレクトリは、保護の下では
+# サービスが作れない（再クローンや git clean、cache/ の削除のあとなど）。
+list_check_service_dirs() {
+  local dropin="${SYSROOT}${SERVICE_DROPIN}" line paths path missing=() quoted=""
+  [ -f "${dropin}" ] || return 0
+  while IFS= read -r line || [ -n "${line}" ]; do
+    [[ "${line}" == ReadWritePaths=* ]] || continue
+    paths="${line#ReadWritePaths=}"
+    for path in ${paths}; do
+      path="${path#-}"
+      path="${path//\%\%/%}"
+      [ -d "${path}" ] || missing+=("${path}")
+    done
+  done < "${dropin}"
+  if [ "${#missing[@]}" -gt 0 ]; then
+    quoted="$(quote_cmd "${missing[@]}")"
+    warn "保護の下で書き込みを許したディレクトリが無くなっています: ${missing[*]}。サービスは保護の下では作れないので、状態や時報音を保存できません。${TARGET_USER} として作ってください（sudo -u ${TARGET_USER} mkdir -p ${quoted}）。"
+  fi
 }
 
 require_root() {
   if [ "${IS_ROOT}" -ne 1 ]; then
-    fail "sudo を付けて実行してください（例: sudo bash scripts/harden.sh ssh）。何も変更していません。"
+    fail "sudo を付けて実行してください（例: $(harden_cmd) ssh）。何も変更していません。"
   fi
 }
 
@@ -2915,12 +4054,31 @@ on_exit() {
   local rc=$?
   trap - EXIT
   if [ "${rc}" -ne 0 ] && [ -n "${CURRENT_STEP}" ] && [ "${DRY_RUN}" -eq 0 ]; then
-    warn "手順 ${CURRENT_STEP} の途中で止まりました。状態は『sudo bash scripts/harden.sh』で確かめられ、sudo bash scripts/harden.sh --rollback ${CURRENT_STEP} で戻せます。"
-    if [ -n "$(pending_list 2>/dev/null || true)" ]; then
+    warn "手順 ${CURRENT_STEP} の途中で止まりました。状態は『$(harden_cmd)』で確かめられ、$(harden_cmd) --rollback ${CURRENT_STEP} で戻せます。"
+    if [ "${CURRENT_STEP}" = sudo ]; then
+      sudo_password_advice
+    elif [ -n "$(pending_list 2>/dev/null || true)" ]; then
       warn "確定待ちの変更には自動復元の時計が動いています。確定しなければ、時間が来ると元に戻ります。"
     fi
   fi
   exit "${rc}"
+}
+
+# Ctrl-C・回線切れ（SIGHUP）・SIGTERM。適用の途中なら、確認に失敗したときと同じ道（undo_step）で、その手順を
+# 元に戻してから終わる（sudo なら NOPASSWD の設定が戻る）。戻している間は、重ねて来る信号は無視する。
+# 端末が消えていても（回線切れ）戻せるよう、画面への出力の失敗は無視する。
+on_signal() {
+  local name="$1" code="$2" step="${CURRENT_STEP}"
+  trap '' INT TERM HUP PIPE
+  set +e
+  printf '\n' >&2 || true
+  warn "${name} を受け取ったので、途中で止めます。" || true
+  if [ -n "${step}" ] && [ "${MODE}" = apply ] && [ "${DRY_RUN}" -eq 0 ]; then
+    if undo_step "${step}" "中断された"; then
+      CURRENT_STEP=""
+    fi
+  fi
+  exit "${code}"
 }
 
 # ---------------------------------------------------------------------------
@@ -3008,10 +4166,11 @@ parse_args() {
       ;;
     apply)
       if [ "${#STEPS[@]}" -eq 0 ]; then
-        if [ "${TEST_SOUND}" -eq 1 ]; then
-          MODE=test-sound
-        elif [ "${DRY_RUN}" -eq 1 ]; then
+        if [ "${DRY_RUN}" -eq 1 ]; then
+          # --dry-run --test-sound も同じ: 音を鳴らす確認は、何も変えない試しにはならない。
           usage_error "--dry-run には手順が必要です（例: bash scripts/harden.sh --dry-run ssh）。"
+        elif [ "${TEST_SOUND}" -eq 1 ]; then
+          MODE=test-sound
         else
           MODE=list
         fi
@@ -3037,7 +4196,9 @@ main() {
     IS_ROOT=1
   fi
   trap on_exit EXIT
-  trap 'exit 130' INT TERM HUP
+  trap 'on_signal INT 130' INT
+  trap 'on_signal TERM 143' TERM
+  trap 'on_signal HUP 129' HUP
   case "${MODE}" in
     list) run_list ;;
     apply) run_apply ;;
@@ -3048,7 +4209,7 @@ main() {
       require_root
       load_user
       if [ ! -f "${SYSROOT}${SERVICE_DROPIN}" ]; then
-        fail "保護の設定（${SERVICE_DROPIN}）がありません。先に sudo bash scripts/harden.sh service を実行するか、service と一緒に --test-sound を付けてください。何も変更していません。"
+        fail "保護の設定（${SERVICE_DROPIN}）がありません。先に $(harden_cmd) service を実行するか、service と一緒に --test-sound を付けてください。何も変更していません。"
       fi
       acquire_lock 0
       run_test_sound
