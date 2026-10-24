@@ -16,7 +16,7 @@
 2. 「中」は 4 件です: SSH のパスワードログイン、`main` をそのまま取り込む更新の経路、同じネットワークの人から影響を受けうる時計、OS の更新の遅れ（実機が古い場合だけ）。
    いまの前提では「高」はありません。ただし **Pi が学外から届くなら、SSH のパスワードログインは「高」** です。
 3. 先にやること: OS の更新と再起動 → SSH を鍵だけに（`harden.sh ssh`）→ 防火壁（`harden.sh firewall`）→ GitHub の二要素認証（パスキー）と `main` の保護ルール。
-4. **実機の Pi は一度も見ていません。** バージョン、学外から届くか、`sudo` の設定など、実機しだいの判断は、`security_check.sh` と 7 章のコマンドで確かめてください。
+4. **実機の Pi は一度も見ていません。そして、`security_check.sh` と `harden.sh` も、本物の Pi では一度も動かしていません。** バージョン、学外から届くか、`sudo` の設定など、実機しだいの判断は、`sudo bash scripts/security_check.sh` と 7 章のコマンドで確かめてください。`harden.sh` は、`--dry-run` で内容を見て、1 手順ずつ、コンソールに入れる用意をして使います（SECURITY.md 3 節の「始める前に」）。
 5. コードの修正（時計の見張り、天気取得の時間制限ほか）は今後の候補です。急ぎではなく、相談のうえで決めます（6 章）。
 
 ---
@@ -40,7 +40,7 @@
 大学がクラス B（/16）やクラス C（/24）の IPv4 アドレスの範囲を持っていると、学内の機器にも「世界で唯一のアドレス」（グローバルアドレス）が配られることがあります。
 その場合、Pi がインターネットから届くかどうかは**大学の入口の防火壁の設定だけ**で決まり、Pi の中からは見えません。
 
-`security_check.sh` は Pi 自身のアドレスを `ip -4 -o addr show scope global`（IPv6 は `ip -6 ...`）で読み、1 つずつ分類します（項目名 `NET-ADDR4`・`NET-ADDR6`）。
+`security_check.sh` は Pi 自身のアドレスを `ip -4 -o addr show scope global`（IPv6 は `ip -6 ...`）で読み、1 つずつ分類します（点検の画面では「IPv4 アドレス」「IPv6 アドレス」の行です）。
 
 | アドレス | 判定 |
 |---|---|
@@ -94,7 +94,7 @@
 
 17 のまとまり（テーマ）にしました。**状況**の言い方は次のとおりです。
 
-- **`harden.sh ○○` で対策できる:** v6.2.0 の `scripts/harden.sh` の手順で、運用者が Pi で直せます（手順ごとの説明は SECURITY.md 5 節）。実機ではまだ動かしていません（7.1 節）。
+- **`harden.sh ○○` で対策できる:** v6.2.0 の `scripts/harden.sh` の手順で、運用者が Pi で直せます（手順ごとの説明は SECURITY.md 5 節）。実機ではまだ動かしていません。元に戻す仕組みの限界もあります（SECURITY.md 3.2 節、7.1 節）。
 - **GitHub の設定で対策（運用者が行う）:** GitHub の画面で設定します（5 章）。
 - **コードの修正は今後の候補:** リポジトリのコードを直す案です。まだ入れていません（6 章）。
 - **文書を直した:** v6.2.0 の文書に反映済みです。
@@ -105,15 +105,15 @@
 | 1 | 中（学外から届く・ゲスト用の Wi-Fi・推測されやすいパスワードなら **高**） | SSH がパスワードでのログインを受け付けたままだと、同じネットワークの人がパスワードを試し続けられる。当たると Pi の中に入られ、`sudo` がパスワードなしなら管理者の権限まで届く。放送の悪用、Wi-Fi のパスワードの流出、学内への足がかりになりうる。前提: 学内の同じネットワークから届くこと。実機の sshd の設定は未確認 | 鍵だけにする（`harden.sh ssh`）→ 管理用のネットワークだけに SSH を許す（`harden.sh firewall` の `--ssh-from`）→ `sudo` にパスワードを求める（`harden.sh sudo`）。`fail2ban` は入れない（3.3 節） | `harden.sh ssh`・`firewall`・`sudo` で対策できる。文書を直した（SETUP.md は公開鍵認証を勧める書き方に） |
 | 2 | 中 | GitHub の `main` に悪意のある変更が入ると、次に `update.sh` を実行した Pi すべてで、その中身が実行される（`pi` の権限で、`sudo` の行では管理者の権限で）。Pi が学内専用でも関係ない（Pi は GitHub へ出ていくだけ）。前提: `main` に書き込める人のアカウントやトークンの乗っ取り、または中身を読まずにマージした Pull Request。そのあと運用者が `update.sh` を実行すること | GitHub 側の守りが最も安く効く（5 章）。さらに署名つきのデプロイ用タグ（6 章 8）。**`sudo` にパスワードを求めても、この経路は守れない**（取り込んだコードは運用者の画面で動くため） | GitHub の設定で対策（運用者が行う）。署名つきタグはコードの修正は今後の候補。文書を直した（SECURITY.md 8 節） |
 | 3 | 中 | NTP は暗号で守られていない。同じネットワークで時刻合わせの通信に手を加えられる人がいると、時計が狂い、違う時刻に鳴る・鳴らない日ができる。ずれが戻ったあとも影響が残ることがある。そうした位置にいる人がいるときだけ起きる話で、広く起きるものではないが、学内の公共の場に鳴る機械なので「中」 | `chrony` に替える（`harden.sh ntp`。起動後の大きな時刻の飛びを受け付けない）。**NTP 自体は暗号化されず、NTS は未設定なので、部分的な対策**。アプリに時計の見張りを足す案（6 章 2） | `harden.sh ntp` で対策できる（部分的）。コードの修正は今後の候補 |
-| 4 | 条件つきで中（実機が古いときだけ。そうでなければ情報） | OS・カーネル・SSH・avahi・BlueZ などの更新が遅れていると、既知の脆弱性が残る。とくに CISA の KEV に載ったカーネルの権限昇格が 6 件ある（8.1 節）。**単独で外から入る穴ではなく**、先に Pi の中に入った人が管理者になるのを助ける。以前の手順書は、初回の更新と学期ごとの `apt upgrade` だけで、再起動の決まりもなかった。前提: 実機のパッケージが修正より古い場合のみ（実機は未確認） | 今すぐ `sudo apt update && sudo apt full-upgrade` と再起動。以後は毎月（9:55〜17:05 を避ける）。使わない常駐を止める（`harden.sh services`）。自動更新（`harden.sh updates`）は任意で、再起動はしない | `harden.sh services`・`updates` で対策できる。文書を直した（SECURITY.md 6 節、KNOWLEDGE_BASE.md 5 章の毎月の更新と再起動）。古さは `security_check.sh` が見つける |
+| 4 | 条件つきで中（実機が古いときだけ。そうでなければ情報） | OS・カーネル・SSH・avahi・BlueZ などの更新が遅れていると、既知の脆弱性が残る。とくに CISA の KEV に載ったカーネルの権限昇格が 6 件ある（8.1 節）。**単独で外から入る穴ではなく**、先に Pi の中に入った人が管理者になるのを助ける。以前の手順書にも、学期ごとの更新と再起動はあったが、カーネルを入れ替えるための**毎月**の更新と再起動の決まりがなかった。前提: 実機のパッケージが修正より古い場合のみ（実機は未確認） | 今すぐ `sudo apt update && sudo apt full-upgrade` と再起動。以後は毎月（9:55〜17:05 を避ける）。使わない常駐を止める（`harden.sh services`）。自動更新（`harden.sh updates`）は任意で、再起動はしない | `harden.sh services`・`updates` で対策できる。文書を直した（SECURITY.md 6 節、KNOWLEDGE_BASE.md 5 章の毎月の更新と再起動）。古さは `security_check.sh` が見つける |
 | 5 | 低 | 放送サービスの保護が薄い（`systemd-analyze security` で 8.7、EXPOSED）。サービスが乗っ取られた場合に、自分のコードやホームの中を書き換えられ、任意の通信ができる。前提: 先にサービスの中でコードが動く必要がある（いま入口は見つかっていない）。`NoNewPrivileges` が付いており、`sudo` への昇格はできない | 追加設定（`harden.sh service`。ユニット本体は変えない）。適用の前後で点を表示する。**音が出なくなる恐れがあるので `harden.sh --test-sound` で確かめる** | `harden.sh service` で対策できる |
 | 6 | 低（名前解決の答えに手を加えられる人がいるなら中） | 天気の取得は、放送を回す主ループの中で行う。取得全体の時間制限がなく、通信相手のふるまいしだいで取得が長引き、その回の放送の準備が遅れる・抜けることがある。ほかに、正しい証明書を持つ相手（Open-Meteo 側の乗っ取りなど）が巨大な応答や `http` への転送を返した場合の、メモリ不足や誤った天気の一文。前提: #3 と同じ種類の人、または Open-Meteo 側の問題 | 取得全体の期限、読み取りの上限、`https` 以外への転送の拒否（6 章 1）。Pi 側の対策はない | コードの修正は今後の候補 |
 | 7 | 低 | 防火壁がないと、sshd・avahi・Bluetooth・ModemManager が同じネットワークや電波の届く範囲に見えている。Bluetooth（BlueZ）と avahi に既知の脆弱性の報告がある（8.3 節）。前提: 同じネットワークまたは電波の届く範囲。実機でどれが有効かは未確認 | 防火壁（`harden.sh firewall`）と、使わない常駐の停止（`harden.sh services`）。avahi は `campus-chime.local` に使うので止めない。Bluetooth を根元から切るなら `/boot/firmware/config.txt` に `dtoverlay=disable-bt`（`harden.sh` にはない。再起動が要る。未試験） | `harden.sh firewall`・`services` で対策できる |
 | 8 | 低 | SD カードに Wi-Fi のパスワード・`pi` のパスワードのハッシュ・SSH のホスト鍵が暗号化されずに入る。カードを抜かれると読まれる。共有の Wi-Fi のパスワードを知る人は、#3 の前提になる位置に立てる。前提: 設置場所に人が触れる。共有パスワードの Wi-Fi。Imager が書く設定の中身（パスワードの保存のしかた）は未確認 | 設置場所の管理、専用の SSID か有線、Wi-Fi のパスワードの変更手順（SECURITY.md 10 節）。スクリプトでは直せない | 文書を直した（運用で対処する） |
-| 9 | 低（開発 PC）／情報（Pi） | 他人のブランチを取り込んだとき、`assets/voice/manifest.json` の書き方しだいで、作り置きの掃除（`generate_voicevox.py --prune`）が意図しない場所のファイルを消すことがある（再現済み）。Pi 側は、読めるファイルを再生用に開くだけで、リポジトリを書き換えられる人にはもともと可能なこと | 作り置きのフォルダの外を指すファイル名を拒む（6 章 5）。**他人のブランチを取り込んだ直後は `--prune` を実行しない** | コードの修正は今後の候補 |
+| 9 | 低（開発 PC）／情報（Pi） | 他人のブランチを取り込んだとき、作り置きの掃除（開発 PC で行う `generate_voicevox.py` の整理）が、意図しない場所のファイルを消すことがある（再現済み）。Pi 側は、読めるファイルを再生用に開くだけで、リポジトリを書き換えられる人にはもともと可能なこと | 作り置きのフォルダの外を指すファイル名を拒む（6 章 5）。**他人のブランチを取り込んだ直後は、作り置きの掃除を実行しない** | コードの修正は今後の候補 |
 | 10 | 低 | 運用の事故。`sudo` で `campus_chime.py` を動かすと管理者の持ち主のファイルが残り、サービスが書けなくなることがある。手で起動したものとサービスが並ぶと放送が 2 回鳴ることがある（コードの読みだけ。未実行）。時報音の WAV が書き込み中の停電で壊れることがある（`setup.sh` が毎回作り直すので、影響する窓は小さい）。攻撃者は要らない | 管理者で実行したときの案内の拡張、同時に 1 つしか動かさない仕組み、WAV の原子的な書き込み（6 章 4・6・7） | コードの修正は今後の候補 |
 | 11 | 情報 | `config.json`・`cache/state.json` などに極端な値や特殊なファイルがあると、起動時に落ちる・止まる。書き込める人（`pi`、運用者、リポジトリを変えられる人）だけが起こせ、新しい境界は越えない | 失敗しても落ちない読み込み（6 章 3） | コードの修正は今後の候補 |
-| 12 | 情報 | `requirements.txt` を `pip3 install` で入れると、`~/.local` の pygame が apt の版より優先される。版の固定・ハッシュなし。前提: `pip` を実際に使った場合のみ（文書は apt を勧める）。実機は未確認 | apt で入れる | 点検で見つかる（`security_check.sh` の `PY-USERSITE`） |
+| 12 | 情報 | `requirements.txt` を `pip3 install` で入れると、`~/.local` の pygame が apt の版より優先される。版の固定・ハッシュなし。前提: `pip` を実際に使った場合のみ（文書は apt を勧める）。実機は未確認 | apt で入れる | 点検で見つかる（`security_check.sh` の「pip の pygame」の行） |
 | 13 | 情報（Actions の固定は低） | GitHub Actions の外部アクションがメジャーなタグでの指定（`tag.yml` は `contents: write`）。Dependabot の設定なし。CI の Python 3.9 は寿命切れ。公開の履歴にコミットした人のメールアドレスが残る。Open-Meteo に座標と User-Agent が見える。NetworkManager の接続確認（平文の HTTP）が有効かは未確認 | Dependabot、Actions の権限を読み取りに、コミットの SHA での固定は次の Pull Request で | GitHub の設定で対策（運用者が行う）。コードの修正は今後の候補 |
 | 14 | 情報（目安） | 失敗の通知がない。乗っ取られても鳴り続けるなら気づけない。止まったまま動いている（ハングした）プロセスにも気づけない（`WatchdogSec` なし）。ログが再起動で消える設定かもしれない（未確認）。他の指摘の発見が遅れる、という種類の弱点 | ログを残す（`harden.sh journal`）、毎月の `security_check.sh` と `--status`。見張りの仕組みは 6 章に候補 | `harden.sh journal` で対策できる。見張りはコードの修正は今後の候補 |
 | 15 | 情報（目安） | 侵入されたときの手順がなかった（作り直しに 60〜90 分）。バックアップのイメージには Wi-Fi のパスワード・`pi` のパスワードのハッシュ・SSH のホスト鍵が入る。固有の状態は `config.json` だけ | SECURITY.md 10 節に短い手順を書いた。イメージは暗号化かオフラインで保管する。`config.json` の控えを取る | 文書を直した |
@@ -159,41 +159,44 @@
 ## 4. Pi でやること（順番どおり）
 
 放送のない時間（9:55〜17:05 以外）に行います。**`ssh` と `firewall` は、確定しないと 10 分（既定。`--revert-after` で 1〜60 分）で自動で元に戻ります**（再起動しても戻ります）。
-始める前に、Pi に **HDMI ディスプレイと USB キーボード**をつなげるようにして、`pi` のパスワードを控えてください（鍵が使えなくなったときの最後の入り口です）。
-詳しい説明は SECURITY.md の 3 節〜7 節です。ここでは順番と、使うコマンドだけを並べます。
+`sudo` の手順は、パスワードの確認が終わらなければ 5 分で戻ります。これは自動で戻す仕組みがあるという意味で、「締め出されない」という保証ではありません（限界は SECURITY.md 3.2 節）。
+**始める前に、SECURITY.md 3 節の「始める前に」を読んでください**（実機で動かしていないこと、1 手順ずつ行うこと、`--dry-run` で内容を見ること）。Pi に **HDMI ディスプレイと USB キーボード**を
+つなげるようにして、`pi` のパスワードを控えてください（鍵が使えなくなったときの最後の入り口です）。
+詳しい説明は SECURITY.md の 3 節〜7 節です。ここでは順番と、使うコマンドだけを並べます。コマンドは `cd /home/pi/campus-chime` してから実行します。**新しい端末は、ホームのフォルダから始まる**ので、
+新しい端末で打つ確定のコマンドは、場所を全部書いてあります。
 
 | 順 | すること | コマンド |
 |---|---|---|
 | 0 | 管理に使う PC のネットワーク（例: `192.168.1.0/24`）を調べる。手順 6 の `--ssh-from` に使う | Windows は `ipconfig`、macOS／Linux は `ip a` か `ifconfig` |
-| 1 | 現状を点検する（読むだけ。何も変えない）。`[要対応]` があると終了コードが 1 になる | `bash scripts/security_check.sh` と `sudo bash scripts/security_check.sh`（root が要る項目も見る） |
+| 1 | 現状を点検する（読むだけ。何も変えない）。`[要対応]` があると終了コードが 1 になる。`sudo` を付けないと、root が要る項目は `[不明]` になり、点検の終わりに「点検は完全ではありません」と出る | `sudo bash scripts/security_check.sh` |
 | 2 | グローバルアドレスが出たら、学外（スマートフォンのテザリングなど）から届くかを確かめる（2.2 節） | `nc -vz <Pi のアドレス> 22`（Windows は `Test-NetConnection <Pi のアドレス> -Port 22`） |
-| 3 | OS を更新して再起動する（カーネルの修正は再起動してはじめて効く）。そのあと点検で `OS-KERNEL`・`OS-REBOOT` が `[OK]` になることを見る | `sudo apt update && sudo apt full-upgrade`、`sudo reboot`、`python3 campus_chime.py --status`、`bash scripts/security_check.sh` |
+| 3 | OS を更新して再起動する（カーネルの修正は再起動してはじめて効く）。そのあと点検で「カーネルの新しさ」「再起動の要否」の行が `[OK]` になることを見る | `sudo apt update && sudo apt full-upgrade`、`sudo reboot`、`python3 campus_chime.py --status`、`sudo bash scripts/security_check.sh` |
 | 4 | 自分の PC で SSH の鍵を作り、Pi に登録する（SECURITY.md 3.1 節） | `ssh-keygen -t ed25519`、`ssh-copy-id pi@campus-chime.local` |
-| 5 | SSH を鍵だけにする。まず `--dry-run` で内容を見る。適用したら、**新しい端末**で鍵で入れること・パスワードでは断られることを確かめ、その新しい端末で確定する | `sudo bash scripts/harden.sh --dry-run ssh`、`sudo bash scripts/harden.sh ssh`、`sudo bash scripts/harden.sh --confirm` |
-| 6 | 防火壁を入れる。手順 5 と同じ流れで確定する。`--ssh-from` は管理に使うネットワークだけにする | `sudo bash scripts/harden.sh --dry-run firewall --ssh-from 192.168.1.0/24`、`sudo bash scripts/harden.sh firewall --ssh-from 192.168.1.0/24`、`sudo bash scripts/harden.sh --confirm` |
+| 5 | SSH を鍵だけにする。まず `--dry-run` で内容を見る。適用したら、**新しい端末**で鍵で入れること・パスワードでは断られることを確かめ、その新しい端末で確定する | `sudo bash scripts/harden.sh --dry-run ssh`、`sudo bash scripts/harden.sh ssh`、新しい端末で `sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm` |
+| 6 | 防火壁を入れる。手順 5 と同じ流れで確定する。`--ssh-from` は管理に使うネットワークだけにする | `sudo bash scripts/harden.sh --dry-run firewall --ssh-from 192.168.1.0/24`、`sudo bash scripts/harden.sh firewall --ssh-from 192.168.1.0/24`、新しい端末で `sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm` |
 | 7 | 使わない常駐を止め、ログを残す。Bluetooth のスピーカーを使っている疑いがあるときは、何も変えずに止まる | `sudo bash scripts/harden.sh services journal` |
-| 8 | `sudo` にパスワードを求める（端末で。`pi` のパスワードを控えてあること）。以後、`update.sh` と `setup.sh` は `sudo` の行でパスワードを聞く | `sudo bash scripts/harden.sh sudo` |
+| 8 | `sudo` にパスワードを求める（端末で。`pi` のパスワードを控えてあること。実行の途中でパスワードを入力して確かめる。確かめられなければ、その場で、または 5 分後に自動で元に戻る）。以後、`update.sh` と `setup.sh` は `sudo` の行でパスワードを聞く | `sudo bash scripts/harden.sh sudo` |
 | 9 | 任意の手順を、放送のない時間に 1 つずつ。`service` は適用のあとに、スピーカーから実際に鳴らして確かめる | `sudo bash scripts/harden.sh updates`、`sudo bash scripts/harden.sh ntp`、`sudo bash scripts/harden.sh service`、`sudo bash scripts/harden.sh --test-sound` |
-| 10 | 最後の確認。`[要対応]` が 0 件で、各手順が「適用済み」、「確定待ち」が残っていないこと | `bash scripts/security_check.sh`、`sudo bash scripts/harden.sh`、`python3 campus_chime.py --status` |
+| 10 | 最後の確認。`[要対応]` が 0 件で、**`[不明]` も残っていない**こと。各手順が「適用済み」で、「確定待ち」が残っていないこと | `sudo bash scripts/security_check.sh`、`sudo bash scripts/harden.sh`、`python3 campus_chime.py --status` |
 
 補足です。
 
-- `OS-KERNEL` の `[OK]` は、「カーネルの作成日が 2026-07-04 より新しい」という**目安**にすぎません。Raspberry Pi のカーネルに各修正がいつ入ったかは確かめられておらず、
+- 「カーネルの新しさ」の `[OK]` は、「カーネルの作成日が 2026-07-04 より新しい」という**目安**にすぎません。Raspberry Pi のカーネルに各修正がいつ入ったかは確かめられておらず、
   `[OK]` は 6 件すべてが直った証明ではありません。古い日付なら、未修正とみなして更新します。
 - `--ssh-from` を付けないと、Pi と同じネットワーク全体に SSH を許します。管理に使うネットワークだけを書くのをおすすめします。
-  いまつながっている SSH の相手が許す範囲に入っていないと、何も変えずに止まります。
+  いまつながっている SSH の相手が許す範囲に入っていないと、何も変えずに止まります（この画面が SSH 経由なら、`--force` でも止まります）。sshd のポートが 22 以外でも、実際に待ち受けているポートを開けます。
 - 変更の前に開いた画面からは確定できません（新しい画面から）。公開鍵が未登録のときは、何も変えずに止まります。
-- `updates` の自動更新の対象は `apt-cache policy` から作ります。適用のあと、`sudo unattended-upgrade --dry-run -d` で対象が出るかを確かめます（未実行）。
+- `updates` は、OS の時間帯が放送の時間帯と違うとき、設定した放送が 4:30〜6:30 にあるとき、次の放送まで 10 分に満たないときに止まります（OS が UTC のままだと、apt のタイマーが 14 時に動くため）。自動更新の対象は `apt-cache policy` から作ります。適用のあと、`sudo unattended-upgrade --dry-run -d` で対象が出るかを確かめます（未実行）。
   カーネルは再起動するまで効かないので、毎月の更新と再起動は続けます。
 - `ntp` は `systemd-timesyncd` を `chrony` に替えます。再同期は `sudo systemctl restart chrony` になります（KNOWLEDGE_BASE.md 4-5）。
 - `service` は放送サービスを再起動します（放送の終わりを待ってから）。SDL2／ALSA を保護の下で動かす試験は、32 ビット ARM では行えていません。音が出なければ
   `sudo bash scripts/harden.sh --rollback service`（KNOWLEDGE_BASE.md 4-12）。
 
-**閉め出されたら:** まず 10 分待ちます（確定しなければ自動で戻ります）。待てないときは、Pi に HDMI とキーボードをつないで `pi` でログインし、
+**閉め出されたら:** まず 10 分待ちます（確定しなければ自動で戻ります。`sudo` の手順は 5 分）。待てないときは、Pi に HDMI とキーボードをつないで `pi` でログインし、
 `cd /home/pi/campus-chime && sudo bash scripts/harden.sh --rollback ssh` を実行します。防火壁なら `--rollback firewall`、確定待ちを全部戻すなら `--rollback-pending`、
 適用したものを全部戻すなら `--rollback` です（SECURITY.md 7 節、KNOWLEDGE_BASE.md 4-10）。
 
-**毎月**（放送のない時間に）: `bash scripts/security_check.sh` → `sudo apt update && sudo apt full-upgrade` → `sudo reboot` → `python3 campus_chime.py --status`（SECURITY.md 6 節）。
+**毎月**（放送のない時間に）: `sudo bash scripts/security_check.sh` → `sudo apt update && sudo apt full-upgrade` → `sudo reboot` → `python3 campus_chime.py --status`（SECURITY.md 6 節）。
 
 ---
 
@@ -231,7 +234,7 @@
   Pi の管理者の権限に届く**ので、必ず自分の目で読んでください（AI が出した Pull Request も同じです）。
 - 「必須のステータスチェック」は、最初は付けずに始めてください。チェックの名前を間違えると、全部の Pull Request がマージできなくなります。付けるときは、成功した Pull Request の Checks 一覧に出る名前を選びます。
 - `tag.yml` はタグだけを push するので、ブランチのルールには当たらない見込みです（GitHub の仕様の理解による。未確認）。Pull Request は「Create a merge commit」か「Squash and merge」でマージします（`tag.yml` の注意書き）。
-- Pi の origin は `https://` のままにし、トークンや書き込みの鍵を Pi に置かないでください（`security_check.sh` の `REPO-REMOTE` が見ます）。
+- Pi の origin は `https://` のままにし、トークンや書き込みの鍵を Pi に置かないでください（`security_check.sh` の「リポジトリの取得元」の行が見ます）。
 
 ---
 
@@ -245,7 +248,7 @@
 | 2 | A | **時計の見張り:** 起きるたびに、壁時計の進みと単調時計の進みを比べ、大きく食い違ったら WARNING を出して「今日は放送済み」の記録（`last_fired`）を消す | `chime/app.py`（`run_forever`）、`chime/state.py` | 日付だけを比べる見張りでは足りない。副作用は、猶予の中にずれが来たとき、最大 1 回余分に鳴る程度。`tests/test_state.py` の更新が要る。電源投入直後（時刻同期の前）に古い時計で鳴る問題は、設計上の割り切り（REQUIREMENTS.md NFR-04）のまま |
 | 3 | B | **JSON の読み込みを落ちないように:** 極端な値を `JsonFileError` に直す、サイズの上限、通常のファイルだけを開く | `chime/jsonfile.py`（`read_json`） | 書き込める人にしか起こせないので、緊急ではない（#11） |
 | 4 | B | **単一起動のロック:** 二重に動かない（`flock`） | `campus_chime.py` の起動部分 | コードの読みだけで、未実行（#10） |
-| 5 | C | **マニフェストのファイル名を閉じ込める:** 作り置きのフォルダの外を指すファイル名を拒む（実行時の検索と `generate_voicevox.py --prune` の両方） | `chime/tts.py`、`scripts/generate_voicevox.py` | #9 |
+| 5 | C | **マニフェストのファイル名を閉じ込める:** 作り置きのフォルダの外を指すファイル名を拒む（実行時の検索と、`generate_voicevox.py` の整理の両方） | `chime/tts.py`、`scripts/generate_voicevox.py` | #9 |
 | 6 | C | **管理者で実行したときの案内を、他の CLI のモードにも:** いまは `--pause-*` だけ | `chime/cli.py` | `setup.sh` は管理者でも動き、終了コード 2 を「`config.json` を読めない」に割り当てている。ガードと衝突するので、`setup.sh` に `update.sh` と同じ早めの確認を入れるか、別の終了コードにする |
 | 7 | C | **`time_signal.wav` を原子的に書く**（一時ファイルに書いて `os.replace`） | `chime/timesignal.py`（`generate_time_signal`） | `--generate-assets` が `setup.sh` から毎回走るので、実害の窓は小さい（#10） |
 | 8 | A（効果大、手間も大） | **署名つきデプロイタグ（任意）:** `/etc/campus-chime/deploy-fingerprint` があるときだけ、`refs/tags/deploy/*` を取り込み、固定した指紋で署名された最新のタグへ `git merge --ff-only`。なければ従来どおり `git pull --ff-only`。「検証できる版がない」は終了コード 65 | `scripts/update.sh`、テスト（偽のリポジトリは署名なしなので**任意**にする）、文書 | 名前空間は **`deploy/vX.Y.Z`**。`tag.yml` が作る `vX.Y.Z` は署名なしの bot のタグで、使うと毎回止まる。`git verify-tag` は、信頼していない鍵でも正しい署名なら 0 を返すので、`--raw` の `VALIDSIG` で指紋を固定する。署名は**その下の履歴全部**を保証するので、署名の前に先端を読む。毎回署名が要り、鍵をなくすと更新が止まる。`update.sh` は自分を途中で更新しないので、最初の 1 回は手で `git pull`。**GPG（git 2.43）だけ試験。SSH 署名と Bookworm の git 2.39 は未試験**。試作のパッチはリポジトリに残していない（作り直しになる） |
@@ -255,8 +258,8 @@
 - **見張り:** `campus_chime.service` の `WatchdogSec` と `sd_notify`（ハング対策）、または `/etc/systemd/system.conf.d/` の `RuntimeWatchdogSec=15`（OS のハングだけ。先に `ls /dev/watchdog*`）。止まったままの `aplay` には前者が要ります。
 - **`scripts/audit.sh`:** 月 1 回の点検をまとめる読み取り専用のスクリプト。`security_check.sh` が多くを兼ねているので、足りない所だけ。
 - **`.github/CODEOWNERS`**（`campus_chime.service`・`scripts/`・`.github/`・`requirements.txt`・`chime/audio.py`）、**`.github/dependabot.yml`**、Actions の**コミットの SHA での固定**。
-- **ユニットの強化をリポジトリ側で行う場合:** `setup.sh` で `mkdir -p cache assets/generated` を先に行い、SPECIFICATION.md 6.1 章を `campus_chime.service` と一致させます（`tests/test_docs.py` が比べます）。
-  書き込み先が無いとサービスが起動しないためです。`harden.sh service` は追加設定とフォルダの作成でこれを避けているので、急ぎません（SPECIFICATION.md 6.3 章）。
+- **ユニットの強化をリポジトリ側で行う場合:** SPECIFICATION.md 6.1 章を `campus_chime.service` と一致させます（`tests/test_docs.py` が比べます）。
+  書き込み先が無いとサービスが起動しないためです。`harden.sh service` は追加設定とフォルダの作成でこれを避けており、`setup.sh` も、再起動の前に `cache/` と `assets/generated/` を実行している利用者で作るようになったので、急ぎません（SPECIFICATION.md 4.19 章、SPECIFICATION.md 6.3 章）。ただし、`setup.sh` が作るのは既定の 2 つだけで、`config.json` で書き込み先を変えているときの場所は、`harden.sh service` が求めて作ります。
 - **文書:** OS の版（Bookworm）の明記、`requirements.txt` の pip の注意、CI の Python 3.9 の扱い。
 
 ---
@@ -269,13 +272,13 @@
 |---|---|---|
 | 実機の Pi の状態すべて（アドレス・有効なサービス・sudoers・sshd の設定・バージョン） | 実機に触れていない | #1・#4 の重さが変わる。7.2 節のコマンドで確かめる |
 | 学外から Pi に届くか | 大学の防火壁は Pi の中から見えない | 届くなら #1 は「高」 |
-| カーネルの KEV 修正が、Raspberry Pi の apt のカーネルに入った時期 | 公式のページが見つからなかった。パッケージ名も推測（`linux-image-rpi-v7` か `raspberrypi-kernel` か） | `OS-KERNEL` の日付（2026-07-04）は目安。CVE-2025-39682・CVE-2025-38352 の修正版は未確認 |
+| カーネルの KEV 修正が、Raspberry Pi の apt のカーネルに入った時期 | 公式のページが見つからなかった。パッケージ名も推測（`linux-image-rpi-v7` か `raspberrypi-kernel` か） | 「カーネルの新しさ」の日付（2026-07-04）は目安。CVE-2025-39682・CVE-2025-38352 の修正版は未確認 |
 | Raspbian が Debian の LTS の更新（例: python3.11 の `3.11.2-6+deb12u9`）を再構築するか | Raspbian の配布元を調べていない | 「更新したのに直っていない」可能性。32 ビット版の寿命の見通しも未確認 |
 | Wi-Fi の種類（共有パスワード・ゲスト・企業認証）、クライアント隔離、PMF／WPA3 | 実環境の情報 | #3・#8 の重さ。7.3 節の質問 |
 | `systemd 252`（Pi）と `chrony 4.3` の実際の動き | 作業環境は systemd 255 | `ntp`・`service` の効果と副作用。1 つずつ試す |
 | 保護（sandbox）の下での SDL2／ALSA の動き（armhf） | 試験できない | 音が出なくなる恐れ。`harden.sh --test-sound` と `harden.sh --rollback service` |
 | `harden.sh` の `ssh`・`firewall`・`sudo`・`ntp`・`updates` の実機での動き | 偽の環境でのテストのみ | 最初は `--dry-run` で内容を確かめ、1 手順ずつ |
-| `harden.sh` の途中に中断や外部コマンドの失敗が入ったときの動き | 偽の環境での試験で、元に戻す処理や確定の処理が実際と合わない場合が見つかり、直っていないものがある（DEVELOPMENT_LOG.md の 2026-10-24） | 実機では `--dry-run` で内容を確かめ、1 手順ずつ、HDMI とキーボードを手元に置いて行う（SECURITY.md 7 節）。直したらこの行を消す |
+| `harden.sh` の途中に中断や外部コマンドの失敗が入ったときの動き | 偽の環境での失敗・中断の試験で、元に戻す処理や確定の処理が実際と合わない場合が見つかり、直した（`sudo` の入力中の中断、控えのコピーの失敗、確定の記録の失敗、再適用の取り消し、など。DEVELOPMENT_LOG.md の 2026-10-24）。ただし試験は偽の環境で、実機の sshd・nft・systemd・sudo での動きは確かめていない。見つけていない不具合が残っているかもしれない | 実機では `--dry-run` で内容を確かめ、1 手順ずつ、HDMI とキーボードを手元に置いて行う（SECURITY.md 3 節の「始める前に」と 7 節） |
 | 署名タグの SSH 署名版、Bookworm の git 2.39 | 試験環境に無い | 6 章 8 |
 | GitHub の画面の名前・ルールの実際の効き方 | つないでいない | 5 章 |
 | Debian の通常の支援の終了日 | 資料で 2026-07-11／07-12／（古い見込みの）06-11 とずれがある。記事の原文は開いていない | 8.2 節 |
@@ -305,7 +308,7 @@ dpkg -l | grep -i connectivity                                      # NetworkMan
 
 ### 7.3 運用者への質問
 
-1. Pi のアドレスは何ですか（`security_check.sh` の `NET-ADDR4`／`NET-ADDR6`）。学外から 22 番に届きますか。情報基盤の担当者に聞けますか。
+1. Pi のアドレスは何ですか（`security_check.sh` の「IPv4 アドレス」「IPv6 アドレス」の行）。学外から 22 番に届きますか。情報基盤の担当者に聞けますか。
 2. どの Wi-Fi ですか（共有パスワードなら何人が知っているか、ゲスト、企業認証）。クライアント隔離はありますか。近くに有線の口はありますか（DHCP の予約、MAC 登録）。
 3. 管理は、どの PC から、どのネットワーク（固定のアドレスか）から行いますか（`--ssh-from` に書く値です）。
 4. `sudo` がパスワードなしなのは、意図したものですか。更新のたびに `update.sh` でパスワードを入力しても構いませんか。
@@ -370,9 +373,27 @@ CPython・SDL・pygame・mpg123・ALSA・OpenSSH・systemd・avahi・BlueZ・wpa
 
 ### 8.4 リポジトリ内
 
-- `scripts/security_check.sh`（項目名: `NET-ADDR4`／`NET-ADDR6`／`NET-LISTEN`／`NET-FW`／`SSH-PASSWORD`／`SSH-KEYS`／`SUDO-NOPASSWD`／`OS-KERNEL`／`OS-REBOOT`／`OS-UPDATES`／`OS-AUTOUPDATE`／`TIME-SYNC`／`REPO-STRAY`／`HARDEN-PENDING` ほか）
+- `scripts/security_check.sh`（項目の ID は、スクリプトのコメントにある開発者向けの名前で、**点検の画面には出ません**。画面に出る分類の名前は、次の対応表のとおりです）
 - `scripts/harden.sh`（手順 `ssh`・`firewall`・`sudo`・`services`・`journal`・`updates`・`service`・`ntp`、`recommended`、`--confirm`・`--rollback`・`--rollback-pending`・`--dry-run`・`--test-sound`・`--ssh-from`・`--ntp-server`・`--revert-after`・`--force`・`--user`）
 - [SECURITY.md](SECURITY.md)（運用の手引き）
 - [KNOWLEDGE_BASE.md](KNOWLEDGE_BASE.md) 4-5（時刻の再同期）・4-10（閉め出されたとき）・4-11・4-12、同じく 5 章（毎月の点検）
 - [SETUP.md](SETUP.md)（公開鍵認証、導入の最後の安全面の手順）
 - [SPECIFICATION.md](SPECIFICATION.md) 4.19 章（点検と強化のスクリプト）、SPECIFICATION.md 6.3 章（追加設定）
+
+点検の項目の ID と、画面に出る分類の名前（開発者向け。運用の手順では、画面の名前で書きます）:
+
+| 項目の ID | 画面に出る分類の名前 |
+|---|---|
+| `NET-ADDR4`・`NET-ADDR6` | 「IPv4 アドレス」・「IPv6 アドレス」 |
+| `NET-LISTEN`・`NET-FW` | 「待ち受けポート」・「防火壁」 |
+| `SSH-ACTIVE`・`SSH-PASSWORD`・`SSH-ROOT` | 「SSH の稼働」・「SSH パスワードログイン」・「SSH の root ログイン」 |
+| `SSH-KEYS`・`SSH-FAILED`・`SSH-LOGINS` | 「SSH 公開鍵」・「SSH 失敗ログイン」・「SSH ログイン履歴」 |
+| `SUDO-NOPASSWD`・`USER-PASSWORD` | 「sudo のパスワード」・「利用者のパスワード」 |
+| `OS-RELEASE`・`OS-KERNEL`・`OS-REBOOT` | 「OS の版」・「カーネルの新しさ」・「再起動の要否」 |
+| `OS-UPDATES`・`OS-AUTOUPDATE` | 「更新の状況」・「自動更新」 |
+| `TIME-SYNC`・`TIME-SOURCE` | 「時刻の同期」・「時刻の同期元」 |
+| `SVC-BLUETOOTH`・`SVC-MODEM`・`SVC-AVAHI`・`SVC-RPICONNECT` | 「Bluetooth」・「ModemManager」・「Avahi」・「Raspberry Pi Connect」 |
+| `LOG-PERSIST`・`CHIME-UNIT`・`CHIME-SANDBOX` | 「ログの保存」・「時報サービスの定義」・「時報サービスの隔離」 |
+| `REPO-REMOTE`・`REPO-PERMS`・`REPO-HOOKS`・`REPO-STRAY` | 「リポジトリの取得元」・「リポジトリの書き込み権限」・「Git フック」・「リポジトリの管理外ファイル」 |
+| `PY-USERSITE`・`HARDEN-PENDING` | 「pip の pygame」・「harden.sh の保留」 |
+| （ID なし） | 「利用者」（調べる利用者。`--user` で指定した名前が見つかるか） |

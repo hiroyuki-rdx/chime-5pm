@@ -11,8 +11,10 @@
 #   bash scripts/security_check.sh --user NAME    # サービスと管理に使うユーザー（既定は pi）
 #   bash scripts/security_check.sh --help         # この説明を表示する
 #
-# ファイルは書かない（一時ファイルも作らない）。サービスにも触れない。root でないときに
-# 使う sudo は、設定を一覧するだけの sudo -n -l（パスワードは聞かない）だけ。
+# ファイルは書かない（一時ファイルも作らない）。apt の索引の作り直しもしない（apt を使うときは、
+# 索引の写し pkgcache.bin・srcpkgcache.bin の保存先を空にして、root でも何も書かせない）。
+# サービスにも触れない。root でないときに使う sudo は、設定を一覧するだけの sudo -n -l
+# （パスワードは聞かない）だけ。
 # 終了コードは、[要対応] が無ければ 0、1 件以上あれば 1、使い方の間違いは 2。
 #
 # この点検は「Pi には学内のネットワークからだけ届く（ポート転送はしていない）」という
@@ -102,6 +104,15 @@ need_root() {
 
 # -- 道具 ------------------------------------------------------------------------
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# apt の道具（apt-get・apt-cache・apt-config）は、必ずこれを通して呼ぶ: apt_read 道具名 引数...
+# root で apt を動かすと、索引の写し（/var/cache/apt の pkgcache.bin・srcpkgcache.bin）を作り直して
+# しまうので、その保存先を空にして、何も書かせない（索引はそのつど、メモリの中に作る）。
+apt_read() {
+  local tool=$1
+  shift
+  "${tool}" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= "$@"
+}
 
 trim() {
   local s=$1
@@ -1041,7 +1052,7 @@ check_os_updates() {
     stale=1
   fi
   if have apt-get; then
-    pending="$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | awk '/^Inst / { n++ } END { print n + 0 }')" || pending=""
+    pending="$(apt_read apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | awk '/^Inst / { n++ } END { print n + 0 }')" || pending=""
   fi
   if [ -n "${pending}" ]; then
     pending_text="。未適用の更新は ${pending} 件（apt の手元のリストからの見積りで、最新とは限りません）"
@@ -1059,13 +1070,13 @@ check_os_updates() {
 
 # apt-cache policy の release 行（o=Raspbian,a=stable,n=bookworm,l=Raspbian,c=main,b=armhf）だけを出す。
 policy_releases() {
-  apt-cache policy 2>/dev/null | sed -n 's/^[[:space:]]*release[[:space:]][[:space:]]*//p'
+  apt_read apt-cache policy 2>/dev/null | sed -n 's/^[[:space:]]*release[[:space:]][[:space:]]*//p'
 }
 
 # unattended-upgrades の Origins-Pattern を 1 行に 1 つ出す。
 # shellcheck disable=SC2016
 configured_origin_patterns() {
-  apt-config dump 2>/dev/null | sed -n 's/^Unattended-Upgrade::Origins-Pattern::[[:space:]]*"\(.*\)";[[:space:]]*$/\1/p'
+  apt_read apt-config dump 2>/dev/null | sed -n 's/^Unattended-Upgrade::Origins-Pattern::[[:space:]]*"\(.*\)";[[:space:]]*$/\1/p'
 }
 
 # 更新元の指定（origin=...,codename=...,label=...）が、release 行（o=...,n=...,l=...）に当てはまるか。
@@ -1113,7 +1124,7 @@ check_os_autoupdate() {
     fixline "sudo bash scripts/harden.sh updates"
     return 0
   fi
-  periodic="$(apt-config dump 2>/dev/null | sed -n 's/^APT::Periodic::Unattended-Upgrade[[:space:]]*"\([^"]*\)";.*$/\1/p')" || periodic=""
+  periodic="$(apt_read apt-config dump 2>/dev/null | sed -n 's/^APT::Periodic::Unattended-Upgrade[[:space:]]*"\([^"]*\)";.*$/\1/p')" || periodic=""
   if [ -z "${periodic}" ] || [ "${periodic}" = "0" ]; then
     emit 注意 "${category}" "unattended-upgrades は入っていますが、毎日の実行が有効になっていません（APT::Periodic::Unattended-Upgrade が 0 か未設定）"
     fixline "sudo bash scripts/harden.sh updates"
@@ -1465,17 +1476,54 @@ check_py_usersite() {
 }
 
 # HARDEN-PENDING
+# harden.sh の確定待ちの記録（pending ファイル）は、1 行に 1 つ: 手順ごとの「ssh=時刻」「firewall=時刻」「sudo=時刻」と、
+# 自動で戻るまでの「window=分数」。手順が 1 つも無い記録（window だけ・空）は、止められて残ったもので、確定待ちではない。
 check_harden_pending() {
   local category="harden.sh の保留" state_dir="${SYSROOT}/var/lib/campus-chime-harden"
+  local pending_file line window="" harden steps=() has_ssh=0 has_firewall=0 has_sudo=0
+  pending_file="${state_dir}/pending"
   if [ ! -d "${state_dir}" ]; then
     emit OK "${category}" "確定待ちの変更はありません（harden.sh はまだ使われていません）"
-  elif ! is_root; then
+    return 0
+  fi
+  if ! is_root; then
     need_root "${category}"
-  elif [ -e "${state_dir}/pending" ]; then
-    emit 要対応 "${category}" "harden.sh の変更がまだ確定していません（確定しないと、時間がたつと自動で元に戻ります。既定は 10 分）"
-    fixline "新しい画面からログインできることを確かめ、sudo bash scripts/harden.sh --confirm"
-  else
+    return 0
+  fi
+  if [ -f "${pending_file}" ]; then
+    if [ ! -r "${pending_file}" ]; then
+      emit 不明 "${category}" "確定待ちの記録（${pending_file#"${SYSROOT}"}）を読めませんでした"
+      return 0
+    fi
+    while IFS= read -r line || [ -n "${line}" ]; do
+      case "${line}" in
+        ssh=*) has_ssh=1 ;;
+        firewall=*) has_firewall=1 ;;
+        sudo=*) has_sudo=1 ;;
+        window=*) window="${line#window=}" ;;
+      esac
+    done < "${pending_file}"
+  fi
+  if [ "${has_ssh}${has_firewall}${has_sudo}" = 000 ]; then
     emit OK "${category}" "確定待ちの変更はありません"
+    return 0
+  fi
+  if [ "${has_ssh}" -eq 1 ]; then steps+=(ssh); fi
+  if [ "${has_firewall}" -eq 1 ]; then steps+=(firewall); fi
+  if [ "${has_sudo}" -eq 1 ]; then steps+=(sudo); fi
+  # 分数が読めないときは、harden.sh の既定（REVERT_AFTER）と同じ 10 分。
+  case "${window}" in '' | *[!0-9]*) window=10 ;; esac
+  # 直し方に書く harden.sh は、この点検がいるリポジトリの絶対パス（どこで実行しても、そのまま貼れる）。
+  harden="$(printf '%q' "${REPO_DIR}/scripts/harden.sh")"
+  if [ "${has_ssh}" -eq 1 ] || [ "${has_firewall}" -eq 1 ]; then
+    emit 要対応 "${category}" "harden.sh の変更がまだ確定していません（手順: $(join_ja "${steps[@]}")）。確定しないと ${window} 分で自動で元に戻ります"
+    fixline "新しい端末（別の画面）を開き、鍵でログインできることを確かめてから、その新しい端末で  sudo bash ${harden} --confirm"
+    if [ "${has_sudo}" -eq 1 ]; then
+      more "sudo の手順も途中で止まっています。こちらは確定の操作では確定できず、${window} 分以内に自動で元に戻ります（パスワードなしの sudo が戻る）"
+    fi
+  else
+    emit 要対応 "${category}" "sudo の手順が途中で止まりました。数分で自動で元に戻ります（パスワードなしの sudo が戻る）"
+    fixline "確定の操作は要りません。自動で戻る（最長 ${window} 分）のを待ち、パスワードなしの sudo が戻ってから、もう一度  sudo bash ${harden} sudo"
   fi
   return 0
 }
@@ -1542,15 +1590,22 @@ main() {
 
   log "まとめ"
   printf '要対応 %d 件・注意 %d 件・不明 %d 件\n' "${N_NG}" "${N_WARN}" "${N_UNK}"
+  # [不明] が 1 件でもあれば、調べ終わっていない。「要対応 0 件」を合格と読まないよう、すぐ下に書く。
+  if [ "${N_UNK}" -gt 0 ]; then
+    if is_root; then
+      printf '\n%s※ 点検は完全ではありません。[不明] の %d 件は調べられていません（理由は上の各行にあります）。[要対応] が 0 件でも、安全と確かめられたわけではありません。%s\n' "${C_BOLD}" "${N_UNK}" "${C_RESET}"
+    else
+      printf '\n%s※ 点検は完全ではありません。root でないため、[不明] の %d 件を調べられていません。[要対応] が 0 件でも、安全と確かめられたわけではありません。%s\n' "${C_BOLD}" "${N_UNK}" "${C_RESET}"
+      printf '  この結果は、確認の合格には使えません。すべて調べるには、sudo を付けて実行してください:\n'
+      printf '    sudo bash scripts/security_check.sh\n'
+    fi
+  fi
   if [ "${GLOBAL_FOUND}" -eq 1 ]; then
     printf '\n%s※ この Pi は、グローバルアドレス（%s）を持っています。%s\n' "${C_BOLD}" "$(join_ja "${GLOBAL_ADDRS[@]}")" "${C_RESET}"
     printf '  学外から届くかどうかは、大学の防火壁の設定しだいで、この点検では確かめられません。\n'
     printf '  「学内からだけ届く」という前提が成り立つかを、必ず学外（スマホのテザリングなど）から確かめてください:\n'
     printf '    nc -vz %s 22\n' "${GLOBAL_ADDRS[0]}"
     printf '  つながるなら、危険度は上の表示より一段高く考えてください（SSH のパスワードログインは「高」）。\n'
-  fi
-  if ! is_root && [ "${N_UNK}" -gt 0 ]; then
-    printf '\nroot でないため、調べられなかった項目があります（[不明]）。すべて調べるには:  sudo bash scripts/security_check.sh\n'
   fi
   if [ "${N_NG}" -gt 0 ]; then
     return 1

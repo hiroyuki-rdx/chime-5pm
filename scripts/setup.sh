@@ -7,6 +7,9 @@
 #   bash scripts/setup.sh --no-apt     # apt を実行しない
 #   bash scripts/setup.sh --no-service # systemd への登録を行わない
 #
+# サービスの再起動の前に、サービスが書き込むフォルダ（cache/ と assets/generated/）を、実行している
+# 利用者で作る（scripts/harden.sh の service 手順の保護の下では、無いフォルダには書き込めないため）。
+# root で実行しているときは作らない（root 所有になり、サービス（pi）が書けなくなるため。警告だけ出す）。
 # サービスの再起動に成功したら、そのときのコミットを cache/deployed_commit に記録する
 # （scripts/update.sh が、サービスに反映済みの版かどうかを判断するのに使う）。
 # 設定ファイル（config.json）を読めないときは、サービスを再起動せず、終了コード 1 で終わる。
@@ -55,6 +58,32 @@ record_deployed_commit() {
          && mv -f "${REPO_DIR}/cache/deployed_commit.tmp" "${REPO_DIR}/cache/deployed_commit"; } 2>/dev/null; then
     warn "サービスに反映した版の記録（cache/deployed_commit）を書けませんでした。放送には影響しません（次の update.sh は、念のため続きの反映を行います）。"
   fi
+}
+
+# サービスが書き込むフォルダ（リポジトリからの相対）を、再起動の前に用意する。
+# harden.sh の service 手順は ProtectSystem=strict と、書き込みを許す場所（ReadWritePaths=-<リポジトリ>/cache など。
+# 先頭の - は「無ければ無視」）を設定する。新規の checkout では、これらのフォルダはまだ無い（cache/ は再起動の
+# あとの record_deployed_commit が初めて作る）ので、先に作らないと、保護の下のサービスは状態を保存できない。
+# 作るのは実行している利用者で、sudo は使わない。root で実行しているときは作らない
+# （root 所有のフォルダは、サービス（pi）が書けなくなる）。作れなくても導入は止めない（警告だけ）。
+SERVICE_WRITE_DIRS=(cache assets/generated)
+prepare_service_dirs() {
+  local rel missing=""
+  if [ "$(id -u)" -eq 0 ]; then
+    for rel in "${SERVICE_WRITE_DIRS[@]}"; do
+      [ -d "${REPO_DIR}/${rel}" ] || missing+="${missing:+ }${rel}/"
+    done
+    if [ -n "${missing}" ]; then
+      warn "root で実行しているため、サービスが書き込むフォルダ（${missing}）は作りません（root 所有になり、サービスが書けなくなるため）。"
+      warn "保護（harden.sh の service 手順）を適用している場合は、pi などサービスの利用者で作ってください: mkdir -p ${missing}"
+    fi
+    return 0
+  fi
+  for rel in "${SERVICE_WRITE_DIRS[@]}"; do
+    if ! mkdir -p "${REPO_DIR}/${rel}" 2>/dev/null; then
+      warn "サービスが書き込むフォルダ（${rel}/）を作れませんでした。保護（harden.sh の service 手順）を適用している場合、サービスは状態を保存できません。"
+    fi
+  done
 }
 
 log "設置パスの確認"
@@ -159,6 +188,7 @@ if [ "${DO_SERVICE}" -eq 1 ]; then
     alert "サービスを再起動していません（設定ファイルを読めないため）。今動いている分は、そのまま動き続けます。"
     warn "config.json を直したあと、もう一度 bash scripts/setup.sh --no-apt を実行してください。"
   else
+    prepare_service_dirs
     sudo systemctl restart "${SERVICE_NAME}"
     sleep 2
     record_deployed_commit

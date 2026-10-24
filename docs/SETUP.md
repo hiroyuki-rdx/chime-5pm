@@ -206,7 +206,7 @@ bash scripts/setup.sh
 5. 時報音（`assets/generated/time_signal.wav`）の生成と、時刻アナウンスの音声（作り置き）の確認
 6. 設置状態の点検（`--check`。音は鳴らず、何も書きません。NG があれば「直し方」を表示して先へ進みます）
 7. 予定表の表示
-8. systemd への登録・有効化・起動。再起動に成功したら、そのときのコミットを `cache/deployed_commit` に記録します（`update.sh` が、サービスが最新のコードで動いているかを見分けるのに使います）
+8. systemd への登録・有効化・起動。再起動の前に、サービスが書き込むフォルダ（`cache/` と `assets/generated/`）を、実行している利用者（`pi`）で用意します（あとで `harden.sh service` の保護をかけても、サービスが状態を保存できるように。root で実行したときは作らず、警告だけを出します）。再起動に成功したら、そのときのコミットを `cache/deployed_commit` に記録します（`update.sh` が、サービスが最新のコードで動いているかを見分けるのに使います）
 
 6 で `config.json` を読めなかったとき（`--check` の終了コードが 2）だけは、7 を省き、8 でサービスを再起動しません（読めない設定で再起動すると、起動できないまま再起動を繰り返すため）。このときは最後に「導入は途中です」と表示して**終了コード 1** で終わります。サービスの登録を省く `--no-service` を付けても、同じく終了コード 1 で終わります（「完了」とは表示しません）。`config.json` を直して、もう一度実行してください。
 
@@ -1225,16 +1225,16 @@ python3 campus_chime.py --test-hourly 12
 - [ ] `python3 campus_chime.py --status` の「放送の休止」が「止めていません」（試しに止めたなら、`--pause-off` で戻してある）
 - [ ] スピーカーの音量が実際の運用位置で適切
 - [ ] 実際の正時（例: 14:00）に立ち会って放送を確認した
-- [ ] `bash scripts/security_check.sh` で `[要対応]` が 0 件（直し方は次の「最後に」と [SECURITY.md](SECURITY.md)）
+- [ ] `sudo bash scripts/security_check.sh` で `[要対応]` が 0 件で、`[不明]` も残っていない（`sudo` なしで実行すると、root が要る項目が `[不明]` になり、点検は完全になりません。直し方は次の「最後に」と [SECURITY.md](SECURITY.md)）
 
-**最後に、安全にします。** 導入が終わったら、安全面の点検をして、見つかった点を直します。`bash scripts/security_check.sh` は読むだけで、何も変えません。直すときは `sudo bash scripts/harden.sh ssh` のように手順を選んで実行します（どれも元に戻せます）。
+**最後に、安全にします。** 導入が終わったら、安全面の点検をして、見つかった点を直します。`sudo bash scripts/security_check.sh` は読むだけで、何も変えません。直すときは `sudo bash scripts/harden.sh ssh` のように手順を選んで実行します（元に戻す仕組みがあります。ただし、本物の Pi ではまだ動かしておらず、限界もあります。最初は `--dry-run` で内容を見て、**1 手順ずつ**、放送のない時間に行います）。
 
 ```bash
 cd /home/pi/campus-chime
-bash scripts/security_check.sh
+sudo bash scripts/security_check.sh
 ```
 
-進める順（鍵の設定 → 防火壁 → `sudo` → ログ …）、手順ごとの放送への影響、締め出されたときの戻し方、毎月の点検は **[SECURITY.md](SECURITY.md)** にあります。
+進める順（鍵の設定 → 防火壁 → `sudo` → ログ …）、始める前の注意、手順ごとの放送への影響、元に戻す仕組みの限界、締め出されたときの戻し方、毎月の点検は **[SECURITY.md](SECURITY.md)** にあります。
 
 ---
 

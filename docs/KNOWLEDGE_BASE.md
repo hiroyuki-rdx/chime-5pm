@@ -15,7 +15,7 @@
 | ログ | `journalctl -u campus_chime.service`（起動時の先頭に、版とコミット `campus-chime 6.1.0 (a1b2c3d)` と、作り置きの音声の件数が出る） |
 | 状態・点検 | `python3 campus_chime.py --status`（版・時刻の同期・サービス・放送の休止・直近の放送・次の予定・近い休館日）／`--check`（設置状態）。どちらも鳴らさず、何も書かない（3-6） |
 | 更新 | `bash scripts/update.sh`（3-3） |
-| 安全面 | `bash scripts/security_check.sh`（読むだけの点検）／`sudo bash scripts/harden.sh`（強化。手順ごとに選べて、元に戻せる）。進め方と毎月の点検は [SECURITY.md](SECURITY.md) |
+| 安全面 | `sudo bash scripts/security_check.sh`（読むだけの点検。`sudo` なしだと `[不明]` が出て完全ではない）／`sudo bash scripts/harden.sh`（強化。手順ごとに選べる。元に戻す仕組みつき。本物の Pi では未試験）。始める前の注意、進め方、毎月の点検は [SECURITY.md](SECURITY.md) |
 | 止める・休む | 行事や点検の日は `--pause-today`（今日だけ）・`--pause-until 日付`（その日まで。最長 31 日）。サービスは止めず、再起動も要らない（3-4）。決まった休みは設定の `schedule.closures`（休館日）。**祝日は自動では休まない** |
 | 設定 | `/home/pi/campus-chime/config.json`（Git 管理外） |
 | ネットワーク依存 | 天気予報のみ（既定で有効。12 時のみ）。切れても時報音・時刻の読み上げ・ひとこと・蛍の光は鳴る |
@@ -56,7 +56,7 @@ python3 campus_chime.py --version          # 版とコミット
 bash scripts/update.sh
 
 # 安全面の点検（読むだけ。何も変えない。進め方は SECURITY.md）
-bash scripts/security_check.sh             # root が要る項目も調べるなら sudo を付ける
+sudo bash scripts/security_check.sh        # sudo なしだと root が要る項目が [不明] になる
 sudo bash scripts/harden.sh                # 強化の手順の状態（適用済み・確定待ち・未適用）
 
 # ログ
@@ -555,7 +555,7 @@ sudo iw dev wlan0 set power_save off   # 省電力による切断を防ぐ（応
 
 `sudo bash scripts/harden.sh ssh` や `firewall` を適用したあとで、入れなくなったときです（手順は [SECURITY.md](SECURITY.md)）。
 
-1. **まず待つ。** `ssh` と `firewall` は、新しい端末から `--confirm` しなければ、10 分（`--revert-after` で変えた分）で自動で元に戻ります。再起動した場合も、起動のあとに戻ります。
+1. **まず待つ。** `ssh` と `firewall` は、新しい端末から `--confirm` しなければ、10 分（`--revert-after` で変えた分）で自動で元に戻ります（`sudo` の手順は 5 分）。再起動した場合も、起動のあとに戻ります。ただし、OS が起動しない場合など、戻らないこともあります。
 2. 鍵で入れないとき: 登録した公開鍵を持つ PC から入っているか、鍵のパスフレーズが合っているかを見ます。`ssh -v pi@campus-chime.local` で、どの鍵を差し出しているかが分かります。`Permission denied (publickey)` なら、Pi に登録されていない鍵です。
 3. 防火壁で入れないとき: 入ろうとしている PC のネットワークが、`--ssh-from` で許した範囲に入っているかを見ます（範囲に入っていない PC は、`campus-chime.local` の名前解決もできないことがあります）。
 4. 待てない・戻らないときは、Pi に HDMI のディスプレイと USB キーボードをつなぎ、`pi` でログインして戻します。
@@ -566,6 +566,8 @@ sudo bash scripts/harden.sh --rollback ssh
 ```
 
 防火壁が原因なら `--rollback firewall` です。確定待ちをすべて戻すなら `sudo bash scripts/harden.sh --rollback-pending` です。
+
+新しい端末で `--confirm` するときは、ホームのフォルダから始まるので、`sudo bash /home/pi/campus-chime/scripts/harden.sh --confirm` のように場所を全部書きます。10 分を過ぎてから実行すると、「確定する変更はありません。ただし、これは確定できたからではありません。」と出て、終了コード 1 で終わります（すでに元に戻っています。[SECURITY.md](SECURITY.md) 4.3 節）。この表示を消すには、`sudo bash scripts/harden.sh --rollback`（手順を付けない）か、もう一度適用して確定します。
 
 ### 4-11. `update.sh` や `setup.sh` が、パスワードを聞くようになった
 
@@ -582,7 +584,9 @@ sudo bash scripts/harden.sh --rollback service
 python3 campus_chime.py --test-hourly 12
 ```
 
-音が戻れば、保護が原因です。`journalctl -u campus_chime.service -n 50 --no-pager` にエラーが出ていないか見て、問い合わせるときは、その出力と `bash scripts/security_check.sh` の出力を添えます。保護をかけたままの音は、`sudo bash scripts/harden.sh --test-sound` で確かめられます（12 時の時報を 1 回、実際に鳴らします）。
+音が戻れば、保護が原因です。`journalctl -u campus_chime.service -n 50 --no-pager` にエラーが出ていないか見て、問い合わせるときは、その出力と `sudo bash scripts/security_check.sh` の出力を添えます。もう一度試すなら、`sudo bash scripts/harden.sh service --test-sound` です（保護をかけ直して、12 時の時報を 1 回、実際に鳴らして確かめます。放送のない時間に行います）。戻したあとは保護の設定が無いので、`--test-sound` だけでは試せません。
+
+音は出るのに、記録（`cache/`）や時報音（`assets/generated/`）が保存されないときは、`sudo bash scripts/harden.sh`（一覧）が「保護の下で書き込みを許したディレクトリが無くなっています」と警告していないか見ます。保護の下のサービスは、無いフォルダを自分では作れません。`bash scripts/setup.sh --no-apt`（`pi` で、`sudo` なし。サービスの再起動の前に、`cache/` と `assets/generated/` を作ります）か、警告に出た `mkdir` の命令で作ります。
 
 ---
 
@@ -591,7 +595,7 @@ python3 campus_chime.py --test-hourly 12
 | 頻度 | 作業 |
 |---|---|
 | 毎月 | 実際の正時に立ち会って放送を聴く／`--status` の「直近の放送」に「失敗」「一部のみ」が無いかと、`--check` が「すべて OK です。」になることを確認（3-6）／`journalctl -p err --since -30d` を確認（v5.3.0 から有効。それ以前は常に空だった。警告も見るなら `-p warning`） |
-| 毎月（放送のない時間に） | `bash scripts/security_check.sh` で `[要対応]` が 0 件であることを確認／`sudo apt update && sudo apt full-upgrade` のあと、**9:55〜17:05 を避けて**再起動して、`--status` で自動復帰を確認（カーネルは再起動してはじめて新しくなる）。詳しくは [SECURITY.md](SECURITY.md) |
+| 毎月（放送のない時間に） | `sudo bash scripts/security_check.sh` で `[要対応]` が 0 件で、`[不明]` も残っていないことを確認／`sudo apt update && sudo apt full-upgrade` のあと、**9:55〜17:05 を避けて**再起動して、`--status` で自動復帰を確認（カーネルは再起動してはじめて新しくなる）。詳しくは [SECURITY.md](SECURITY.md) |
 | 年 1 回 | SD カードの健全性確認（可能ならバックアップイメージを取得） |
 | 都度 | 長期休業前後にスケジュール（`weekdays` / `skip_hours`）と休館日（`schedule.closures`）を見直す。`--status` の「放送の休止」が「止めていません」に戻っているかも見る（止めたまま忘れていないか） |
 
@@ -621,7 +625,7 @@ python3 campus_chime.py --test-hourly 12
 | 止めた回は再生済みにしない（準備に入っていた回だけ、履歴に「止めていた」と残す） | 止めた直後に戻したとき、まだ間に合う回は鳴らせるようにするため。再生済みにすると、戻しても鳴らない。先に止めた日の回は、予定の選び直しで外すだけで、履歴は残さない（止めた期間と理由は `--status` の「放送の休止」で分かる） |
 | 音量は種類別（時報音・読み上げ・蛍の光）に `audio.volume` で絞り、OS（ALSA）の音量は高めに固定する | ALSA は全体で 1 つしか音量を持たない。アプリ側の設定なら種類ごとに絞れ、設定ファイルに残るので機械を作り直しても再現できる。範囲外・読めない値でも放送は止めない（丸める／1.0 にする） |
 | 停止要求で再生を止める（フェードアウトして 1 秒ほど）。止めた回は再生済みにする（音を出す前に止まった回は除く）。ユニットの `TimeoutStopSec` は 30 秒 | 以前は再生が終わるまで止まらず、蛍の光の途中で停止・再起動すると systemd が約 90 秒待って強制終了していた。音を出し始めた回を再生済みにしないと、再起動後に同じ放送を頭から鳴らし直してしまう。何も鳴っていない回は再生済みにせず、再起動のあと猶予のうちに鳴らし直す（鳴らないまま、その回を失わないため） |
-| 強化（`harden.sh`）は、手順ごとに選んで実行し、変える前にすべての条件を確かめ、変えたあとに確かめ、確かめられなければ自分で戻す。`ssh` と `firewall` は、新しい端末で入り直せることを確かめて `--confirm` するまで、10 分で自動で元に戻る | 無人の機械は、設定の間違いで締め出されると、現地へ行くまで直せない。放送が止まるより、強化が取り消されるほうがましなので、確定しない変更は戻す側に倒す。今の画面は変更のあとも生き続けるので、確かめは新しい画面で行う（[SECURITY.md](SECURITY.md)） |
+| 強化（`harden.sh`）は、手順ごとに選んで実行し、変える前にすべての条件を確かめ、変えたあとに確かめ、確かめられなければ自分で戻す。`ssh` と `firewall` は、新しい端末で入り直せることを確かめて `--confirm` するまで、10 分で自動で元に戻る。`sudo` は、パスワードの確認が終わるまでの 5 分だけ確定待ちにする | 無人の機械は、設定の間違いで締め出されると、現地へ行くまで直せない。放送が止まるより、強化が取り消されるほうがましなので、確定しない変更は戻す側に倒す。今の画面は変更のあとも生き続けるので、確かめは新しい画面で行う。これは戻す仕組みであって、締め出されない保証ではない（強制終了や電源断、OS が起動しない場合は戻らない。本物の Pi では未試験。[SECURITY.md](SECURITY.md) 3.2 節）。時計は先に張ってから確定待ちを記録する（逆だと「記録はあるのに時計が無い」状態で止まりうる）。確定した設定の控えは、新しい控えを置いてから古い控えを消す。`ssh`・`sudo` の変更の直前には `sync` で控えと時計をディスクへ出す |
 | `update.sh` は、止まるときは何も変えず、元の版へ戻す手順は表示するだけにする | 運用中の機械を、更新の途中で半端な状態にしないため。戻す操作は人が確かめてから実行する |
 | `setup.sh` が再起動に成功したときのコミットを `cache/deployed_commit` に記録し、`update.sh` はそれがいまの版と合わなければ、すでに最新版でも続きを反映する | 取り込みのあとで止まった（放送の時間帯が終わらない・`setup.sh` の失敗）あとにもう一度実行したとき、「すでに最新版です」で終わると、サービスが古い版のまま気づかれないため |
 

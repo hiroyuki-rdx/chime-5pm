@@ -11,11 +11,14 @@ security_check.sh は Pi の上で人が手で実行する、**読むだけ**の
   （169.254/16）・それ以外（グローバル）。大学が持つクラス B/C のアドレスを Pi が持つことが
   あるので、グローバルアドレスは、学外から届くかを確かめる方法と一緒に、はっきり警告する。
 * 終了コード（``[要対応]`` が無ければ 0、あれば 1、使い方の間違いは 2）と、まとめの行。
-* root と root でないときの違い（root が要る項目は ``[不明]`` と案内になる）。
+* root と root でないときの違い（root が要る項目は ``[不明]`` と案内になる）。``[不明]`` が残るときは、
+  まとめの数の行のすぐ下で「点検は完全ではない（``[要対応]`` 0 件は合格ではない）」と伝える。
 * **何も変更しない**こと。偽の ``/``（``CHIME_SYSROOT``）・リポジトリ・``TMPDIR`` の、パス・大きさ・
   更新時刻・権限・中身を、実行の前後で比べる。道具は読み取りだけの本物（許可した名前の一覧）と、
   呼ばれた記録を残す偽物だけで、``cp``・``mv``・``rm``・``mkdir``・``touch``・``chmod``・``mktemp``・``tee`` などは
   PATH に無い。偽物の呼ばれ方も、読む形（``systemctl is-active`` など）に限られることを確かめる。
+  apt の道具は、root で呼ぶと索引の写し（pkgcache.bin・srcpkgcache.bin）を作り直すので、その保存先を空にする
+  指定を、呼び出しのたびに付ける（偽物の呼ばれ方と、本物の apt を偽の木で動かした前後の比較で確かめる）。
 
 1 回の実行に 0.2 秒ほどかかるので、このファイルのテストは、いくつかのスレッドで並べて動かす
 （``ParallelSuite``。どのテストも自分専用の偽の ``/`` を作り、何も共有しない）。
@@ -108,6 +111,19 @@ STUB_PRELUDE = r"""#!/bin/sh
 { printf '%s' "${0##*/}"; for a in "$@"; do printf ' %s' "$a"; done; printf '\n'; } >> "$CALLS_LOG"
 refuse() { echo "${0##*/}: 読み取り以外の使い方は断ります: $*" >&2; exit 1; }
 out() { [ -f "$1" ] || return 0; while IFS= read -r l || [ -n "$l" ]; do printf '%s\n' "$l"; done < "$1"; }
+"""
+
+#: apt の道具（apt-get・apt-cache・apt-config）の偽物の先頭。実物は root で呼ぶと、索引の写し（pkgcache.bin・
+#: srcpkgcache.bin）を /var/cache/apt に作り直してしまうので、スクリプトは、その保存先を空にする
+#: 2 つの指定（``APT_RO_OPTIONS``）を必ず先頭に付ける。付いていない呼び方は断る（``$rest`` は、その指定の
+#: あとの引数）。
+APT_RO_OPTIONS = "-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache="
+APT_RO_PRELUDE = r"""
+case "$*" in
+  "-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= "*) ;;
+  *) refuse "$@" ;;
+esac
+rest="${*#-o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= }"
 """
 
 #: 偽物の本体。用意された答えは ``STUB_DATA`` の中のファイルと、環境変数から返す。
@@ -208,18 +224,18 @@ esac
 [ "$2" != "$4" ] || exit 1
 [ "$(printf '%s\n%s\n' "$2" "$4" | sort -V | tail -n 1)" = "$2" ]
 """,
-    "apt-get": r"""
-[ "$*" = "-s -o Debug::NoLocking=1 upgrade" ] || refuse "$@"
+    "apt-get": APT_RO_PRELUDE + r"""
+[ "$rest" = "-s -o Debug::NoLocking=1 upgrade" ] || refuse "$@"
 out "$STUB_DATA/apt_upgrade_s"
 exit 0
 """,
-    "apt-cache": r"""
-[ "$*" = "policy" ] || refuse "$@"
+    "apt-cache": APT_RO_PRELUDE + r"""
+[ "$rest" = "policy" ] || refuse "$@"
 out "$STUB_DATA/apt_policy"
 exit 0
 """,
-    "apt-config": r"""
-[ "$*" = "dump" ] || refuse "$@"
+    "apt-config": APT_RO_PRELUDE + r"""
+[ "$rest" = "dump" ] || refuse "$@"
 out "$STUB_DATA/apt_config"
 exit 0
 """,
@@ -298,9 +314,9 @@ ALLOWED_CALLS = [re.compile(pattern) for pattern in (
     r"^uptime -s$",
     r"^dpkg-query -W -f \S+ (linux-image-\*|unattended-upgrades)$",
     r"^dpkg --compare-versions \S+ gt \S+$",
-    r"^apt-get -s -o Debug::NoLocking=1 upgrade$",
-    r"^apt-cache policy$",
-    r"^apt-config dump$",
+    r"^apt-get {0} -s -o Debug::NoLocking=1 upgrade$".format(re.escape(APT_RO_OPTIONS)),
+    r"^apt-cache {0} policy$".format(re.escape(APT_RO_OPTIONS)),
+    r"^apt-config {0} dump$".format(re.escape(APT_RO_OPTIONS)),
     r"^timedatectl show(-timesync)? -p \w+ --value( |$)",
     r"^chronyc -n sources$",
     r"^journalctl -u ssh\.service --since -(7|30) days -o cat$",
@@ -847,7 +863,7 @@ class SecurityCheckCase(unittest.TestCase):
         write(os.path.join(self.repo, ".git", "hooks", "post-merge"), "#!/bin/sh\n", 0o755)
         self.stub_data("git_status", "?? evil.py\n")
         makedirs(self.sys("/home/pi/.local/lib/python3.11/site-packages/pygame"))
-        self.put("/var/lib/campus-chime-harden/pending", "ssh 1\n", 0o600)
+        self.put("/var/lib/campus-chime-harden/pending", "ssh=1\nwindow=10\n", 0o600)
 
     def install_stub(self, name: str) -> None:
         write(os.path.join(self.bin_dir, name), STUB_PRELUDE + STUB_BODIES[name], 0o755)
@@ -2514,14 +2530,111 @@ class HardenPendingTest(SecurityCheckCase):
         makedirs(self.sys(self.STATE + "/applied"))
         self.check_item("HARDEN-PENDING", "OK", "確定待ちの変更はありません")
 
-    def test_a_pending_change(self):
-        self.put(self.STATE + "/pending", "ssh 1760000000\n", 0o600)
-        item = self.check_item("HARDEN-PENDING", "要対応", "まだ確定していません", "10 分")
-        self.assertIn("sudo bash scripts/harden.sh --confirm", item.fix)
-        self.assertIn("新しい画面から", item.fix)
+    def put_pending(self, text):
+        self.put(self.STATE + "/pending", text, 0o600)
+
+    def harden_command(self, *words, repo=None):
+        # 直し方に書かれる harden.sh は、点検しているリポジトリの絶対パス。
+        path = os.path.join(repo or self.repo, "scripts", "harden.sh")
+        return " ".join(("sudo bash {0}".format(path),) + words)
+
+    def test_a_pending_ssh_or_firewall_change_names_the_steps_and_the_window(self):
+        # 表: (pending の中身, 手順の表示, 窓の分数)。sudo が一緒に残っていても、確定の案内は同じ。
+        table = [
+            ("ssh=1760000000\nwindow=10\n", "手順: ssh）", "10 分"),
+            ("firewall=1760000000\nwindow=7\n", "手順: firewall）", "7 分"),
+            ("ssh=1760000000\nfirewall=1760000100\nwindow=15\n", "手順: ssh、firewall）", "15 分"),
+            ("window=20\nfirewall=1760000100\nssh=1760000000\n", "手順: ssh、firewall）", "20 分"),
+            ("ssh=1760000000\nsudo=1760000050\nwindow=10\n", "手順: ssh、sudo）", "10 分"),
+            ("ssh=1760000000\nfirewall=1760000100\nsudo=1760000200\nwindow=12", "手順: ssh、firewall、sudo）", "12 分"),
+            ("ssh=\nwindow=3\n", "手順: ssh）", "3 分"),
+            # window が無い・読めないときは、harden.sh の既定（10 分）。
+            ("ssh=1760000000\n", "手順: ssh）", "10 分"),
+            ("ssh=1760000000\nwindow=\n", "手順: ssh）", "10 分"),
+            ("ssh=1760000000\nwindow=abc\n", "手順: ssh）", "10 分"),
+            # 同じキーが 2 回あっても、手順は 1 回。window は後ろのものが効く。
+            ("ssh=1\nssh=2\nwindow=4\nwindow=6\n", "手順: ssh）", "6 分"),
+        ]
+        repos = {}  # type: Dict[int, str]
+
+        def change(world, index, text):
+            world.put_pending(text)
+            repos[index] = world.repo
+
+        variants = [(index, lambda world, index=index, text=text: change(world, index, text))
+                    for index, (text, _steps, _window) in enumerate(table)]
+        for index, result in self.run_variants(variants):
+            text, steps, window = table[index]
+            with self.subTest(pending=text):
+                item = self.check_item("HARDEN-PENDING", "要対応", "まだ確定していません", steps,
+                                       "{0}で自動で元に戻ります".format(window), result=result)
+                self.assertEqual(result.summary()[0], 1)
+                self.assertTrue(item.fix.endswith(self.harden_command("--confirm", repo=repos[index])), item.fix)
+                self.assertIn("新しい端末", item.fix)
+                self.assertIn("鍵でログインできる", item.fix)
+                self.assertNotIn("sudo の手順が途中で止まりました", item.everything)
+
+    def test_a_stuck_sudo_step_next_to_ssh_is_explained_but_cannot_be_confirmed(self):
+        self.put_pending("ssh=1760000000\nsudo=1760000050\nwindow=10\n")
+        item = self.check_item("HARDEN-PENDING", "要対応", "手順: ssh、sudo）", "10 分で自動で元に戻ります")
+        self.assertEqual(len(item.notes), 1)
+        self.assertIn("sudo の手順も途中で止まっています", item.notes[0])
+        self.assertIn("確定の操作では確定できず", item.notes[0])
+        self.assertIn("パスワードなしの sudo が戻る", item.notes[0])
+
+    def test_only_a_stuck_sudo_step_is_not_confirmed_and_waits_for_the_automatic_revert(self):
+        for text, window in (("sudo=1760000000\nwindow=5\n", "5 分"), ("sudo=1760000000\n", "10 分"),
+                             ("window=9\nsudo=1760000000", "9 分")):
+            with self.subTest(pending=text):
+                self.put_pending(text)
+                item = self.check_item(
+                    "HARDEN-PENDING", "要対応",
+                    "sudo の手順が途中で止まりました。数分で自動で元に戻ります（パスワードなしの sudo が戻る）")
+                # harden.sh は sudo の --confirm を断る。--confirm は、どこにも書かない。
+                self.assertNotIn("--confirm", item.everything)
+                self.assertNotIn("確定していません", item.everything)
+                self.assertIn("待ち", item.fix)
+                self.assertIn("最長 {0}".format(window), item.fix)
+                self.assertTrue(item.fix.endswith(self.harden_command("sudo")), item.fix)
+                self.assertEqual(item.notes, ())
+
+    def test_a_record_without_any_step_is_nothing_pending(self):
+        # 止められて残った window だけの記録・空のファイル・読めない行だけのファイル。
+        for text in ("window=10\n", "window=10", "", "\n", "window=\n", "ssh 1760000000\n", "# ssh=1\n",
+                     " ssh=1\n", "sshx=1\n", "ssh\n", "xsudo=1\nfirewall_old=2\n"):
+            with self.subTest(pending=text):
+                self.put_pending(text)
+                result = self.run_check()
+                item = self.check_item("HARDEN-PENDING", "OK", "確定待ちの変更はありません", result=result)
+                self.assertNotIn("harden.sh の変更", item.everything)
+                self.assertEqual(item.fix, "")
+                self.assertEqual(result.summary()[0], 0)
+
+    def test_a_pending_path_that_is_not_a_file_is_nothing_pending(self):
+        makedirs(self.sys(self.STATE + "/pending"))
+        self.check_item("HARDEN-PENDING", "OK", "確定待ちの変更はありません")
+
+    def test_the_harden_command_is_quoted_for_a_repository_path_with_spaces(self):
+        moved = os.path.join(self.tmp, "my repo")
+        shutil.move(self.repo, moved)
+        self.repo = moved
+        self.put_pending("ssh=1760000000\nwindow=10\n")
+        item = self.check_item("HARDEN-PENDING", "要対応")
+        quoted = os.path.join(moved, "scripts", "harden.sh").replace(" ", "\\ ")
+        self.assertTrue(item.fix.endswith("sudo bash {0} --confirm".format(quoted)), item.fix)
+
+    def test_the_fix_line_does_not_depend_on_the_directory_it_is_run_from(self):
+        self.put_pending("firewall=1760000000\nwindow=10\n")
+        first = self.check_item("HARDEN-PENDING", "要対応")
+        other = os.path.join(self.tmp, "another")
+        makedirs(other)
+        self.elsewhere = other
+        second = self.check_item("HARDEN-PENDING", "要対応")
+        self.assertEqual(first.fix, second.fix)
+        self.assertIn(os.path.join(self.repo, "scripts", "harden.sh"), second.fix)
 
     def test_without_root_the_state_directory_cannot_be_read(self):
-        self.put(self.STATE + "/pending", "ssh 1760000000\n", 0o600)
+        self.put_pending("ssh=1760000000\nwindow=10\n")
         item = self.check_item("HARDEN-PENDING", "不明", "root でないため", root=False)
         self.assertEqual(item.hint, "sudo bash scripts/security_check.sh")
 
@@ -2549,6 +2662,63 @@ class SummaryAndExitCodeTest(SecurityCheckCase):
         result = self.run_check()
         self.assertEqual(result.code, 1)
         self.assertEqual(result.summary()[0], 1)
+
+    def summary_lines(self, result: Result) -> List[str]:
+        return result.stdout.split("== まとめ")[1].splitlines()
+
+    def test_a_normal_user_run_with_unknown_items_says_the_result_is_incomplete(self):
+        # 受け入れの確認に使われる点検。root でなくて [不明] が残るとき、「要対応 0 件」を合格と読ませない。
+        result = self.run_check(root=False)
+        self.assertEqual(result.code, 0)
+        self.assertEqual(result.summary(), (0, 0, 2))
+        lines = self.summary_lines(result)
+        count_at = lines.index("要対応 0 件・注意 0 件・不明 2 件")
+        notice = lines[count_at + 1:]
+        # 数の行のすぐ下（空行 1 つのあと）に、不完全だという知らせ。続けて、sudo で実行し直す案内。
+        self.assertEqual(notice[0], "")
+        self.assertIn("※ 点検は完全ではありません。root でないため、[不明] の 2 件を調べられていません。", notice[1])
+        self.assertIn("[要対応] が 0 件でも、安全と確かめられたわけではありません", notice[1])
+        self.assertIn("この結果は、確認の合格には使えません", notice[2])
+        self.assertIn("sudo を付けて実行してください", notice[2])
+        self.assertEqual(notice[3], "    sudo bash scripts/security_check.sh")
+        self.assertEqual(len(notice), 4, notice)
+        # 終了コードは変わらない（[要対応] が無ければ 0）。
+        self.assertEqual(result.stderr, "")
+
+    def test_the_incomplete_notice_counts_the_unknown_items_and_comes_before_the_address_reminder(self):
+        self.stub_data("ip4_global", ip4_line("203.0.113.7/24"))
+        result = self.run_check(root=False)
+        unknown = result.summary()[2]
+        lines = self.summary_lines(result)
+        notice_at = next(i for i, line in enumerate(lines) if "点検は完全ではありません" in line)
+        reminder_at = next(i for i, line in enumerate(lines) if "グローバルアドレス" in line)
+        self.assertIn("[不明] の {0} 件を調べられていません".format(unknown), lines[notice_at])
+        self.assertLess(notice_at, reminder_at)
+        self.assertIn("nc -vz 203.0.113.7 22", result.stdout)
+
+    def test_a_root_run_with_an_unknown_item_also_says_it_is_incomplete(self):
+        # root でも、道具が無いなどで調べられない項目があれば、「要対応 0 件」は合格ではない。
+        self.remove_tool("ss")
+        result = self.run_check()
+        self.assertEqual(result.labels("NET-LISTEN"), ["不明"])
+        self.assertEqual(result.code, 0)
+        text = "\n".join(self.summary_lines(result))
+        self.assertIn("※ 点検は完全ではありません。[不明] の {0} 件は調べられていません".format(result.summary()[2]), text)
+        self.assertIn("[要対応] が 0 件でも、安全と確かめられたわけではありません", text)
+        # root なのに「root でないため」とは言わず、sudo の案内も付けない。
+        self.assertNotIn("root でないため", text)
+        self.assertNotIn("sudo bash scripts/security_check.sh", text)
+
+    def test_no_incomplete_notice_when_nothing_is_unknown(self):
+        result = self.run_check()
+        self.assertEqual(result.summary(), (0, 0, 0))
+        self.assertNotIn("点検は完全ではありません", result.stdout)
+        self.assertNotIn("確認の合格には使えません", result.stdout)
+        # [注意] や [要対応] が出ていても、[不明] が 0 件なら、知らせは付かない。
+        self.make_bad_world()
+        result = self.run_check()
+        self.assertEqual(result.summary()[2], 0, result.stdout)
+        self.assertNotIn("点検は完全ではありません", result.stdout)
 
     def test_the_summary_counts_the_lines(self):
         self.make_bad_world()
@@ -2689,6 +2859,158 @@ class ReadOnlyTest(SecurityCheckCase):
         self.assertEqual(self.run_check(root=False).stdout, base.stdout)
 
 
+class AptReadOnlyTest(SecurityCheckCase):
+    """apt の道具は、root でも何も書かない: 索引の写し（pkgcache.bin・srcpkgcache.bin）の保存先を空にして呼ぶ。
+
+    実物の apt は、root で ``apt-get -s upgrade`` や ``apt-cache policy`` を動かすと、/var/cache/apt に
+    pkgcache.bin と srcpkgcache.bin を作り直す（偽の道具では分からない）。
+    """
+
+    TOOLS = ("apt-get", "apt-cache", "apt-config")
+
+    def apt_calls(self, result: Result) -> List[str]:
+        return [call for call in result.calls if call.split(" ")[0] in self.TOOLS]
+
+    def test_every_apt_call_empties_the_index_cache_files(self):
+        for root in (True, False):
+            with self.subTest(root=root):
+                result = self.run_check(root=root)
+                calls = self.apt_calls(result)
+                # 3 つの道具のどれも、1 回は呼ばれる（呼ばれない道具があると、この確認が空振りする）。
+                self.assertEqual(sorted({call.split(" ")[0] for call in calls}), sorted(self.TOOLS), result.calls)
+                for call in calls:
+                    tool, _space, rest = call.partition(" ")
+                    self.assertTrue(rest.startswith(APT_RO_OPTIONS + " "), "索引の写しの保存先を空にしていない: " + call)
+                    self.assertEqual(rest.count("Dir::Cache::pkgcache="), 1, call)
+                    self.assertEqual(rest.count("Dir::Cache::srcpkgcache="), 1, call)
+                self.assertEqual(result.labels("OS-UPDATES"), ["OK"], result.stdout)
+                self.assertEqual(result.labels("OS-AUTOUPDATE"), ["OK"], result.stdout)
+
+    def test_every_apt_call_does_too_in_a_bad_world(self):
+        self.make_bad_world()
+        for root in (True, False):
+            with self.subTest(root=root):
+                for call in self.apt_calls(self.run_check(root=root)):
+                    self.assertTrue(call.partition(" ")[2].startswith(APT_RO_OPTIONS + " "), call)
+
+    def test_the_apt_stubs_refuse_a_call_without_the_options(self):
+        # 偽の道具そのものの確認: 指定の無い呼び方、指定の後ろが読む形でない呼び方は、断る（このテストの網が抜けない）。
+        env = self.environment(True, {})
+        forms = {"apt-get": ("-s -o Debug::NoLocking=1 upgrade", "-s -o Debug::NoLocking=1 upgrade"),
+                 "apt-cache": ("policy", "policy"), "apt-config": ("dump", "dump")}
+        for tool, (good, _unused) in forms.items():
+            stub = os.path.join(self.bin_dir, tool)
+            with self.subTest(tool=tool):
+                bare = subprocess.run([stub] + good.split(), env=env, cwd=self.elsewhere, capture_output=True)
+                self.assertNotEqual(bare.returncode, 0)
+                half = subprocess.run([stub, "-o", "Dir::Cache::pkgcache="] + good.split(), env=env,
+                                      cwd=self.elsewhere, capture_output=True)
+                self.assertNotEqual(half.returncode, 0)
+                writing = subprocess.run([stub] + APT_RO_OPTIONS.split() + ["install", "-y", "x"], env=env,
+                                         cwd=self.elsewhere, capture_output=True)
+                self.assertNotEqual(writing.returncode, 0)
+                ok = subprocess.run([stub] + APT_RO_OPTIONS.split() + good.split(), env=env,
+                                    cwd=self.elsewhere, capture_output=True)
+                self.assertEqual(ok.returncode, 0, ok.stderr)
+
+
+class RealAptTest(SecurityCheckCase):
+    """本物の apt（偽の木の中だけで動かす）で、点検が何も書かないこと。
+
+    偽の道具は、本物の apt が索引の写しを書くことを隠してしまう。ここでは apt-get・apt-cache・apt-config
+    の偽物を、本物へ中継する入れ物に替える。入れ物は、APT_CONFIG が使い捨ての木の中を指しているときの、
+    読む形（``-s upgrade``・``policy``・``dump``。索引の写しの保存先を空にする指定つき）だけを通す。
+    本物の apt の木（/var/lib/apt・/var/cache/apt・/etc/apt）には、触れない。
+    """
+
+    PACKAGES = ("Package: foo\nVersion: 2.0\nArchitecture: amd64\nMaintainer: x <x@example.com>\n"
+                "Installed-Size: 10\nFilename: pool/main/f/foo/foo_2.0_amd64.deb\nSize: 100\n"
+                "SHA256: " + "0" * 64 + "\nDescription: foo\n foo\n\n")
+    STATUS = ("Package: foo\nStatus: install ok installed\nVersion: 1.0\nArchitecture: amd64\n"
+              "Maintainer: x <x@example.com>\nInstalled-Size: 10\nDescription: foo\n foo\n\n")
+    RELEASE = "Origin: Fake\nLabel: Fake\nSuite: stable\nCodename: fakecode\nArchitectures: amd64\nComponents: main\n"
+
+    def setUp(self):
+        super().setUp()
+        self.real = {}
+        for name in AptReadOnlyTest.TOOLS:
+            path = shutil.which(name)
+            if not path:
+                self.skipTest(name + " が無い環境では、本物の apt を動かせない")
+            self.real[name] = path
+        self.apt_tree = os.path.join(self.tmp, "apt")
+        self.build_apt_tree()
+        self.apt_env = dict(os.environ, APT_CONFIG=os.path.join(self.apt_tree, "apt.conf"),
+                            LC_ALL="C", HOME=self.tmp)
+        self.install_relays()
+
+    def build_apt_tree(self):
+        tree = self.apt_tree
+        for sub in ("state/lists/partial", "cache/archives/partial", "etc/apt.conf.d", "etc/preferences.d",
+                    "etc/sources.list.d", "etc/trusted.gpg.d", "dpkg"):
+            makedirs(os.path.join(tree, sub))
+        lists = os.path.join(tree, "state", "lists")
+        write(os.path.join(lists, "example.invalid_dists_stable_Release"), self.RELEASE)
+        write(os.path.join(lists, "example.invalid_dists_stable_main_binary-amd64_Packages"), self.PACKAGES)
+        write(os.path.join(tree, "dpkg", "status"), self.STATUS)
+        write(os.path.join(tree, "etc", "sources.list"), "deb [trusted=yes] http://example.invalid/ stable main\n")
+        write(os.path.join(tree, "apt.conf"), (
+            'Dir::State "{t}/state"; Dir::State::status "{t}/dpkg/status"; Dir::Cache "{t}/cache";\n'
+            'Dir::Etc "{t}/etc"; Dir::Etc::main "{t}/etc/apt.conf"; Dir::Etc::parts "{t}/etc/apt.conf.d";\n'
+            'Dir::Etc::sourcelist "{t}/etc/sources.list"; Dir::Etc::sourceparts "{t}/etc/sources.list.d";\n'
+            'Dir::Etc::preferences "{t}/etc/preferences"; Dir::Etc::preferencesparts "{t}/etc/preferences.d";\n'
+            'Dir::Etc::trustedparts "{t}/etc/trusted.gpg.d"; Dir::Log "{t}/log"; APT::Architecture "amd64";\n'
+            'APT::Periodic::Unattended-Upgrade "1";\n'
+            'Unattended-Upgrade::Origins-Pattern {{ "origin=Fake,codename=fakecode"; }};\n').format(t=tree))
+
+    def install_relays(self):
+        allowed = {"apt-get": "-s -o Debug::NoLocking=1 upgrade", "apt-cache": "policy", "apt-config": "dump"}
+        for name, form in allowed.items():
+            write(os.path.join(self.bin_dir, name), STUB_PRELUDE + APT_RO_PRELUDE + (
+                '[ -n "$APT_TREE" ] && [ -n "$APT_CONFIG" ] || refuse "APT_TREE と APT_CONFIG が要ります"\n'
+                'case "$APT_CONFIG" in "$APT_TREE"/*) ;; *) refuse "APT_CONFIG が使い捨ての木の外です: $APT_CONFIG" ;; esac\n'
+                '[ "$rest" = "{form}" ] || refuse "$@"\n'
+                'exec {real} "$@"\n').format(form=form, real=self.real[name]), 0o755)
+
+    def tree_files(self) -> List[str]:
+        found = []
+        for here, _names, files in os.walk(self.apt_tree):
+            found.extend(os.path.relpath(os.path.join(here, name), self.apt_tree) for name in files)
+        return sorted(found)
+
+    def cache_files(self) -> List[str]:
+        return [name for name in self.tree_files() if name.endswith(".bin")]
+
+    def test_real_apt_writes_nothing_even_as_root(self):
+        # 前提の確認: 指定なしで動かすと、この木に索引の写しが書かれる（書かれない apt では、確認が空振りする）。
+        plain = subprocess.run([self.real["apt-get"], "-s", "-o", "Debug::NoLocking=1", "upgrade"],
+                               env=self.apt_env, cwd=self.elsewhere, capture_output=True, text=True)
+        if plain.returncode != 0 or "Inst foo" not in plain.stdout:
+            self.skipTest("この apt では、偽の木を使えない: " + plain.stdout + plain.stderr)
+        if not self.cache_files():
+            self.skipTest("この apt は、指定なしでも索引の写しを書かないので、確認にならない")
+        for name in self.cache_files():
+            os.remove(os.path.join(self.apt_tree, name))
+        before = snapshot(self.root, self.repo, self.tmpdir, self.elsewhere, self.data, self.apt_tree)
+        extra = {"APT_CONFIG": self.apt_env["APT_CONFIG"], "APT_TREE": self.apt_tree}
+        for root in (True, False):
+            with self.subTest(root=root):
+                result = self.run_check(root=root, **extra)
+                after = snapshot(self.root, self.repo, self.tmpdir, self.elsewhere, self.data, self.apt_tree)
+                self.assertEqual(result.stderr, "")
+                changed = sorted(path for path in set(before) | set(after) if before.get(path) != after.get(path))
+                self.assertEqual(changed, [], "変更されたもの: " + ", ".join(changed))
+                self.assertEqual(self.cache_files(), [])
+                # 本物の apt が、指定つきでも正しく答えている（更新が 1 件・更新元が一致）。
+                self.check_item("OS-UPDATES", "情報", "未適用の更新は 1 件", result=result)
+                self.check_item("OS-AUTOUPDATE", "OK", result=result)
+                self.assertEqual(sorted({call.split(" ")[0] for call in self.apt_calls(result)}),
+                                 sorted(AptReadOnlyTest.TOOLS))
+
+    def apt_calls(self, result: Result) -> List[str]:
+        return [call for call in result.calls if call.split(" ")[0] in AptReadOnlyTest.TOOLS]
+
+
 def code_of(text: str) -> str:
     """コメント行と、' ' で囲んだ文字列を除いたスクリプトの本文（命令や書き込みを探すため）。"""
     lines = [line for line in text.splitlines() if not line.lstrip().startswith("#")]
@@ -2762,8 +3084,34 @@ class StaticScriptTest(unittest.TestCase):
 
     def test_help_text_is_the_leading_comment_block_and_documents_the_options(self):
         block = header_block()
-        for needle in ("--user", "--help", "sudo bash scripts/security_check.sh", "終了コード", "何も変更しない"):
+        for needle in ("--user", "--help", "sudo bash scripts/security_check.sh", "終了コード", "何も変更しない",
+                       "apt の索引の作り直しもしない", "pkgcache.bin", "srcpkgcache.bin"):
             self.assertIn(needle, block)
+
+    def test_apt_tools_are_only_run_through_apt_read(self):
+        # apt-get・apt-cache・apt-config は、索引の写しの保存先を空にする apt_read を通してだけ呼ぶ。
+        # 画面に出す文面と、道具があるかを調べる have は、命令ではない。
+        message = re.compile(r"^\s*(emit|more|fixline|need_root|usage_error|printf)\b")
+        tools = r"\bapt-(?:get|cache|config)\b"
+        offenders = []
+        through = set()
+        for line in self.code.splitlines():
+            if message.match(line):
+                continue
+            line = re.sub(r"\bhave\s+apt-(?:get|cache|config)\b", "", line)
+            for found in re.finditer(tools, line):
+                if re.search(r"\bapt_read\s+$", line[:found.start()]):
+                    through.add(found.group(0))
+                else:
+                    offenders.append(line.strip())
+        self.assertEqual(offenders, [], "apt_read を通していない apt の呼び出し")
+        self.assertEqual(through, {"apt-get", "apt-cache", "apt-config"})
+        definition = re.search(r"(?ms)^apt_read\(\) \{\n(.*?)^\}", self.code)
+        self.assertTrue(definition, "apt_read の定義がありません")
+        body = definition.group(1)
+        self.assertEqual(body.count("-o Dir::Cache::pkgcache= "), 1)
+        self.assertEqual(body.count("-o Dir::Cache::srcpkgcache= "), 1)
+        self.assertRegex(body, r'"\$\{tool\}" -o Dir::Cache::pkgcache= -o Dir::Cache::srcpkgcache= "\$@"')
 
 
 class RobustnessTest(SecurityCheckCase):
